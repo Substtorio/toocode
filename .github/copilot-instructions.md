@@ -1383,6 +1383,20 @@ npm run tauri dev    # 开发模式启动（会同时跑 Vite 与编译 Rust）
 npm run tauri build  # 打包发布版
 ```
 
+打包的产物都在 `src-tauri/target/release/` 下：
+
+| 文件 | 用途 |
+| --- | --- |
+| `toocode.exe` | 裸的可执行文件，单独拿走也能跑（需要系统有 WebView2） |
+| `bundle/nsis/Toocode_0.1.0_x64-setup.exe` | 安装程序 —— **要发给别人就传这个**，双击就装 |
+| `bundle/msi/Toocode_0.1.0_x64_en-US.msi` | MSI 安装包，企业部署用的 |
+
+⚠ 第一次打包会**编译 Rust release**（比 dev 慢得多，可能十几分钟），
+  而且 `target` 会从 6 GB 涨到 10+ GB —— 先确认磁盘够用
+⚠ 第一次打包还要**联网下载** NSIS / WiX 打包工具（几 MB），国内网络可能要等
+
+要只出裸 exe、不做安装包：`npm run tauri build -- --no-bundle`
+
 Rust 相关（在 `new_vscode/src-tauri` 下）：
 
 ```bash
