@@ -1403,3 +1403,120 @@ Rust 相关（在 `new_vscode/src-tauri` 下）：
 cargo build   # 编译 Rust 后端
 cargo clean   # 清理构建产物
 ```
+
+---
+
+## 6. 发布到 GitHub
+
+### 仓库根在哪里
+
+git 仓库的根是 **`new_vscode/`**，不是上层那个 `d:\code\Java\New_VScode`。
+
+- `.github/copilot-instructions.md` 因此有**两份**：上层那份是**权威**
+  （Copilot 读的是它），`new_vscode/.github/` 那份是随仓库上传的副本。
+  改完上层那份记得同步一下：
+
+  `Copy-Item "d:\code\Java\New_VScode\.github\copilot-instructions.md" "d:\code\Java\New_VScode\new_vscode\.github\copilot-instructions.md" -Force`
+
+- `HANDOFF.md` / `docs/history/` 是**开发对话记录，故意不上传**
+  （它们在仓库范围之外，所以不需要写进 .gitignore）
+
+### Release 和「代码」是两回事
+
+| 标签页 | 装什么 | 怎么进去 |
+| --- | --- | --- |
+| **Code** | 源码 | `git push` |
+| **Releases** | 每个版本的**成品安装包** | **单独创建**，手动传附件 |
+
+push 完代码、Release 还是空的 —— **这是正常的**，不是没传上去。
+
+发一个版本的流程：本地 `npm run tauri build` → GitHub 上 Draft a new release →
+tag 填 `v0.1.0`（对上 `tauri.conf.json` 里的 `version`）→ 把
+`bundle/nsis/Toocode_0.1.0_x64-setup.exe` 拖进附件区 → Publish。
+
+### ⚠ 提交前确认 target 没被加进来
+
+`src-tauri/target` 有 **6 GB 以上**，一旦提交仓库就毁了。
+`src-tauri/.gitignore` 里有 `/target/` 挡着，但**每次首次 add 之后都值得看一眼**：
+
+```powershell
+git -C d:\code\Java\New_VScode\new_vscode add -A
+git -C d:\code\Java\New_VScode\new_vscode status --short | Select-String "target/|node_modules/"
+# 什么都没有才算安全
+```
+
+---
+
+## 7. 工具链上踩过的坑
+
+### 终端的工作目录不是项目目录
+
+VS Code 里新开的终端，默认在**工作区根** `d:\code\Java\New_VScode`，
+而项目在下一层的 `new_vscode\`。于是：
+
+- `npm run dev` → `ENOENT ... package.json`
+- `cargo check --manifest-path src-tauri\Cargo.toml` → `manifest path does not exist`
+
+**都不是代码问题，是走错目录了。** 两种解法：`cd new_vscode`，
+或者写全路径 `npm run dev --prefix d:\code\Java\New_VScode\new_vscode`。
+
+### `Port 1420 is already in use` 不是故障
+
+意思是「**已经有一个 dev server 在跑**」—— 多半就是 `npm run tauri dev`
+自己拉起来的那个。浏览器打开 `http://localhost:1420` 看有没有界面就知道了。
+
+⚠ Vite 有可能只监听 IPv6 的 `::1`，这时 `localhost` 会 ERR_CONNECTION_REFUSED，
+  改用 `http://[::1]:1420/`。
+
+### ★★ Tauri 的 npm 包和 Rust crate 版本必须对齐
+
+打包时会被直接拒绝：
+
+```
+Error Found version mismatched Tauri packages:
+tauri (v2.11.5) : @tauri-apps/api (v2.12.0)
+```
+
+**根因**：`package.json` 写 `"@tauri-apps/api": "^2"`、`Cargo.toml` 写 `tauri = "2"`
+—— 两边都是**宽范围**，各自独立地取最新，**迟早会漂移**
+（某次 `npm install` 装别的包时顺手把它升上去了）。
+
+**修法**（major.minor 对上就行，不用完全一致）：
+
+```powershell
+npm install --prefix <项目> @tauri-apps/api@2.11.1 @tauri-apps/plugin-dialog@2.7.3 --save-exact
+```
+
+★ `--save-exact` 会**写死版本**（去掉 `^`），这样以后 `npm install` 不会再把它升跑
+★ 反过来升 Rust 侧也行（`cargo update -p tauri`），但那要重编整个 tauri，慢得多
+
+### ★★ 长时间的编译命令不要跑在终端里
+
+打包要编译 Rust release，十几分钟。跑在**终端里**的话，终端一被清理 / 关掉，
+里面的进程就跟着死。症状还挺有迷惑性：
+
+```
+Compiling toocode v0.1.0 ...
+（然后就没动静了 —— 进程消失，也没有任何错误信息）
+```
+
+⇒ **「没有报错但也没结果」的时候，先怀疑进程被杀了，而不是代码有问题。**
+
+改成独立进程 + 输出重定向：
+
+```powershell
+$dir = "d:\code\Java\New_VScode\new_vscode"
+$log = "$env:TEMP\toocode-build.log"
+$p = Start-Process -FilePath "cmd.exe" `
+  -ArgumentList "/c", "npm run tauri build --prefix $dir -- --bundles nsis" `
+  -RedirectStandardOutput $log -RedirectStandardError "$log.err" `
+  -NoNewWindow -PassThru
+"PID = $($p.Id)"
+
+# 随时看进度（去掉 \r，是因为 cargo 的进度条会反复刷同一行）：
+Get-Content $log -Tail 10 | ForEach-Object { $_ -replace "`r","" } | Where-Object { $_.Trim() }
+```
+
+★ 输出重定向还有一个好处：**不会因为输出太长（几万行）而被工具/终端提前截断**
+★ 只想验证「编译能不能过」、不做安装包：改用 `-- --no-bundle`（不联网，快得多）
+★ 要发给别人只需要 NSIS 那一个的话：`-- --bundles nsis`，能少下载几十 MB 的 WiX
