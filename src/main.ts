@@ -1,22 +1,27 @@
-import * as monaco from "monaco-editor";
+// 这个文件只干一件事：在「第一次创建编辑器之前」把 MonacoEnvironment 设置好。
+// Monaco 本体是在 App.vue 里导入使用的，所以这里不需要再 import monaco。
 
-import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
-import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
-import cssWorker from "monaco-editor/esm/vs/language/css/css.worker?worker";
-import htmlWorker from "monaco-editor/esm/vs/language/html/html.worker?worker";
-import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
+// 注意 monaco-editor 0.56 的 package.json 里有 exports 映射：
+//   "./*": "./esm/vs/*.js"
+// 包名后面的路径会被自动接到 esm/vs/ 下面，所以这里不能再写 "esm/vs/" 前缀，
+// 否则会被拼成 esm/vs/esm/vs/... 而找不到文件。
+import editorWorker from "monaco-editor/editor/editor.worker?worker";
+import jsonWorker from "monaco-editor/language/json/json.worker?worker";
+import cssWorker from "monaco-editor/language/css/css.worker?worker";
+import htmlWorker from "monaco-editor/language/html/html.worker?worker";
+import tsWorker from "monaco-editor/language/typescript/ts.worker?worker";
 
 self.MonacoEnvironment = {
     getWorker(_, label) {
         if (label === "json") return new jsonWorker();
         if (label === "css" || label === "scss" || label === "less") return new cssWorker();
-        if (label === "html" || label === "handlebars" || label === 'razor') return new htmlWorker();
+        if (label === "html" || label === "handlebars" || label === "razor") return new htmlWorker();
         if (label === "typescript" || label === "javascript") return new tsWorker();
         return new editorWorker();
     }
 };
 
-import { createApp, h } from "vue";
+import { createApp } from "vue";
 import App from "./App.vue";
 
 createApp(App).mount("#app");
