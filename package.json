@@ -1,5 +1,5 @@
 {
-  "name": "new_vscode",
+  "name": "toocode",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -13,6 +13,10 @@
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-dialog": "^2.8.0",
     "@tauri-apps/plugin-opener": "^2",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "dompurify": "^3.4.16",
+    "marked": "^18.0.14",
     "monaco-editor": "^0.56.0",
     "vscode-oniguruma": "^2.0.1",
     "vscode-textmate": "^9.3.2",

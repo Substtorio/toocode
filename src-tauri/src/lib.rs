@@ -1,8 +1,13 @@
+use base64::Engine as _;
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+use tauri::{AppHandle, Emitter, State};
 
 // ============================ 数据结构 ============================
 
@@ -273,6 +278,8 @@ struct Contributes {
     grammars: Vec<GrammarContribution>,
     #[serde(default)]
     themes: Vec<ThemeContribution>,
+    #[serde(default)]
+    snippets: Vec<SnippetContribution>,
 }
 
 /// 一条主题贡献（`contributes.themes`）。
@@ -302,11 +309,22 @@ struct LanguageContribution {
 
 #[derive(Deserialize)]
 struct GrammarContribution {
-    /// 这个语法服务于哪个语言 id。没写就跳过 —— 我们不知道把它挂在谁头上
+    /// 这个语法服务于哪个语言 id。没写就**不挂到任何语言上**
+    /// （但不是说就可以丢掉它 —— 见下面 inject_to 的说明）
     language: Option<String>,
     #[serde(rename = "scopeName")]
     scope_name: String,
     path: String,
+    /// 这个语法要**注入到**哪些 scope 里去。
+    ///
+    /// ★ 这就是「注入语法」的声明：声明了 injectTo、又没写 language 的那些
+    ///   （Volar 有 6 个），平时根本不会被人加载 ——
+    ///   而是等某个父语法分词到某个位置时，TextMate 按当前 scope 把它们找出来。
+    /// ⚠ 值可能带 `L:` 前缀（如 `L:source.vue`），表示注入到那一层；
+    ///   前端要负责剥掉前缀，并且把方向**反转**（清单写的是「我注入到谁」，
+    ///   而 TextMate 问的是「谁注入到我这儿」）
+    #[serde(rename = "injectTo", default)]
+    inject_to: Vec<String>,
 }
 
 /// 一条可用的语法
@@ -325,6 +343,8 @@ struct GrammarEntry {
     path: String,
     /// 对应哪些文件扩展名，带点，如 [".vue"]
     extensions: Vec<String>,
+    /// 要注入到哪些 scope（原样带过来，前端负责剥 `L:` 前缀 + 反转方向）
+    inject_to: Vec<String>,
 }
 
 /// 一条可用的主题
@@ -547,6 +567,7 @@ fn scan_grammar_extensions() -> Result<Vec<GrammarEntry>, String> {
                 // 和文件树一样，跨语言边界统一用 /
                 path: path.to_string_lossy().replace('\\', "/"),
                 extensions,
+                inject_to: grammar.inject_to,
             });
         }
     });
@@ -557,9 +578,10 @@ fn scan_grammar_extensions() -> Result<Vec<GrammarEntry>, String> {
         println!("[语法扩展]   {}", root.display());
     }
     println!(
-        "[语法扩展] 得到 {} 个语法，其中 {} 个挂了具体语言",
+        "[语法扩展] 得到 {} 个语法，其中 {} 个挂了具体语言、{} 个是注入语法",
         entries.len(),
-        entries.iter().filter(|entry| entry.id.is_some()).count()
+        entries.iter().filter(|entry| entry.id.is_some()).count(),
+        entries.iter().filter(|entry| !entry.inject_to.is_empty()).count()
     );
 
     Ok(entries)
@@ -616,12 +638,215 @@ fn scan_theme_extensions() -> Result<Vec<ThemeEntry>, String> {
 mod tests {
     use super::*;
 
+    // ---------- 全文搜索 ----------
+
+    /// ★ 最容易错的一条：下标不能按**字节**算。
+    ///   中文一个字在 UTF-8 里占 3 字节 —— 按字节当列号会得到 7 而不是 3
+    #[test]
+    fn search_units_are_not_bytes() {
+        let hits = search_in_text("你好世界", "世界", true);
+        assert_eq!(hits.len(), 1);
+        let (line, column, text, start, end) = &hits[0];
+        assert_eq!(*line, 1);
+        assert_eq!(*column, 3, "不能按字节算：按字节会得到 7");
+        assert_eq!(text, "你好世界");
+        assert_eq!((*start, *end), (2, 4));
+    }
+
+    /// ★ emoji 是「1 个 char、2 个 UTF-16 单位」。
+    ///   对中文（BMP）字符数和 UTF-16 长度恰好相等，所以中文用例盖不住这个差别 ——
+    ///   得专门拿补充平面的字符来试
+    #[test]
+    fn search_counts_utf16_units_like_javascript() {
+        // 😀 = U+1F600：chars().count() 是 1，encode_utf16().count() 是 2
+        let hits = search_in_text("😀ok", "ok", true);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].1, 3, "列号：emoji 占 2 个 UTF-16 单位，所以 ok 从第 3 列开始");
+        assert_eq!((hits[0].3, hits[0].4), (2, 4), "高亮下标也要和 JS 的 slice 对齐");
+    }
+
+    /// ★ 两条下标的口径不一样，很容易搞混：
+    ///   列号是「相对原始行」的（跳转用），高亮下标是「相对展示文本」的（trim 过）
+    #[test]
+    fn search_offsets_highlight_by_leading_whitespace() {
+        let hits = search_in_text("    let value = 1;", "value", true);
+        let (_, column, text, start, end) = &hits[0];
+        assert_eq!(text, "let value = 1;");
+        assert_eq!(*column, 9, "列号相对原始行，不减空白");
+        assert_eq!((*start, *end), (4, 9), "高亮下标相对展示文本，要减掉前导空白");
+    }
+
+    #[test]
+    fn search_finds_every_hit_on_a_line() {
+        let hits = search_in_text("a b a b a", "a", true);
+        assert_eq!(hits.len(), 3);
+        let starts: Vec<usize> = hits.iter().map(|hit| hit.3).collect();
+        assert_eq!(starts, vec![0, 4, 8]);
+    }
+
+    #[test]
+    fn search_respects_case_sensitivity() {
+        assert_eq!(search_in_text("Hello", "hello", true).len(), 0);
+        assert_eq!(search_in_text("Hello", "hello", false).len(), 1);
+        // 大小写不敏感时，返回的仍然是**原文**，不是小写版 ——
+        // 不然结果列表里会显示一段被改过大小写的代码
+        assert_eq!(search_in_text("Hello", "hell", false)[0].2, "Hello");
+    }
+
+    #[test]
+    fn search_handles_empty_and_missing() {
+        assert!(search_in_text("abc", "", true).is_empty());
+        assert!(search_in_text("abc", "xyz", true).is_empty());
+    }
+
     /// 自检：VS Code 程序目录里的内置扩展能不能被找到。
     ///
     /// 那是 html / css / typescript 这些**父语法**的家 —— 找不到它们，
     /// Vue 这类「寄生语法」就会缺一大块高亮。
     ///
     /// 跑：cargo test -- --nocapture
+    /// ★ 验证清单里的 `injectTo` 真的被读出来了。
+    ///
+    /// 为什么值得单独测：这个字段是**注入语法**能不能生效的唯一依据 ——
+    /// 读不到的话，Vue 里的 `v-if` / `@click` 会一直保持纯白，
+    /// 而且**不会有任何报错**（和「缺 include」是同一种失效模式：
+    /// 不是坏掉，而是变差，所以必须主动验证）
+    // ---------- 代码片段 ----------
+
+    /// ★ `contributes.snippets[].language` 既可以是字符串，也可以是数组。
+    ///
+    /// 为什么值得单独测：字段写成 `String` 的话，声明成数组的那些扩展会被 serde
+    /// **整个跳过** —— 而 serde 是「全有或全无」的，那一个 package.json 整个不要了，
+    /// 它的语法 / 主题 / 片段跟着一起消失。
+    /// 症状是「某个扩展怎么完全没反应」，而且**不报错**，极难查
+    #[test]
+    fn snippet_language_accepts_both_string_and_array() {
+        #[derive(Deserialize)]
+        struct Holder {
+            language: Option<LanguageList>,
+        }
+
+        let one: Holder = serde_json::from_str(r#"{"language": "typescript"}"#).unwrap();
+        assert_eq!(one.language.unwrap().into_vec(), vec!["typescript"]);
+
+        let many: Holder =
+            serde_json::from_str(r#"{"language": ["javascript", "typescript"]}"#).unwrap();
+        assert_eq!(
+            many.language.unwrap().into_vec(),
+            vec!["javascript", "typescript"]
+        );
+
+        // 没写 language 的是「全局片段」，我们暂时不支持 —— 但不能因此报错
+        let none: Holder = serde_json::from_str("{}").unwrap();
+        assert!(none.language.is_none());
+    }
+
+    /// 真机上扫一遍，把结果打出来看看（`--nocapture`）
+    #[test]
+    fn scans_snippet_extensions() {
+        let entries = scan_snippet_extensions().expect("扫描应该成功");
+
+        let languages: HashSet<&str> = entries
+            .iter()
+            .flat_map(|entry| entry.languages.iter().map(String::as_str))
+            .collect();
+
+        println!("[测试] 片段文件 {} 个，覆盖 {} 个语言", entries.len(), languages.len());
+        for language in ["typescript", "javascript", "vue", "rust"] {
+            let hits = entries
+                .iter()
+                .filter(|entry| entry.languages.iter().any(|id| id == language))
+                .count();
+            println!("[测试]   {language}: {hits} 份");
+        }
+
+        // ⚠ 不断言数量：换台机器可能一个扩展片段都没有，
+        //   那种情况下这个测试也不该失败
+        for entry in &entries {
+            assert!(!entry.path.is_empty(), "片段条目必须带路径");
+            assert!(!entry.languages.is_empty(), "进来之前就该滤掉没有语言的");
+        }
+    }
+
+    #[test]
+    fn reads_inject_to_from_manifests() {
+        let entries = scan_grammar_extensions().expect("扫描应该成功");
+
+        let injections: Vec<_> = entries
+            .iter()
+            .filter(|entry| !entry.inject_to.is_empty())
+            .collect();
+
+        // 跑 `cargo test -- --nocapture` 能看到这些
+        println!("[测试] 注入语法 {} 个：", injections.len());
+        for entry in &injections {
+            println!("[测试]   {} → {:?}", entry.scope_name, entry.inject_to);
+        }
+
+        // ★ 顺便盯一下「降级探针」是不是都在。
+        //   这四个 scopeName 只存在于 VS Code 程序目录的内置扩展里，
+        //   是前端判定「基础语法库到手没有」的依据。少任何一个都可能让
+        //   .vue 这类语法整批退回手写表 ——
+        //   而且编译、分词全都不报错，症状仅仅是「状态栏的语言名从 vue 变成 html」
+        println!("[测试] 降级探针：");
+        for probe in ["text.html.basic", "source.css", "source.ts", "source.json"] {
+            let found = entries.iter().any(|entry| entry.scope_name == probe);
+            println!("[测试]   {probe}：{}", if found { "在" } else { "**不在**" });
+        }
+
+        // ⚠ 不断言数量：本机装了 Volar 才有，换台机器可能是 0 个，
+        //   那种情况下这个测试也不该失败
+        for entry in &injections {
+            // 目前见过的注入语法都是「没写 language」的。
+            // 万一出现既有 language 又有 injectTo 的，提出来看一眼 ——
+            // 那说明它既当主分词器又要注入，得确认前端两条路都没漏
+            assert!(
+                entry.id.is_none(),
+                "{} 既有 language 又有 injectTo，需要重新确认处理方式",
+                entry.scope_name
+            );
+        }
+    }
+
+    // ---------- 密钥存储 ----------
+
+    /// ★ 验证密钥文件确实是**加密**的，而且能原样读回来。
+    ///
+    /// 为什么值得单独测：这个功能有两种坏法，而**第二种完全看不出来** ——
+    ///   ① 读不出密钥（会立刻暴露）
+    ///   ② 以为加密了、其实还是明文（看起来一切正常）
+    #[cfg(windows)]
+    #[test]
+    fn secret_file_is_encrypted_and_roundtrips() {
+        let dir = std::env::temp_dir().join("toocode-secret-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.secret");
+
+        let key = "sk-test-1234567890abcdef";
+        write_secret(&path, key).unwrap();
+
+        // ① 文件里**不能**出现明文密钥
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            raw.starts_with(SECRET_MAGIC),
+            "加密文件应该带 TOOCODE1 标记"
+        );
+        assert!(
+            !raw.windows(key.len()).any(|window| window == key.as_bytes()),
+            "文件里不该出现明文密钥"
+        );
+
+        // ② 但要能原样读回来
+        assert_eq!(read_secret(&path).unwrap(), key);
+
+        // ③ 旧格式（整个文件就是明文）也要能读 ——
+        //    这是「老用户不用重填密钥」的前提
+        std::fs::write(&path, "sk-legacy-plain").unwrap();
+        assert_eq!(read_secret(&path).unwrap(), "sk-legacy-plain");
+
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn finds_vscode_builtin_extensions() {
         let roots = extension_roots();
@@ -650,6 +875,899 @@ mod tests {
     }
 }
 
+// ============================ 代码片段（snippets）============================
+
+/// `contributes.snippets[].language` —— 它**既可以是字符串，也可以是字符串数组**。
+///
+/// ⚠ 这是个真坑：字段写成 `String` 的话，那些声明成数组的扩展会被 serde 直接跳过。
+///   而 serde 是「全有或全无」的 —— 一个字段类型不对，
+///   那个扩展的 package.json **整个**都不要了，它的语法 / 主题也跟着一起没。
+///   症状会是「某个扩展怎么完全没反应」，而且不报错
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LanguageList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl LanguageList {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            LanguageList::One(id) => vec![id],
+            LanguageList::Many(ids) => ids,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct SnippetContribution {
+    /// 不写 language 的片段文件是给「所有语言」用的，我们暂时跳过它们
+    #[serde(default)]
+    language: Option<LanguageList>,
+    #[serde(default)]
+    path: String,
+}
+
+/// 一份可用的片段文件
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippetEntry {
+    /// 这份片段适用于哪些 Monaco 语言 id（一个文件可以同时给好几种语言用）
+    languages: Vec<String>,
+    /// 片段文件的绝对路径（前端再自己去读内容）
+    path: String,
+    /// 这份片段来自哪个扩展。
+    /// ★ 不是装饰：片段重名时用户会问「这条是哪来的」，而且排查也只靠它
+    source: String,
+}
+
+/// 扫一遍所有扩展，把它们贡献的代码片段（`contributes.snippets`）列出来。
+///
+/// ★ 只负责「哪个语言的片段在哪个文件」，**不解析片段内容** ——
+///   内容是前端读的（和语法 / 主题一致）。
+///   一个扩展往往在 snippets/ 下摆十几个语言的文件，
+///   启动时全读进来解析一遍纯属浪费，用到哪个读哪个
+#[tauri::command]
+fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
+    let roots = extension_roots();
+    let mut entries: Vec<SnippetEntry> = Vec::new();
+
+    // ★ 先到先得（和语法那套一致）：扫描顺序 = 目录优先级（用户扩展 > 内置），
+    //   所以用户装的扩展能盖住内置的。
+    //   判重的 key 是「语言 + 文件路径」—— 同一份文件可以服务多个语言，
+    //   但同一个语言的同一份文件只登记一次
+    let mut seen = HashSet::new();
+
+    for_each_manifest(&roots, |dir, manifest| {
+        let Some(contributes) = manifest.contributes else {
+            return;
+        };
+
+        for snippet in contributes.snippets {
+            // 老规矩：**先确认文件真的存在，再占位**。
+            // 反过来的话，一条「声明了路径但文件不在」的片段会把 key 白白吃掉
+            let path = dir.join(&snippet.path);
+            if !path.is_file() {
+                continue;
+            }
+
+            let Some(languages) = snippet.language else {
+                // 没写 language 的片段文件通常是「全局片段」，我们还不支持
+                continue;
+            };
+
+            // ⚠ 判重的 key 用**元组**，不要拿一个字符拼字符串 ——
+            //   拼的话就得挑一个「路径里绝不会出现」的分隔符，
+            //   而那种魔术字符正是以后会被忘掉、然后出 bug 的东西
+            let normalized = path.to_string_lossy().replace('\\', "/");
+            let wanted: Vec<String> = languages
+                .into_vec()
+                .into_iter()
+                .filter(|id| seen.insert((id.clone(), normalized.clone())))
+                .collect();
+
+            if wanted.is_empty() {
+                continue;
+            }
+
+            entries.push(SnippetEntry {
+                languages: wanted,
+                path: normalized,
+                source: dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            });
+        }
+    });
+
+    println!(
+        "[代码片段] 得到 {} 个片段文件，覆盖 {} 个语言",
+        entries.len(),
+        entries
+            .iter()
+            .flat_map(|entry| entry.languages.iter())
+            .collect::<HashSet<_>>()
+            .len()
+    );
+
+    Ok(entries)
+}
+
+// ============================ AI 对话 ============================
+//
+// ★★ 分工：Rust 只干两件事 ——「发一次请求」和「把原始 SSE 文本转发回去」。
+//   解析（delta 拼接 / 工具调用累加）留在前端，理由：
+//     1. 那段逻辑已经用纯函数测过了（`src/agentStream.ts`）
+//     2. 各家 API 的字段差异（`reasoning` vs `reasoning_content`）
+//        在 JS 里加个 `??` 就行，改 Rust 结构体要重新编译
+//
+// ★★ 为什么请求不能由前端直接发：云端 API 基本都不允许浏览器跨域（CORS），
+//   WebView 里 fetch 会被直接拦掉
+//
+// ★★ 为什么密钥存后端、而且**不回传**给前端：
+//   前端的一切都能被 F12 看到，localStorage 也是明文。
+//   前端只需要知道「配没配」，用的时候由 Rust 自己去读
+
+/// 一次对话请求的参数。
+/// 用 OpenAI 兼容的格式 —— 这样 OpenAI / DeepSeek / 通义 / 本地的 Ollama
+/// 和 LM Studio 都是同一套代码
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatRequest {
+    /// 接口根地址，如 `https://api.deepseek.com/v1`
+    base_url: String,
+    model: String,
+    /// 直接透传的 messages 数组（含 role / content / tool_calls / tool_call_id）
+    messages: Vec<serde_json::Value>,
+    /// 工具声明。为 None 时就是纯聊天
+    #[serde(default)]
+    tools: Option<Vec<serde_json::Value>>,
+    /// 采样温度
+    #[serde(default)]
+    temperature: Option<f32>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChatDeltaEvent {
+    /// 和发起时传的一致 —— 前端可能同时开着多个会话
+    request_id: String,
+    /// 原始 SSE 文本，前端自己按行解析
+    text: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ChatEndEvent {
+    request_id: String,
+    /// 出错时带上原因；正常结束是 None
+    error: Option<String>,
+}
+
+/// 密钥文件放哪儿：`appDataDir/toocode.secret`
+fn secret_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    use tauri::Manager;
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|err| format!("拿不到应用数据目录：{err}"))?;
+
+    // 首次运行时目录还不存在 —— create_dir_all 幂等，不用先判断
+    std::fs::create_dir_all(&dir).map_err(|err| format!("建目录失败：{err}"))?;
+
+    Ok(dir.join("toocode.secret"))
+}
+
+// ---------- 密钥的加密存储 ----------
+//
+// ★★ 先说清楚这个加密**防的是什么**（威胁模型）：
+//   · 「前端 / 篡改的页面把密钥偷走」—— 这个**已经**防住了，和加不加密无关：
+//     密钥不进前端、没有「读密钥」的命令、请求也从 Rust 发
+//   · 「磁盘上的文件被别的程序读走」—— 这个是**明文文件**的问题，加密要解决的就是它
+//
+// ★ Windows 上用 DPAPI（CryptProtectData）：
+//   加密出来的数据**只有同一个用户在同一台机器上**能解开，密钥材料由系统保管。
+//   ★ 为什么不自己写一套加密：那必然要面对「主密码存哪」——
+//     用一个写死的密钥去加密等于没加密，而让用户每次输密码体验又太差。
+//     DPAPI 正好绕开了这个死结
+//
+// ★ 非 Windows 平台退回明文，并且**明说**这件事，不要让人以为已经加密了
+
+/// 加密文件的头部。
+/// 没有这个头就说明是**旧的明文格式** —— 于是老文件照样能读，
+/// 下次保存时自动写成加密格式（等于无缝迁移）
+const SECRET_MAGIC: &[u8] = b"TOOCODE1";
+
+#[cfg(windows)]
+mod dpapi {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CryptProtectData, CryptUnprotectData, CRYPT_INTEGER_BLOB,
+    };
+
+    fn as_blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB {
+            cbData: data.len() as u32,
+            pbData: data.as_ptr() as *mut u8,
+        }
+    }
+
+    /// 把系统分配的内存交还回去。
+    /// ⚠ DPAPI 的输出是用 `LocalAlloc` 分配的，必须用 `LocalFree` 释放 ——
+    ///   拿 `Vec` 接走之后忘了这一步就是内存泄漏
+    unsafe fn take_output(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        let bytes = std::slice::from_raw_parts(out.pbData, out.cbData as usize).to_vec();
+        LocalFree(out.pbData as *mut core::ffi::c_void);
+        bytes
+    }
+
+    pub fn protect(plain: &[u8]) -> Result<Vec<u8>, String> {
+        let mut input = as_blob(plain);
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+
+        let ok = unsafe {
+            CryptProtectData(
+                &mut input,
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut output,
+            )
+        };
+
+        if ok == 0 {
+            return Err("密钥加密失败".into());
+        }
+        Ok(unsafe { take_output(output) })
+    }
+
+    pub fn unprotect(blob: &[u8]) -> Result<Vec<u8>, String> {
+        let mut input = as_blob(blob);
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+
+        let ok = unsafe {
+            CryptUnprotectData(
+                &mut input,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                &mut output,
+            )
+        };
+
+        if ok == 0 {
+            // 常见原因：换了台机器、或者换了 Windows 用户 —— 那种情况下
+            // 密钥确实解不开了（这是 DPAPI 的设计意图，不是故障）
+            return Err("密钥解密失败（可能是换了电脑或系统用户）".into());
+        }
+        Ok(unsafe { take_output(output) })
+    }
+}
+
+/// 读取密钥。自动兼容明文（旧格式）和加密（新格式）
+fn read_secret(path: &Path) -> Result<String, String> {
+    let raw = std::fs::read(path).map_err(|_| "还没配置 API 密钥".to_string())?;
+
+    let plain = if raw.starts_with(SECRET_MAGIC) {
+        let body = &raw[SECRET_MAGIC.len()..];
+
+        #[cfg(windows)]
+        {
+            dpapi::unprotect(body)?
+        }
+        #[cfg(not(windows))]
+        {
+            // 非 Windows 上 magic 后面直接就是明文（见 write_secret）
+            body.to_vec()
+        }
+    } else {
+        // 旧格式：整个文件就是明文密钥
+        raw
+    };
+
+    String::from_utf8(plain).map_err(|_| "密钥文件不是合法的 UTF-8".to_string())
+}
+
+/// 写入密钥。Windows 上会先加密
+fn write_secret(path: &Path, value: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    let payload = {
+        let encrypted = dpapi::protect(value.as_bytes())?;
+        let mut buf = SECRET_MAGIC.to_vec();
+        buf.extend_from_slice(&encrypted);
+        buf
+    };
+
+    #[cfg(not(windows))]
+    let payload = {
+        // ⚠ 非 Windows 上没有等价的「系统帮你管密钥」的机制，
+        //   所以这里就是明文。不要假装它被加密了
+        let mut buf = SECRET_MAGIC.to_vec();
+        buf.extend_from_slice(value.as_bytes());
+        buf
+    };
+
+    std::fs::write(path, payload).map_err(|err| format!("写入失败：{err}"))
+}
+
+/// 存 API 密钥。值**只进不出** —— 没有对应的「读出来」命令
+#[tauri::command]
+fn save_secret(app: tauri::AppHandle, value: String) -> Result<(), String> {
+    let path = secret_file(&app)?;
+    write_secret(&path, value.trim())
+}
+
+/// 前端只问这个 —— 用来决定「显示配置界面」还是「可以开聊了」
+#[tauri::command]
+fn has_secret(app: tauri::AppHandle) -> Result<bool, String> {
+    let path = secret_file(&app)?;
+    // ⚠ 这里走完整的解密流程，而不是「文件存在就算配过」——
+    //   在别的机器上拷过来的文件解不开，那种情况下应该让用户重新配，
+    //   而不是等他发消息时才报错
+    Ok(read_secret(&path).map(|key| !key.trim().is_empty()).unwrap_or(false))
+}
+
+#[tauri::command]
+fn clear_secret(app: tauri::AppHandle) -> Result<(), String> {
+    let path = secret_file(&app)?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|err| format!("删除失败：{err}"))?;
+    }
+    Ok(())
+}
+
+/// 复用同一个 HTTP 客户端。
+/// ★ 每次新建 Client 会连连接池一起丢掉，逐轮对话时开销很明显
+static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    HTTP_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            // 模型「思考 + 写代码」可能要很久，超时给宽一点；
+            // 但**不能不给** —— 没有超时的话网络一断这个命令就永远挂着
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .expect("构造 HTTP 客户端不该失败")
+    })
+}
+
+/// 发起一次对话，把响应**原始文本**逐块 emit 回前端。
+///
+/// 事件：
+///   `chat-delta` —— 每收到一块就发一次（可能是半行，前端要自己缓冲）
+///   `chat-end`   —— 这一轮结束（正常或出错都发，前端靠它收尾）
+#[tauri::command]
+async fn chat_stream(
+    app: tauri::AppHandle,
+    request_id: String,
+    request: ChatRequest,
+) -> Result<(), String> {
+    use futures_util::StreamExt;
+    use tauri::Emitter;
+
+    let key = {
+        let path = secret_file(&app)?;
+        // 走 read_secret 而不是直接读文件 —— 密钥在磁盘上是**加密**的
+        read_secret(&path)?.trim().to_string()
+    };
+    if key.is_empty() {
+        return Err("还没配置 API 密钥".into());
+    }
+
+    let url = format!("{}/chat/completions", request.base_url.trim_end_matches('/'));
+
+    let mut body = serde_json::json!({
+        "model": request.model,
+        "messages": request.messages,
+        // ★ 不写 stream 的话服务端会把整个回复一次返回，
+        //   那「逐字输出」的效果就没了
+        "stream": true,
+    });
+    if let Some(tools) = request.tools {
+        if !tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(tools);
+        }
+    }
+    if let Some(temperature) = request.temperature {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+
+    let send = http_client()
+        .post(&url)
+        .bearer_auth(&key)
+        .json(&body)
+        .send()
+        .await;
+
+    let response = match send {
+        Ok(response) => response,
+        Err(err) => {
+            let _ = app.emit(
+                "chat-end",
+                ChatEndEvent {
+                    request_id,
+                    error: Some(format!("请求失败：{err}")),
+                },
+            );
+            return Ok(());
+        }
+    };
+
+    // ★ 非 2xx 也要把**响应体**读出来 —— 服务端会在这里说明原因
+    //   （密钥错了、模型名不对、余额不足…），只报状态码的话用户无从下手
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        let _ = app.emit(
+            "chat-end",
+            ChatEndEvent {
+                request_id,
+                error: Some(format!("服务端返回 {status}：{}", detail.trim())),
+            },
+        );
+        return Ok(());
+    }
+
+    // ★★ UTF-8 边界：`bytes_stream()` 给的一块**不保证**落在字符边界上，
+    //   直接 `from_utf8_lossy` 会在中文被切开时偶发一个 `�`。
+    //   做法是攒着，只在「能完整解码」的部分才发出去，剩下的字节留到下一块
+    let mut pending: Vec<u8> = Vec::new();
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let bytes = match chunk {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let _ = app.emit(
+                    "chat-end",
+                    ChatEndEvent {
+                        request_id,
+                        error: Some(format!("读取响应中断：{err}")),
+                    },
+                );
+                return Ok(());
+            }
+        };
+
+        pending.extend_from_slice(&bytes);
+
+        // 从尾部往回找「合法的截断点」：一个不完整的多字节序列最多 3 个字节
+        let valid_upto = match std::str::from_utf8(&pending) {
+            Ok(_) => pending.len(),
+            Err(err) => err.valid_up_to(),
+        };
+
+        if valid_upto > 0 {
+            let text = String::from_utf8_lossy(&pending[..valid_upto]).to_string();
+            pending.drain(..valid_upto);
+            let _ = app.emit(
+                "chat-delta",
+                ChatDeltaEvent {
+                    request_id: request_id.clone(),
+                    text,
+                },
+            );
+        }
+    }
+
+    // 收尾：还有残余字节就说明流被切断了，但也要尽量交出去
+    if !pending.is_empty() {
+        let _ = app.emit(
+            "chat-delta",
+            ChatDeltaEvent {
+                request_id: request_id.clone(),
+                text: String::from_utf8_lossy(&pending).to_string(),
+            },
+        );
+    }
+
+    let _ = app.emit(
+        "chat-end",
+        ChatEndEvent {
+            request_id,
+            error: None,
+        },
+    );
+
+    Ok(())
+}
+
+// ============================ 全文搜索 ============================
+//
+// ★ 为什么不复用 `walk()`：那个函数是给文件树用的 —— 它返回的是「结构」，
+//   受 MAX_DEPTH 限制，而且不读文件内容。搜索要的是「把所有能读的文件过一遍」，
+//   是另一件事，硬套只会让两边都别扭。
+//   ⚠ 但**共用了同一份 IGNORED_DIRS** —— 这条规则必须一致，
+//     不然会出现「文件树里看不到 node_modules、但搜索能搜到」这种怪事。
+
+/// 一条匹配
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchMatch {
+    path: String,
+    /// 1 起的行号（Monaco 的 setPosition 也是 1 起）
+    line: usize,
+    /// 1 起的列号，**按字符数**算（Monaco 的 column 也是字符口径）
+    column: usize,
+    /// 整行的内容（去掉首尾空白，省得结果列表里一堆缩进）
+    text: String,
+    /// 匹配在 `text` 里的起止字符下标，给前端做高亮
+    start: usize,
+    end: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchResponse {
+    matches: Vec<SearchMatch>,
+    /// 是不是撞到上限提前停了 —— 前端要告诉用户「结果被截断了」
+    truncated: bool,
+    /// 实际扫了多少个文件 —— 给用户一个「它确实干活了」的反馈
+    files_scanned: usize,
+}
+
+/// 一次搜索最多返回多少条。不封顶的话大项目能把前端灌死
+const MAX_SEARCH_RESULTS: usize = 1000;
+/// 单个文件超过这个大小就跳过。
+/// ⚠ 比 `MAX_FILE_BYTES`（5MB，给「打开一个文件」用的）更保守 ——
+///   搜索是**批量**读文件，同一个上限会让一次搜索读进来几百 MB
+const MAX_SEARCH_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// 单行最多取多少字符。压缩过的 js 可能一行几十万字符
+const MAX_LINE_CHARS: usize = 400;
+/// 防软链接成环的兜底深度
+const MAX_SEARCH_DEPTH: usize = 32;
+
+/// 把所有值得搜的文件收集起来。和 `walk()` 共用 IGNORED_DIRS，但不设业务深度上限
+fn collect_search_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > MAX_SEARCH_DEPTH {
+        return;
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        let path = entry.path();
+
+        if meta.is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if IGNORED_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            collect_search_files(&path, out, depth + 1);
+        } else if meta.is_file() && meta.len() <= MAX_SEARCH_FILE_BYTES {
+            out.push(path);
+        }
+    }
+}
+
+/// 在一个文件的内容里找出所有匹配。
+///
+/// 返回 `(行号, 列号, 行内容, 匹配起点, 匹配终点)` —— 后两个是**相对行内容**的下标。
+///
+/// ★ 下标全部按 **UTF-16 单位**算（`encode_utf16().count()`），**不是**字符数。
+///   为什么不直接用 `chars().count()`（直觉上更「对」）：
+///   - Monaco 的 `column` 是 UTF-16 口径
+///   - 前端高亮要用 `String.prototype.slice()`，JS 的字符串下标也是 UTF-16 口径
+///   两边都按这个来，前端拿到的下标才能**直接**用。
+///   ⚠ 对 BMP 字符（中文、ASCII）字符数 = UTF-16 长度，看不出差别；
+///     但 emoji（补充平面，如 😀）是「1 个 char、2 个 UTF-16 单位」，
+///     用字符数当列号会让光标插到 emoji 中间，高亮也会短一截
+fn search_in_text(
+    content: &str,
+    query: &str,
+    case_sensitive: bool,
+) -> Vec<(usize, usize, String, usize, usize)> {
+    let mut hits = Vec::new();
+    if query.is_empty() {
+        return hits;
+    }
+
+    let needle = if case_sensitive {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
+    let needle_units = needle.encode_utf16().count();
+
+    for (line_index, raw_line) in content.lines().enumerate() {
+        // 超长行先截断再比对。
+        // ⚠ 这一步按 char 切（不是 UTF-16）—— 按 UTF-16 切可能把代理对劈成两半，
+        //   得到一个非法字符串
+        let line: String = raw_line.chars().take(MAX_LINE_CHARS).collect();
+        let haystack = if case_sensitive {
+            line.clone()
+        } else {
+            line.to_lowercase()
+        };
+
+        // 去掉首尾空白后的行，才是展示给用户看的
+        let shown = line.trim();
+        // 展示文本相对原始行「少了几个 UTF-16 单位」——
+        // 高亮下标要减掉这个偏移，否则会整体往前偏
+        let leading = line.encode_utf16().count() - line.trim_start().encode_utf16().count();
+        let shown_units = shown.encode_utf16().count();
+
+        let mut from = 0;
+        while let Some(offset) = haystack[from..].find(&needle) {
+            let byte_start = from + offset;
+            let byte_end = byte_start + needle.len();
+
+            // ★ 字节下标 → UTF-16 单位下标
+            let unit_start = line[..byte_start].encode_utf16().count();
+            let unit_end = unit_start + needle_units;
+
+            hits.push((
+                line_index + 1,
+                unit_start + 1,
+                shown.to_string(),
+                unit_start.saturating_sub(leading).min(shown_units),
+                unit_end.saturating_sub(leading).min(shown_units),
+            ));
+
+            from = byte_end;
+            // 单文件上限：防某些病态文件（一行里出现几千次）把内存吃光
+            if hits.len() > 500 {
+                return hits;
+            }
+        }
+    }
+
+    hits
+}
+
+/// 在整个文件夹里搜关键词
+#[tauri::command]
+async fn search_in_folder(
+    path: String,
+    query: String,
+    case_sensitive: bool,
+) -> Result<SearchResponse, String> {
+    if query.trim().is_empty() {
+        return Ok(SearchResponse {
+            matches: Vec::new(),
+            truncated: false,
+            files_scanned: 0,
+        });
+    }
+
+    // ★ 搜索是重活（要挨个读文件），必须挪到**阻塞线程池**里。
+    //   直接在 async fn 主体里跑会把运行时线程占住，同时发起的其它调用只能排队
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut files = Vec::new();
+        collect_search_files(Path::new(&path), &mut files, 0);
+
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        let mut truncated = false;
+        let mut files_scanned = 0usize;
+
+        for file in &files {
+            if matches.len() >= MAX_SEARCH_RESULTS {
+                truncated = true;
+                break;
+            }
+
+            // 读不出来（二进制 / 没权限 / 不是 UTF-8）就当它不存在。
+            // 搜索应该容错，不该因为一个文件就整个失败
+            let Ok(bytes) = fs::read(file) else { continue };
+            let Ok(content) = String::from_utf8(bytes) else {
+                continue;
+            };
+
+            files_scanned += 1;
+            let file_path = file.to_string_lossy().replace('\\', "/");
+
+            for (line, column, text, start, end) in
+                search_in_text(&content, &query, case_sensitive)
+            {
+                if matches.len() >= MAX_SEARCH_RESULTS {
+                    truncated = true;
+                    break;
+                }
+                matches.push(SearchMatch {
+                    path: file_path.clone(),
+                    line,
+                    column,
+                    text,
+                    start,
+                    end,
+                });
+            }
+        }
+
+        Ok(SearchResponse {
+            matches,
+            truncated,
+            files_scanned,
+        })
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+// ============================ 终端（PTY） ============================
+//
+// 数据流：
+//   前端 xterm --onData--> pty_write(id, data)      用户敲的键
+//                          pty_resize(id, cols, rows) 面板尺寸变了
+//   Rust 读线程 --emit("pty-output")--> 前端 xterm.write(字节)
+//
+// ★ 三个关键决策：
+//
+// 1. **输出必须传字节，不能传 String**。PTY 吐的是裸字节流，一个多字节字符
+//    （中文、emoji）可能正好横跨两次 read()。两边各自解 UTF-8 都会失败，
+//    屏幕上就变成 `�`。所以 Rust 侧不解码，原样传过去，由 xterm 自己处理
+//
+// 2. **走 base64 而不是 Vec<u8>**。Tauri 的事件 payload 是 JSON，
+//    `Vec<u8>` 会被序列化成 `[27,91,51,50,109,...]` 数字数组，体积膨胀约 3 倍，
+//    高频输出（`dir /s`）会直接把 JSON 解析干掉。base64 只膨胀 4/3
+//
+// 3. **读输出必须开独立线程**。`read()` 是阻塞的，挂在命令里会把
+//    Tauri 的命令线程整个卡死 —— 终端会“敲了没反应”
+
+/// 一个终端会话的全部家当。三样缺一不可：
+/// writer 用来写输入，master 用来 resize，child 用来 kill
+struct PtySession {
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn MasterPty + Send>,
+    child: Box<dyn Child + Send + Sync>,
+}
+
+/// 所有活着的会话。前端拿 id 来寻址
+#[derive(Default)]
+struct PtyState(Mutex<HashMap<u32, PtySession>>);
+
+impl Drop for PtyState {
+    fn drop(&mut self) {
+        // 应用退出时把子进程全收掉 —— 不然 powershell 会留在后台变成孤儿进程
+        if let Ok(mut map) = self.0.lock() {
+            for (_, session) in map.iter_mut() {
+                let _ = session.child.kill();
+            }
+        }
+    }
+}
+
+/// 推给前端的一条输出。data 是 base64，不是明文
+#[derive(Clone, Serialize)]
+struct PtyOutput {
+    id: u32,
+    data: String,
+}
+
+/// 起一个 shell 会话。id 由前端生成（前端维护计数器，不依赖后端状态）
+#[tauri::command]
+fn pty_spawn(
+    app: AppHandle,
+    state: State<'_, PtyState>,
+    id: u32,
+    cols: u16,
+    rows: u16,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|err| err.to_string())?;
+
+    let mut cmd = CommandBuilder::new("powershell.exe");
+    // -NoLogo：不打印版权头，省得开盘就刷掉一屏
+    cmd.arg("-NoLogo");
+    // ⚠ 只在目录真的存在时才设 cwd —— 直接 cwd() 一个不存在的路径
+    //   会让 spawn 整个失败，而用户只是换了个工作区而已
+    if let Some(dir) = cwd {
+        if !dir.is_empty() && Path::new(&dir).is_dir() {
+            cmd.cwd(dir);
+        }
+    }
+
+    let child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|err| err.to_string())?;
+
+    // ★ 必须把 slave 端丢掉：它是“另一端”的句柄，留着的话 master 永远读不到 EOF，
+    //   子进程退出后读线程会一直挂在那里
+    drop(pair.slave);
+
+    let mut reader = pair.master.try_clone_reader().map_err(|err| err.to_string())?;
+    let writer = pair.master.take_writer().map_err(|err| err.to_string())?;
+
+    state.0.lock().map_err(|err| err.to_string())?.insert(
+        id,
+        PtySession {
+            writer,
+            master: pair.master,
+            child,
+        },
+    );
+
+    // 读线程：PTY 有输出就 base64 后 emit 给前端
+    let app_handle = app.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                // Ok(0) = 子进程关了那一端，正常收工
+                Ok(0) => break,
+                Ok(count) => {
+                    let data = base64::engine::general_purpose::STANDARD.encode(&buf[..count]);
+                    if app_handle
+                        .emit("pty-output", PtyOutput { id, data })
+                        .is_err()
+                    {
+                        // emit 失败 = 窗口没了，没必要再读
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    Ok(())
+}
+
+/// 把用户敲的键写进 PTY
+#[tauri::command]
+fn pty_write(state: State<'_, PtyState>, id: u32, data: String) -> Result<(), String> {
+    let mut map = state.0.lock().map_err(|err| err.to_string())?;
+    let session = map.get_mut(&id).ok_or("终端会话不存在")?;
+    session
+        .writer
+        .write_all(data.as_bytes())
+        .map_err(|err| err.to_string())?;
+    // ★ 必须 flush：不刷的话输入会缓在 writer 里，表现为“敲了不出字”
+    session.writer.flush().map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// 面板尺寸变了，告诉 PTY。不告诉的话 shell 会按 80 列排版，
+/// 换行位置全是错的（vim / top 这类全屏程序会花屏）
+#[tauri::command]
+fn pty_resize(state: State<'_, PtyState>, id: u32, cols: u16, rows: u16) -> Result<(), String> {
+    let map = state.0.lock().map_err(|err| err.to_string())?;
+    let session = map.get(&id).ok_or("终端会话不存在")?;
+    session
+        .master
+        .resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|err| err.to_string())?;
+    Ok(())
+}
+
+/// 关掉会话（面板里的 × 或标签切换时）
+#[tauri::command]
+fn pty_kill(state: State<'_, PtyState>, id: u32) -> Result<(), String> {
+    let mut map = state.0.lock().map_err(|err| err.to_string())?;
+    if let Some(mut session) = map.remove(&id) {
+        let _ = session.child.kill();
+    }
+    Ok(())
+}
+
 // ============================ 启动 ============================
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -665,8 +1783,20 @@ pub fn run() {
             read_preview_bytes,
             write_file,
             scan_grammar_extensions,
-            scan_theme_extensions
+            scan_theme_extensions,
+            scan_snippet_extensions,
+            search_in_folder,
+            pty_spawn,
+            pty_write,
+            pty_resize,
+            pty_kill,
+            save_secret,
+            has_secret,
+            clear_secret,
+            chat_stream
         ])
+        // 终端会话表。放在 State 里而不是全局变量 —— Tauri 会管它的生命周期
+        .manage(PtyState::default())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

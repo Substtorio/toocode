@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "new_vscode",
+  "productName": "Toocode",
   "version": "0.1.0",
-  "identifier": "com.new_vscode.app",
+  "identifier": "com.toocode.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "new_vscode",
+        "title": "Toocode",
         "width": 800,
-        "height": 600
+        "height": 600,
+        "theme": "Dark",
+        "decorations": false
       }
     ],
     "security": {

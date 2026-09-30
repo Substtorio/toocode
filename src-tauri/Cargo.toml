@@ -1,7 +1,7 @@
 [package]
-name = "new_vscode"
+name = "toocode"
 version = "0.1.0"
-description = "A Tauri App"
+description = "Toocode —— 一个仿 VS Code 的桌面代码编辑器"
 authors = ["you"]
 edition = "2021"
 
@@ -11,7 +11,7 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "new_vscode_lib"
+name = "toocode_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -23,6 +23,35 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+portable-pty = "0.9.0"
+base64 = "0.23.1"
+# AI 对话要用。
+#
+# ★ 为什么请求必须从 Rust 发、不能在浏览器里 fetch：
+#   云端 API 基本都不允许浏览器跨域（CORS），WebView 里发会被直接拦掉。
+#   而且密钥放前端就等于公开 —— F12 一看就有
+#
+# ★ features 的选法：
+#   json   —— 让 reqwest 自己处理请求体 / 响应体的 JSON
+#   stream —— 流式响应（`bytes_stream()`），模型回话是逐 token 来的，靠它
+#   ⚠ 不用 `default-features = false`：默认带的那套 TLS 在 Windows 上走 schannel，
+#     不用额外拉 OpenSSL，够用了。换成 rustls 会多一堆依赖、编译明显变慢
+reqwest = { version = "0.12", features = ["json", "stream"] }
+# 消费上面的 stream 要用 StreamExt
+futures-util = "0.3"
+
+# API 密钥的加密存储（**仅 Windows**）。
+#
+# ★ 用 DPAPI（CryptProtectData）—— 这是 Windows 自带的能力：
+#   加密出来的数据**只有同一个用户在同一台机器上**能解开，
+#   密钥材料由系统保管，我们不用自己发明一套加密方案
+# ★ 放在 `[target.'cfg(windows)']` 里：其它平台不会尝试编译它
+# ★ 已经在依赖树里了（Tauri 自己带着），所以加它不会多下载什么
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
