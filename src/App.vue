@@ -341,6 +341,11 @@ const CSS_VAR_BY_COLOR: Array<[cssVar: string, vscodeKey: string]> = [
   ["--color-text-emphasis", "tab.activeForeground"],
   ["--color-icon", "activityBar.inactiveForeground"],
   ["--color-icon-active", "activityBar.foreground"],
+  /* 鼠标悬停在活动栏图标上时，图标背后那个圆角方块。
+     ★ 这是 VS Code 「modern UI」的一套键，**主题文件里真有**（深浅都有）：
+       深色 #FFFFFF11（半透明白）、浅色 #F2F2F2。
+       所以能走正常映射，不用像 terminal.ansi* 那样写死两套 */
+  ["--color-icon-hover-bg", "modernActivityBarItem.hoverBackground"],
   ["--color-link", "textLink.foreground"],
 ];
 
@@ -4725,8 +4730,48 @@ watch(activeTabPath, async (path) => {
 
    ★ 写在 CSS 而不是 svg 的属性上：「图标是填充的」这件事只有一个出处，
      模板里不用重复三遍。将来真要加一个描边图标，再按需开例外 */
+/* ⚠ `position: relative` + `z-index: 1` 不只是为了好看 —— 见下面 ::after 那段 */
 .activity-item svg {
+  position: relative;
+  /* ★★ 这个 1 不能省，而且**不能只写 position: relative**。
+     按钮里的三个东西（::before 竖线、svg、::after 方块）都是「定位元素」：
+     ::before / svg 是 `z-index: auto`，::after 是 `z-index: 0` ——
+     而 auto 和 0 在绘制时是**同一档**，同档里按 DOM 顺序画。
+     ::after 排在 svg **后面**，所以方块会盖在图标上面。
+     只有把 svg 抬到 1（真正比 0 大）才稳。 */
+  z-index: 1;
   fill: currentColor;
+}
+
+/* ★ 悬停时图标背后浮出来的那个圆角方块。
+   ---- 为什么要有 ::after 这一层，不能直接把背景刷在 .activity-item 上 ----
+   因为按钮是满宽的（48×48），给它加背景得到的是「一条顶到两边的色带」，
+   而不是「围着图标的一个方块」。
+
+   ---- 尺寸和圆角都是从 VS Code 的 modern UI 抄的 ----
+   · 边长 `action高度 - 4` ⇒ 48 - 4 = **44**，也就是 `inset: 2px`
+   · 圆角 `--vscode-cornerRadius-small` = **4px**
+   （VS Code 的写法是 `width/height: calc(var(--activity-bar-action-height, 36px) - 4px)`
+     加 `left: calc((bar宽 - action高 + 4px) / 2)` —— 因为它的活动栏宽度可以变。
+      我们这里活动栏固定 48、按钮也固定 48，`inset: 2px` 是同一个结果，还更直白）
+
+   ⚠ ★ **z-index 那两句不能省**。按 CSS 绘制顺序，绝对定位的伪元素画在
+     **在流内联元素**（svg 那层）之后 —— 默认情况下这个方块会压在图标上面。
+     给 svg 加 `position: relative; z-index: 1`，方块留在 0，
+     两者才真正分到两档（写成 `auto` 和 `0` 是同一档，仍然靠 DOM 顺序，没用）*/
+.activity-item::after {
+  content: "";
+  position: absolute;
+  inset: 2px;
+  z-index: 0;
+  border-radius: 4px;
+  background: transparent;
+}
+
+/* 只在**非激活**的项上亮 —— 和 VS Code 一致（它写的是 `:not(.checked):hover`）。
+   激活项已经有左侧那条蓝竖线了，再叠一个方块反而分不清「哪个是当前视图」 */
+.activity-item:not(.active):hover::after {
+  background: var(--color-icon-hover-bg);
 }
 
 /* 激活项左侧那条 2px 竖线 —— VS Code 的标志性细节。
@@ -5906,6 +5951,10 @@ kbd {
   --color-tab-hover-fg: #cccccc;
   /* 活动栏「当前视图」左侧那条竖线。VS Code 用 activityBar.activeBorder 管它 */
   --color-activitybar-active-border: #007acc;
+  /* 悬停在活动栏图标上时背后那个圆角方块。
+     ★ 值就是 modernActivityBarItem.hoverBackground 的深色档（半透明白）——
+       这里只是主题没加载时（比如直接在浏览器里看）的兜底 */
+  --color-icon-hover-bg: #ffffff11;
   /* ★ 「浮起」风格的底：活动栏 / 侧栏 / 编辑器 / 面板都是浮在它上面的卡片，
      卡片之间的缝隙里露出来的就是它。必须比**所有**卡片都深，否则缝隙看不出来。
      注意它不是任何主题键 —— 主题里没有比 activityBar.background(#181818) 更深的值了，
@@ -6029,6 +6078,9 @@ kbd {
      这两个值一变，激活项那条竖线也跟着变黑（它俩共用 --color-icon-active）*/
   --color-icon: #616161;
   --color-icon-active: #000000;
+  /* ★ 悬停方块在浅色下**不能用深色那套半透明白** ——
+     白铺在白底上等于没画。浅色主题给的是实色 #F2F2F2 */
+  --color-icon-hover-bg: #f2f2f2;
 
   --color-hover: #e8e8e8;
   --color-selection: #0060c0;
