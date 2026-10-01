@@ -25,7 +25,7 @@ import {
 } from "./agentChanges";
 // 把 VS Code 的主题文件翻译成 Monaco 主题的地方（插件机制的第二块）
 import { loadVscodeTheme } from "./vscodeTheme";
-import { isInside, normalizePath, relativePath } from "./pathUtils";
+import { isInside, normalizePath, relativePath, samePath } from "./pathUtils";
 // 编辑器状态桥：把「用户此刻在编辑什么」暴露给 Agent
 import {
   MAX_SELECTION_CHARS,
@@ -1117,6 +1117,8 @@ const currentLanguage = computed(() => {
 // Monaco 的事件订阅会返回一个 IDisposable，组件卸载时要手动释放，否则会内存泄漏
 let cursorSubscription: monaco.IDisposable | null = null;
 let fontSizeSubscription: monaco.IDisposable | null = null;
+/** marker 变化的订阅（「问题」面板用） */
+let markersSubscription: monaco.IDisposable | null = null;
 
 // ---------- 文档模型（model）管理 ----------
 //
@@ -1128,6 +1130,128 @@ let fontSizeSubscription: monaco.IDisposable | null = null;
 // 这样每个文件的撤销栈和视图状态都能各自保留下来。
 const models = new Map<string, monaco.editor.ITextModel>();
 
+/**
+ * 从一个 model 反查它的磁盘路径。
+ *
+ * ⚠ **只能遍历着找，不能读 `model.uri`**：我们的 model 是匿名建的
+ *   （`createModel(content, language)` 没传 uri ⇒ `inmemory://model/N`），
+ *   路径只存在 `models` 这张表的 key 上。
+ *   之所以不建反向索引表：索引得跟着 openFile / 另存为 / 关标签 /
+ *   resetWorkspace 一起维护，总有漏的地方，而漏掉的表现是
+ *   「文件明明开着却读不到」，不报错。标签最多十几个，遍历不会漏
+ *
+ * ★ 使用者有两处：「跳转到定义」的 host，和「问题」面板
+ *   （marker 只带 uri，也得反查回路径才知道是哪个文件）
+ */
+function pathOfModel(model: monaco.editor.ITextModel): string | null {
+  for (const [path, candidate] of models) {
+    if (candidate === model) return path;
+  }
+  return null;
+}
+
+/**
+ * 内置语言服务的 defaults 对象（每套都有 modeConfiguration + setModeConfiguration）。
+ *
+ * ⚠ ★ 0.56 里它们挂在 **`monaco.json` / `monaco.css` / `monaco.html`** 上，
+ *   而**不是**旧版的 `monaco.languages.json` —— 后者在新版里根本不存在
+ *   （实测：`monaco.languages.json === undefined`）
+ */
+function builtinDefaultsFor(languageId: string) {
+  switch (languageId) {
+    case "json":
+    case "jsonc":
+      return monaco.json.jsonDefaults;
+    case "css":
+      return monaco.css.cssDefaults;
+    case "scss":
+      return monaco.css.scssDefaults;
+    case "less":
+      return monaco.css.lessDefaults;
+    case "html":
+      return monaco.html.htmlDefaults;
+    default:
+      // 没有内置服务的语言（rust / python …）本来就没什么可冲突的
+      return null;
+  }
+}
+
+/**
+ * 把一个语言**完全交给真服务器**：关掉 Monaco 内置那套语言服务。
+ *
+ * ★★ 为什么非关不可：内置的 json / css / html 服务和真服务器**跑的是同一份代码**
+ *   （vscode-json-languageservice 那一套），于是同一件事被做了两遍，
+ *   而且两遍的结果**都会显示出来**：
+ *   · 诊断 → 「问题」面板里每条错出现两次（实测：broken.json 2 行、
+ *     style.css 4 行，两行的位置和消息完全一样）
+ *   · 补全 → 建议列表里 `margin` / `margin-top` 各出现两遍
+ *   VS Code 自己**不带**内置语言服务，只用真服务器那一套 ——
+ *   所以「有真服务器就把它关掉」是往 VS Code 靠，不是特例
+ *
+ * ⚠ 反过来说：**没有**真服务器的语言（这台机器上的 TypeScript）绝不能动 ——
+ *   内置那份是唯一的语言特性来源，关掉就什么都没有了。
+ *   这正是这件事要挂在 `onServerReady` 上、而不是启动时无脑关一遍的原因
+ */
+function handLanguageToServer(languageId: string) {
+  const defaults = builtinDefaultsFor(languageId);
+  if (defaults === null) return;
+
+  // ★ 十三个能力全部显式写 false（键名是从运行时的 modeConfiguration 里读出来的，
+  //   不是拄的）。不写全的话，`setModeConfiguration` 是**整体替换**而非合并，
+  //   没写的项会变成 undefined —— 效果一样是关掉，但读的人不知道这是有意的
+  defaults.setModeConfiguration({
+    completionItems: false,
+    hovers: false,
+    documentSymbols: false,
+    definitions: false,
+    references: false,
+    documentHighlights: false,
+    rename: false,
+    colors: false,
+    foldingRanges: false,
+    diagnostics: false,
+    selectionRanges: false,
+    documentFormattingEdits: false,
+    documentRangeFormattingEdits: false,
+  });
+
+  console.info(`[LSP] ${languageId}：内置语言服务已交出（只由真服务器负责，避免同一件事做两遍）`);
+  handedOverLanguages.add(languageId);
+  dropForeignMarkers();
+}
+
+/**
+ * 已经交给真服务器的语言。
+ *
+ * ★ 用普通 Set 而不是 ref：它只在回调里读，不参与渲染
+ */
+const handedOverLanguages = new Set<string>();
+
+/**
+ * 把某个语言交给真服务器时，清掉**其它 owner** 的 marker。
+ *
+ * ★★ 为什么不能「只清一次」：内置语言服务是走 **worker** 校验的，
+ *   而 worker 是异步的 —— 实测踩到的顺序是：
+ *     关掉内置服务 → 清 marker（此刻还没有）→ **worker 的回复才落地** →
+ *     于是「问题」面板里依旧每条出现两次，看起来就像「关了没生效」。
+ *   ⇒ 所以这条规则要**持续生效**：只要这个语言已经交出去了，
+ *     非 `lsp` 的 marker 就不能留。
+ *
+ * ⚠ 按 owner 筛而不是按名字写死：owner 叫什么名字是 Monaco 内部的事
+ */
+function dropForeignMarkers() {
+  if (handedOverLanguages.size === 0) return;
+
+  for (const marker of monaco.editor.getModelMarkers({})) {
+    if (marker.owner === "lsp") continue;
+    const model = monaco.editor.getModel(marker.resource);
+    if (model === null) continue;
+    // 语言直接问 model —— 比按路径查扩展名表更准（路径可能来自别的磁盘）
+    if (!handedOverLanguages.has(model.getLanguageId())) continue;
+    monaco.editor.setModelMarkers(model, marker.owner, []);
+  }
+}
+
 // ---------- 语言特性的两个口子 ----------
 //
 // 补全 / 悬停 / 跳转定义这三件事在 lspFeatures.ts 里注册，但它不该知道
@@ -1137,22 +1261,7 @@ const models = new Map<string, monaco.editor.ITextModel>();
 //   Monaco 的 standalone 版自己不会去开那个文件（见 lspFeatures 里的说明），
 //   得由我们把它接到自己的标签栏 / model 体系上
 const lspFeatureHost = {
-  /**
-   * 从一个 model 反查磁盘路径。
-   *
-   * ⚠ 只能**遍历**着找，不能读 `model.uri`：我们的 model 是匿名建的
-   *   （`createModel(content, language)` 没传 uri ⇒ `inmemory://model/3`），
-   *   路径只存在 `models` 这张表的 key 上。
-   *   之所以不建反向索引表：索引得跟着 openFile / 另存为 / 关标签 /
-   *   resetWorkspace 一起维护，总有漏的地方，而漏掉的表现是
-   *   「文件明明开着却读不到」，不报错。标签最多十几个，遍历不会漏
-   */
-  pathOfModel(model: monaco.editor.ITextModel): string | null {
-    for (const [path, candidate] of models) {
-      if (candidate === model) return path;
-    }
-    return null;
-  },
+  pathOfModel,
 
   /**
    * 打开别的文件并**等到它真的成了编辑器上的 model**，再返回编辑器。
@@ -1475,6 +1584,7 @@ const WELCOME_SHORTCUTS: readonly WelcomeShortcut[] = [
   { keys: ["Ctrl", "J"], label: "显示 / 隐藏面板", primary: true },
 
   // ---- 折叠区：下面这些默认收起 ----
+  { keys: ["Ctrl", "Shift", "M"], label: "问题面板" },
   // 文件。这几条是全局的 —— 焦点在侧栏或标签栏时也生效
   { keys: ["Ctrl", "N"], label: "新建文件" },
   { keys: ["Ctrl", "Shift", "S"], label: "另存为…" },
@@ -2473,6 +2583,168 @@ function handlePanelShortcut(event: KeyboardEvent) {
   togglePanel();
 }
 
+// ---------- 「问题」面板 ----------
+//
+// ★ 数据来源是 **Monaco 自己那张 marker 表**，不是我们另存一份：
+//   `lsp.ts` 把 LSP 诊断写进去、Monaco 内置 worker 也写进去 ——
+//   从 markers 读就自动把所有来源都收进来了，不用挨个去接
+
+/** 「问题」面板里的一行 */
+interface ProblemRow {
+  path: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  severity: monaco.MarkerSeverity;
+  message: string;
+  /** 谁报的（json / lsp / …）。空字符串表示没写 */
+  source: string;
+}
+
+const problemRows = ref<ProblemRow[]>([]);
+
+/**
+ * 三种严重程度的图标：原生 codicon 的 path 原样抄的（16×16 网格）。
+ *
+ * ⚠ ★ codicon 是**填充**图形（`fill="currentColor"`，没有 stroke）：
+ *   图上那个「空心圆」靠的是子路径**绕向相反**，在 nonzero 填充规则下把内圈挖掉。
+ *   所以模板里**不写** fill / stroke，统一由 CSS 给 `fill: currentColor` ——
+ *   写成 `fill:none; stroke:…` 得到的是「粗描边轮廓图」，和原生不是一个东西
+ *   （活动栏那三个图标踩过同一个坑）
+ */
+const PROBLEM_ICON: Record<string, string> = {
+  error:
+    "M8 1C4.14 1 1 4.14 1 8C1 11.86 4.14 15 8 15C11.86 15 15 11.86 15 8C15 4.14 11.86 1 8 1ZM8 14C4.691 14 2 11.309 2 8C2 4.691 4.691 2 8 2C11.309 2 14 4.691 14 8C14 11.309 11.309 14 8 14ZM10.854 5.854L8.708 8L10.854 10.146C11.049 10.341 11.049 10.658 10.854 10.853C10.756 10.951 10.628 10.999 10.5 10.999C10.372 10.999 10.244 10.95 10.146 10.853L8 8.707L5.854 10.853C5.756 10.951 5.628 10.999 5.5 10.999C5.372 10.999 5.244 10.95 5.146 10.853C4.951 10.658 4.951 10.341 5.146 10.146L7.292 8L5.146 5.854C4.951 5.659 4.951 5.342 5.146 5.147C5.341 4.952 5.658 4.952 5.853 5.147L7.999 7.293L10.145 5.147C10.34 4.952 10.657 4.952 10.852 5.147C11.047 5.342 11.047 5.659 10.852 5.854H10.854Z",
+  warning:
+    "M14.831 11.965L9.206 1.714C8.965 1.274 8.503 1 8 1C7.497 1 7.035 1.274 6.794 1.714L1.169 11.965C1.059 12.167 1 12.395 1 12.625C1 13.383 1.617 14 2.375 14H13.625C14.383 14 15 13.383 15 12.625C15 12.395 14.941 12.167 14.831 11.965ZM13.625 13H2.375C2.168 13 2 12.832 2 12.625C2 12.561 2.016 12.5 2.046 12.445L7.671 2.195C7.736 2.075 7.863 2 8 2C8.137 2 8.264 2.075 8.329 2.195L13.954 12.445C13.984 12.501 14 12.561 14 12.625C14 12.832 13.832 13 13.625 13ZM8.75 11.25C8.75 11.664 8.414 12 8 12C7.586 12 7.25 11.664 7.25 11.25C7.25 10.836 7.586 10.5 8 10.5C8.414 10.5 8.75 10.836 8.75 11.25ZM7.5 9V5.5C7.5 5.224 7.724 5 8 5C8.276 5 8.5 5.224 8.5 5.5V9C8.5 9.276 8.276 9.5 8 9.5C7.724 9.5 7.5 9.276 7.5 9Z",
+  info:
+    "M8.49902 7.49998C8.49902 7.22384 8.27517 6.99998 7.99902 6.99998C7.72288 6.99998 7.49902 7.22384 7.49902 7.49998V10.5C7.49902 10.7761 7.72288 11 7.99902 11C8.27517 11 8.49902 10.7761 8.49902 10.5V7.49998ZM8.74807 5.50001C8.74807 5.91369 8.41271 6.24905 7.99903 6.24905C7.58535 6.24905 7.25 5.91369 7.25 5.50001C7.25 5.08633 7.58535 4.75098 7.99903 4.75098C8.41271 4.75098 8.74807 5.08633 8.74807 5.50001ZM8 1C4.13401 1 1 4.13401 1 8C1 11.866 4.13401 15 8 15C11.866 15 15 11.866 15 8C15 4.13401 11.866 1 8 1ZM2 8C2 4.68629 4.68629 2 8 2C11.3137 2 14 4.68629 14 8C14 11.3137 11.3137 14 8 14C4.68629 14 2 11.3137 2 8Z",
+  hint: "M8 1C5.419 1 2.75 2.964 2.75 6.25C2.75 8.167 3.637 9.184 4.224 9.856C4.408 10.067 4.598 10.285 4.628 10.398L5.568 13.889C5.744 14.543 6.34 14.999 7.017 14.999H8.984C9.662 14.999 10.257 14.542 10.432 13.889L11.372 10.397C11.402 10.285 11.593 10.067 11.776 9.856C12.363 9.183 13.25 8.167 13.25 6.25C13.25 3.355 10.895 1 8 1ZM9.467 13.63C9.408 13.848 9.209 14 8.984 14H7.017C6.791 14 6.593 13.848 6.534 13.63L6.095 12H9.906L9.467 13.63ZM11.022 9.199C10.741 9.522 10.497 9.802 10.407 10.137L10.175 10.999H5.826L5.594 10.138C5.503 9.801 5.26 9.522 4.977 9.199C4.43 8.572 3.75 7.792 3.75 6.25C3.75 3.59 5.911 2 8 2C10.344 2 12.25 3.907 12.25 6.25C12.25 7.792 11.569 8.572 11.022 9.199Z",
+};
+
+/** 严重程度 → 类名 / 图标名。用名字而不是内联色值：颜色归 CSS 主题管 */
+function problemTone(severity: monaco.MarkerSeverity): string {
+  switch (severity) {
+    case monaco.MarkerSeverity.Warning:
+      return "warning";
+    case monaco.MarkerSeverity.Info:
+      return "info";
+    case monaco.MarkerSeverity.Hint:
+      return "hint";
+    default:
+      return "error";
+  }
+}
+
+/** 重排整张问题列表 */
+function refreshProblems() {
+  const rows: ProblemRow[] = [];
+
+  for (const marker of monaco.editor.getModelMarkers({})) {
+    // ⚠ marker 只带 **uri**，而我们的 model 是匿名建的（inmemory://model/N）——
+    //   路径只能拿 model 回 `models` 表里反查（见 pathOfModel）
+    const model = monaco.editor.getModel(marker.resource);
+    const path = model === null ? null : pathOfModel(model);
+    // 查不到的是欢迎页 / diff 浮层那些临时 model —— 它们不该算「问题」。
+    // ★ 这一条顺带挡住了「同一个文件出现两遍」：diff 浮层会为同一个文件
+    //   再建一对 model，而 Monaco 自己那套 worker 也会往它们身上写 marker
+    if (path === null) continue;
+
+    rows.push({
+      path,
+      line: marker.startLineNumber,
+      column: marker.startColumn,
+      endLine: marker.endLineNumber,
+      endColumn: marker.endColumn,
+      severity: marker.severity,
+      message: marker.message,
+      source: marker.source ?? "",
+    });
+  }
+
+  // 排序：严重程度优先（错误在警告前面），再按文件、行列。
+  // ★ 不按「发现顺序」排 —— 那个顺序跟着服务器推送的先后变，
+  //   用户扫一眼列表时位置会跳来跳去
+  const rank: Record<number, number> = {
+    [monaco.MarkerSeverity.Error]: 0,
+    [monaco.MarkerSeverity.Warning]: 1,
+    [monaco.MarkerSeverity.Info]: 2,
+    [monaco.MarkerSeverity.Hint]: 3,
+  };
+  rows.sort(
+    (a, b) =>
+      (rank[a.severity] ?? 4) - (rank[b.severity] ?? 4) ||
+      a.path.localeCompare(b.path) ||
+      a.line - b.line ||
+      a.column - b.column,
+  );
+
+  problemRows.value = rows;
+}
+
+let problemRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * 让重排等一等再跑。
+ *
+ * ⚠ 打字时诊断会**连续**更新（每敲一个字服务器都推一次），
+ *   不防抖的话每一条都要重排 + 重渲染一遍列表 —— 问题多了就看得出来卡
+ */
+function scheduleRefreshProblems() {
+  if (problemRefreshTimer !== null) clearTimeout(problemRefreshTimer);
+  problemRefreshTimer = setTimeout(() => {
+    problemRefreshTimer = null;
+    refreshProblems();
+  }, 200);
+}
+
+/**
+ * 按文件分组。用「和前一条比」而不是 Map：
+ * 列表已经按 path 排过序了，相邻即同组 —— 少建一张表，也保持顺序
+ */
+const problemGroups = computed(() => {
+  const groups: Array<{ path: string; name: string; rows: ProblemRow[] }> = [];
+
+  for (const row of problemRows.value) {
+    const last = groups[groups.length - 1];
+    if (last !== undefined && last.path === row.path) last.rows.push(row);
+    else groups.push({ path: row.path, name: fileNameOf(row.path), rows: [row] });
+  }
+
+  return groups;
+});
+
+/** 点一条问题：跳过去，并把它标的那一段选中 */
+function openProblem(row: ProblemRow) {
+  revealAt({
+    path: row.path,
+    line: row.line,
+    column: row.column,
+    endLine: row.endLine,
+    endColumn: row.endColumn,
+  });
+}
+
+/** 打开「问题」面板 —— 快捷键和菜单共用这一个入口 */
+function showProblemsPanel() {
+  activePanelTab.value = "problems";
+  panelVisible.value = true;
+}
+
+/**
+ * Ctrl+Shift+M：打开问题面板（VS Code 就是这个键）。
+ * ★ 和 handlePanelShortcut 一样用**捕获阶段** —— Monaco 那边也可能绑了它，
+ *   冒泡阶段才监听就轮不到我们了
+ */
+function handleProblemsShortcut(event: KeyboardEvent) {
+  if (!event.ctrlKey || !event.shiftKey || event.altKey) return;
+  if (event.key.toLowerCase() !== "m") return;
+
+  event.preventDefault();
+  showProblemsPanel();
+}
+
 // ---------- 全文搜索 ----------
 //
 // 数据流：输入框（防抖 300ms）→ invoke("search_in_folder")
@@ -2514,7 +2786,54 @@ let searchSeq = 0;
  *   而且 `editor.setModel()` 本身就会把光标重置掉。
  *   所以只能把目的地存下来，由那个 watch 在真正 setModel 之后来消费。
  */
-const pendingReveal = ref<{ path: string; line: number; column: number } | null>(null);
+const pendingReveal = ref<{ path: string; line: number; column: number; endLine?: number; endColumn?: number } | null>(null);
+
+/** 真正把光标 / 选区放过去。调用方必须保证 model 已经挂上了 */
+function applyPendingReveal(path: string) {
+  const editor = editorInstance.value;
+  const pending = pendingReveal.value;
+  if (editor === null || pending === null || pending.path !== path) return;
+  pendingReveal.value = null;
+
+  editor.revealLineInCenter(pending.line);
+  if (pending.endLine === undefined || pending.endColumn === undefined) {
+    editor.setPosition({ lineNumber: pending.line, column: pending.column });
+  } else {
+    // 有范围就选中它 —— 点问题列表那一条要的就是「把出错的那段框起来」
+    editor.setSelection({
+      startLineNumber: pending.line,
+      startColumn: pending.column,
+      endLineNumber: pending.endLine,
+      endColumn: pending.endColumn,
+    });
+  }
+  editor.focus();
+}
+
+/**
+ * 跳到一个位置（必要时先打开文件）。
+ *
+ * ⚠ ★ 不能只是「登记 pendingReveal 再 openFile」：目标文件**已经就是当前标签**时
+ *   `activeTabPath` 没有变化 ⇒ 那个 watch 根本不会跑 ⇒ 跳转被静默丢掉。
+ *   （实测：点同一文件里的第二条问题，光标一动不动）
+ *   ⇒ 所以先把 cursor 登记好，再看「文件是不是已经开着而且 model 已经挂上」：
+ *     是就自己来，不是就交给 watch
+ */
+function revealAt(target: { path: string; line: number; column: number; endLine?: number; endColumn?: number }) {
+  pendingReveal.value = target;
+
+  const editor = editorInstance.value;
+  const model = editor?.getModel() ?? null;
+  const current = model === null ? null : pathOfModel(model);
+  if (current !== null && samePath(current, target.path)) {
+    applyPendingReveal(target.path);
+    return;
+  }
+
+  // 文件没开、或者还挂着别的 model（watch 内部 await 过，还没跑完）——
+  // 交给 watch，它会在 setModel 之后消费掉 pendingReveal
+  openFile(target.path);
+}
 
 async function runSearch() {
   const root = workspaceRoot.value;
@@ -2601,12 +2920,11 @@ function toggleSearchGroup(path: string) {
 }
 
 /** 点一条搜索结果：打开那个文件，并把光标放到匹配处 */
-async function openSearchResult(match: SearchMatch) {
-  // 先登记目的地，再打开 —— 顺序不能反：
-  // 反过来的话，watch 可能在登记之前就已经跑完了，跳转就丢了
-  pendingReveal.value = { path: match.path, line: match.line, column: match.column };
-
-  openFile(match.path);
+function openSearchResult(match: SearchMatch) {
+  // ★ 走 revealAt 而不是自己登记 + openFile：
+  //   目标文件已经就是当前标签时，openFile 不会触发那个 watch，
+  //   跳转会被静默丢掉（点同一文件里的第二条结果最明显）
+  revealAt({ path: match.path, line: match.line, column: match.column });
 }
 
 /** 打开搜索视图并把焦点送进输入框 —— 快捷键和菜单共用这一个入口 */
@@ -3213,6 +3531,7 @@ const menus = computed<Menu[]>(() => {
         shortcut: "Ctrl+J",
         run: togglePanel,
       },
+      { label: "问题", shortcut: "Ctrl+Shift+M", run: showProblemsPanel },
       { separator: true },
       { label: "命令面板…", shortcut: "Ctrl+Shift+P", run: () => openQuickOpen("commands") },
       { label: "转到文件…", shortcut: "Ctrl+P", run: () => openQuickOpen("files") },
@@ -3566,6 +3885,17 @@ onMounted(async () => {
     };
   });
 
+  // 「问题」面板跟着 marker 走。
+  // ★ 用 Monaco 自己的 `onDidChangeMarkers`，而不是自己搭一套通知：
+  //   不管是 LSP 推诊断、还是内置 worker 改了 marker，都会走到这里
+  markersSubscription = monaco.editor.onDidChangeMarkers(() => {
+    // ★ 先扫一遍「不该存在的 marker」再重排：内置 worker 是异步的，
+    //   它的结果可能晚于「交出内置服务」那一刻才落地（见 dropForeignMarkers）
+    dropForeignMarkers();
+    scheduleRefreshProblems();
+  });
+  refreshProblems();
+
   // 字号一变就记下来，并同步给菜单显示。
   //
   // ★ onDidChangeConfiguration 是「任何选项变化」都会触发的大事件，
@@ -3616,8 +3946,13 @@ onMounted(async () => {
       //   而它必须写在注册那一行里
       onServerReady: (languageIds, capabilities) => {
         for (const languageId of languageIds) {
+          // ★ 顺序：先把内置那套交出去（否则两套一起应答，
+          //   补全列表里同一项出现两遍），再注册我们自己的
+          handLanguageToServer(languageId);
           registerLspLanguage(languageId, capabilities.triggerCharacters, lspFeatureHost);
         }
+        // 内置服务可能已经校验过当前打开的文件，顺手清一下它的存货
+        dropForeignMarkers();
       },
     },
     (line) => console.info(line),
@@ -3648,6 +3983,7 @@ onMounted(async () => {
   window.addEventListener("beforeunload", writeHotExit);
   // 面板快捷键要用捕获阶段（Monaco 把 Ctrl+J 抢走了）
   window.addEventListener("keydown", handlePanelShortcut, true);
+  window.addEventListener("keydown", handleProblemsShortcut, true);
 
   // 命令面板 / 快速打开。同样用捕获阶段 —— 见 handleQuickOpenShortcut 上面的说明
   window.addEventListener("keydown", handleQuickOpenShortcut, true);
@@ -3701,18 +4037,21 @@ onMounted(async () => {
 /**
  * 退订时把异常吃掉。
  *
- * ⚠ ★ 为什么需要：开发时 Vue 的 HMR 会走一遍 `onUnmounted`，而那一刻
- *   `window.__TAURI_EVENT_PLUGIN_INTERNALS__` 可能已经不在了 ——
- *   报的是 `Cannot read properties of undefined (reading 'unregisterListener')`。
- *   抛出去的后果不只是“报个错”：它是个 unhandled rejection，
- *   而且会**把后面剩下的清理全跳掉**（包括销毁编辑器、释放 model）。
- *   退订失败本来就不是大事，不该拖垮后面的步骤
+ * ⚠ ★★ `try/catch` 在这里**不够**：Tauri 的 `unlisten` 是 **async 函数**，
+ *   里面报错会变成「被拒绝的 Promise」—— 而那是个 unhandled rejection，
+ *   同步的 catch 根本接不住（实测：注了 try/catch 之后控制台照旧红）。
+ *   ⇒ 所以要把返回值也当成 Promise 接一手
+ *
+ * ⚠ 为什么会报错：开发时 Vue 的 HMR 会走一遍 `onUnmounted`，
+ *   而那一刻 `window.__TAURI_EVENT_PLUGIN_INTERNALS__` 可能已经不在了
+ *   （`Cannot read properties of undefined (reading 'unregisterListener')`）。
+ *   反正退订失败本来就不是大事，不该在控制台里刷屏
  */
-function safeUnlisten(unlisten: (() => void) | null | undefined) {
+function safeUnlisten(unlisten: (() => unknown) | null | undefined) {
   try {
-    unlisten?.();
+    void Promise.resolve(unlisten?.()).catch(() => {});
   } catch {
-    // 页面正在被拆，退订不上就算了
+    // 同步就抛的（比如 unlisten 本身是 undefined）也兜住
   }
 }
 
@@ -3721,6 +4060,7 @@ onUnmounted(() => {
   window.removeEventListener("click", closeMenu);
   window.removeEventListener("beforeunload", writeHotExit);
   window.removeEventListener("keydown", handlePanelShortcut, true);
+  window.removeEventListener("keydown", handleProblemsShortcut, true);
   window.removeEventListener("keydown", handleQuickOpenShortcut, true);
   window.removeEventListener("keydown", handleNavigateShortcut, true);
   window.removeEventListener("keydown", handleSearchShortcut, true);
@@ -3732,7 +4072,6 @@ onUnmounted(() => {
   void disposeLsp();
   safeUnlisten(unlistenClose);
   safeUnlisten(unlistenResize);
-
   // 定时器也是需要释放的外部资源，否则回调可能在组件销毁后才触发
   if (saveNoticeTimer) clearTimeout(saveNoticeTimer);
   if (hotExitTimer) clearTimeout(hotExitTimer);
@@ -3743,6 +4082,7 @@ onUnmounted(() => {
   // 顺序不能反：先退订事件，再销毁编辑器
   cursorSubscription?.dispose();
   fontSizeSubscription?.dispose();
+  markersSubscription?.dispose();
   editorInstance.value?.dispose();
 
   // diff 浮层的编辑器和它的两个 model 也要收 ——
@@ -4030,14 +4370,7 @@ watch(activeTabPath, async (path) => {
   //   必须在这里消费，不能在 openFile() 后面 ——
   //   那里 model 还没绑上（这个 watch 内部 await 过），而且 setModel 会把光标重置掉
   const pending = pendingReveal.value;
-  if (pending && pending.path === path) {
-    pendingReveal.value = null;
-    editor.revealLineInCenter(pending.line);
-    // setPosition 会派发 onDidChangeCursorPosition，状态栏那行「行列」自动跟着变，
-    // 不用手动赋值
-    editor.setPosition({ lineNumber: pending.line, column: pending.column });
-    editor.focus();
-  }
+  if (pending && pending.path === path) applyPendingReveal(path);
 
   // 换 model 之后光标位置由 Monaco 决定（它会恢复该 model 上次的位置），
   // 所以我们不再假设「一定回到 1:1」，而是直接问它当前在哪，重新同步镜像
@@ -4616,6 +4949,11 @@ watch(activeTabPath, async (path) => {
             @click="activePanelTab = tab.id"
           >
             {{ tab.label }}
+            <!-- 问题数量做成徽标。只在有问题时出现 —— 一个永远写着的 0
+                 除了占地方，还会让「现在到底有错吗」变得需要多看一眼 -->
+            <span v-if="tab.id === 'problems' && problemRows.length > 0" class="panel-tab-badge">
+              {{ problemRows.length }}
+            </span>
           </button>
 
           <div class="panel-tabs-fill" />
@@ -4664,7 +5002,44 @@ watch(activeTabPath, async (path) => {
             </p>
           </div>
 
-          <p v-else-if="activePanelTab === 'problems'" class="panel-empty">没有发现问题</p>
+          <!-- 问题：数据来自 Monaco 的 marker 表。
+               ★ 注意「同一条错可能出现两行」——Owner 不同的两份（内置 worker
+                 和真语言服务器），它们本来就都是 marker，面板并不去猜谁重复了 -->
+          <div v-else-if="activePanelTab === 'problems'" class="panel-problems">
+            <p v-if="problemRows.length === 0" class="panel-empty">没有发现问题</p>
+
+            <template v-else>
+              <div v-for="group in problemGroups" :key="group.path" class="problem-group">
+                <div class="problem-file" :title="group.path">
+                  <span class="problem-file-name">{{ group.name }}</span>
+                  <span class="problem-file-count">{{ group.rows.length }}</span>
+                </div>
+
+                <button
+                  v-for="row in group.rows"
+                  :key="`${row.line}:${row.column}:${row.source}:${row.message}`"
+                  class="problem-row"
+                  type="button"
+                  :title="row.message"
+                  @click="openProblem(row)"
+                >
+                  <svg
+                    class="problem-icon"
+                    :class="problemTone(row.severity)"
+                    viewBox="0 0 16 16"
+                    width="14"
+                    height="14"
+                    aria-hidden="true"
+                  >
+                    <path :d="PROBLEM_ICON[problemTone(row.severity)]" />
+                  </svg>
+                  <span class="problem-message">{{ row.message }}</span>
+                  <span v-if="row.source !== ''" class="problem-source">{{ row.source }}</span>
+                  <span class="problem-location">行 {{ row.line }}，列 {{ row.column }}</span>
+                </button>
+              </div>
+            </template>
+          </div>
 
           <p v-if="activePanelTab === 'debug'" class="panel-empty">调试控制台还没接上</p>
 
@@ -6214,6 +6589,98 @@ kbd {
   color: var(--color-error-text);
 }
 
+/* ---------- 问题面板 ---------- */
+
+/* 标签上的数量徽标。用半透明底色 —— 标签栏底色会跟主题变，
+   实色块很容易在某一套主题下硌出来 */
+.panel-tab-badge {
+  margin-left: 5px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: var(--color-kbd-bg);
+  font-size: 10px;
+  letter-spacing: 0;
+}
+
+.panel-problems {
+  padding: 4px 0 8px;
+  font-size: 12px;
+}
+
+/* 文件分组：一条分隔线 + 文件名，和 VS Code 的问题面板一个形状 */
+.problem-file {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px;
+  border-bottom: 1px solid var(--color-menu-border);
+  color: var(--color-text-emphasis);
+  font-weight: 600;
+}
+
+.problem-file-count {
+  color: var(--color-text-dim);
+  font-weight: 400;
+}
+
+.problem-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 12px 3px 22px;
+  border: 0;
+  background: transparent;
+  color: var(--color-text);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.problem-row:hover {
+  background: var(--color-hover);
+}
+
+/* 图标是**填充**图形，见 PROBLEM_ICON 的说明。
+   颜色用「错误 / 警告 / 信息」三档 —— 值是从 VS Code 自己的代码里挖的
+   （problemsErrorIcon.foreground 就是 editorError.foreground），
+   主题文件里没有这几个键，所以是写死的两套 */
+.problem-icon {
+  flex: 0 0 auto;
+  fill: currentColor;
+}
+
+.problem-icon.error {
+  color: var(--color-problem-error);
+}
+
+.problem-icon.warning {
+  color: var(--color-problem-warning);
+}
+
+.problem-icon.info,
+.problem-icon.hint {
+  color: var(--color-problem-info);
+}
+
+/* 消息占满剩下的宽度并允许收缩 —— 不写 min-width: 0 的话，
+   长消息会把右边的「来源 / 行列」顶出面板 */
+.problem-message {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.problem-source,
+.problem-location {
+  flex: 0 0 auto;
+  color: var(--color-text-dim);
+  font-size: 11px;
+}
+
 .statusbar {
   flex: 0 0 var(--size-statusbar);
   display: flex;
@@ -6354,6 +6821,17 @@ kbd {
   --color-error-bg: #5a1d1d;
   --color-error-text: #f48771;
 
+  /* 问题面板里三档严重程度的颜色。
+     ★ 主题文件里**没有** `problems*Icon.foreground` 这些键 —— 它们属于
+       VS Code 代码里的默认值（和 `gitDecoration.*` / `terminal.ansi*` 同一类）。
+       这三个值是从 VS Code 自己的代码里挖出来的：
+       problemsErrorIcon.foreground = editorError.foreground，
+       problemsWarningIcon.foreground = editorWarning.foreground，
+       problemsInfoIcon.foreground = editorInfo.foreground */
+  --color-problem-error: #f14c4c;
+  --color-problem-warning: #cca700;
+  --color-problem-info: #59a4f9;
+
   /* 滚动条拇指。故意用半透明而不是写死的实色 ——
      轨道是透明的，拇指直接压在侧栏/标签栏的背景上，
      半透明能让它自己跟背景融合，不用为每个容器各配一个值 */
@@ -6451,6 +6929,12 @@ kbd {
   --color-dirty: #b8860b;
   --color-error-bg: #f8d7da;
   --color-error-text: #a94442;
+
+  /* 问题面板那三档。浅色必须换 —— #cca700 那种亮黄铺在白底上直接发糊
+     （和终端 ANSI 黄色是同一个坑）。值同样来自 VS Code 代码里的默认值 */
+  --color-problem-error: #e51400;
+  --color-problem-warning: #bf8803;
+  --color-problem-info: #0063d3;
 
   --color-scrollbar-thumb: rgba(100, 100, 100, 0.35);
   --color-scrollbar-thumb-hover: rgba(100, 100, 100, 0.6);

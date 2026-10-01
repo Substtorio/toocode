@@ -1284,6 +1284,7 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     ⇒ 想清掉的话：`monaco.languages.json.jsonDefaults.setDiagnosticsOptions({ validate: false })`
       （**只有 JSON 有这个开关**，html / css 那边 Monaco 没给）。
       留着的好处是「服务器挂了还有内置那份顶着」，取舍要自己定
+    ✅ **已解决 —— 见下面「问题」面板那条**
 
 - [x] **LSP 第二块：补全 / 悬停 / 跳转到定义**（`src/lspFeatures.ts` 是新文件）：
   ★ **为什么单独一个文件，而不是塞进 `lsp.ts`**：`lsp.ts` 只管协议
@@ -1397,19 +1398,80 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
   ⚠ 顺手加固了一处：开发时 HMR 会走一遍 `onUnmounted`，那一刻
     `window.__TAURI_EVENT_PLUGIN_INTERNALS__` 可能已经不在了（报
     `Cannot read properties of undefined (reading 'unregisterListener')`）。
-    抛出去不只是报个错 —— 它是 unhandled rejection，而且**会把后面剩下的清理
-    全跳掉**（包括销毁编辑器、释放 model）。加了个 `safeUnlisten()` 兜住，
-    `LspSession.stop()` 里也逐个 try 包住
+    ⚠ ★★ **但当时的判断有一半是错的**（后来实测才发现）：
+    · `unlisten` 是 **async 函数** —— 它报错时是「被拒绝的 Promise」，
+      **同步的 `try/catch` 根本接不住**（注了之后控制台照旧刷红）
+      ⇒ 要写成 `void Promise.resolve(unlisten?.()).catch(() => {})`，连返回值一起接
+    · 而「它会跳过后面剩下的清理」这个担心是**错的**：async 函数体里的抛错
+      会变成 rejection，调用处**立刻返回**，后面的语句照常执行。
+      真相是「又吵又无害」，不是「会丢清理」
+    ⇒ ★ 教训：修 bug 时先确认**症状的机制**对不对，不然会往错的方向修
+      （这次要是没再看一眼日志，就会记下一条错的结论）
+
+- [x] **「问题」面板（底部面板的第一个标签）**：
+  ★ **数据来源是 Monaco 自己那张 marker 表**（`monaco.editor.getModelMarkers({})`），
+    **不是**我们另存一份：`lsp.ts` 把 LSP 诊断写进去、Monaco 内置 worker 也写进去 ——
+    从 markers 读就自动把所有来源都收进来了，不用挨个去接
+  ★ 变化用 `monaco.editor.onDidChangeMarkers()` 订阅（公开 API），**防抖 200ms** ——
+    打字时服务器每敲一个字推一次诊断，不挡的话列表会连续重排
+  ⚠ `marker` 只带 **uri**，而我们的 model 是匿名建的 ⇒ 路径只能拿 model
+    回 `models` 表里反查（`pathOfModel`，和「跳到定义」共用同一个函数）。
+    查不到的是欢迎页 / diff 浮层那些临时 model —— **顺手挡住了「同一文件出现两遍」**：
+    diff 浮层会为同一个文件再建一对 model，Monaco 自己那套 worker 也会往它们身上写 marker
+  ★ 排序：**严重程度优先**（错误在警告前），再按文件、行列。
+    不按「发现顺序」排 —— 那个顺序跟着服务器推送的先后变，用户扫列表时位置会跳
+  ★ 图标用**原生 codicon**（`error` / `warning` / `info` / `lightbulb`，16×16）。
+    路径是从 `raw.githubusercontent.com/microsoft/vscode-codicons` 抄的，
+    ⚠ 又是「codicon 是**填充**图形」那件事：模板里不写 fill / stroke，
+      统一由 CSS 给 `fill: currentColor`
+  ★ 三档颜色是**从 VS Code 自己的代码里挖出来的**（不在主题文件里）：
+    `problemsErrorIcon.foreground` = `editorError.foreground`（深 #F14C4C / 浅 #E51400）、
+    warning = `editorWarning.foreground`（#CCA700 / #BF8803）、
+    info = `editorInfo.foreground`（#59a4f9 / #0063d3）。
+    挖法：在 `workbench.desktop.main.js` 里搜 `problemsErrorIcon`，
+    会看到它指向一组 minified 变量（`OLo=se("problemsErrorIcon.foreground",ES,…)`），
+    再拿那个变量名去搜定义就能看到色值（`ES=se("editorError.foreground",{dark:…})`）
+  ★ 快捷键 `Ctrl+Shift+M`（VS Code 的「问题」就是这个键）+ 查看菜单一项 +
+    欢迎页快捷键表一条（按约定三者一起出生）
+  ★ 顺手修了一个旧坑：`revealAt()` 把「打开 + 把光标放过去」包成了一个入口。
+    ⚠ 原写法（登记 pendingReveal 再 openFile）在**目标文件已经就是当前标签**时
+      会静默失效 —— `activeTabPath` 没变，那个 watch 不会跑。
+      点同一文件里的第二条问题 / 第二条搜索结果都中招
+
+  ★★★ **一个必须处理的问题：内置语言服务和真服务器把同一件事做了两遍**
+    面板一出来就肉眼可见了（`broken.json` 2 行、`style.css` 4 行，两行的位置
+    和消息**完全一样**）。补全列表里也一样（`margin` / `margin-top` 各出现两遍）——
+    只是之前没细看。
+    ⇒ **根因修法**：有真服务器接管某个语言时，把 Monaco 内置那套语言服务整套关掉
+      （VS Code 自己**不带**内置语言服务，只用真服务器那一套）
+    ⚠ ★ 0.56 里这套 API 搬家了：是 **`monaco.json` / `monaco.css` / `monaco.html`**
+      上的 `jsonDefaults` / `cssDefaults` / `htmlDefaults`，
+      而**不是**旧版的 `monaco.languages.json` —— 后者在新版里根本不存在
+      （实测 `monaco.languages.json === undefined`，白找了一阵）
+    ★ 关法是 `defaults.setModeConfiguration({ …十三个能力全 false… })`。
+      键名是从**运行时的 `modeConfiguration`** 里读出来的（不是猜的）；
+      显式写全而不是传 `{}`：`setModeConfiguration` 是**整体替换**，
+      没写的项会变成 undefined —— 效果一样，但读的人不知道这是有意的
+    ⚠ ★★ **只关一次是不够的**：内置服务走 **worker** 校验，而 worker 是**异步**的。
+      实测的顺序是：关掉内置服务 → 清 marker（此刻还没有）→
+      **worker 的回复才落地** → 面板里依旧每条两行，看起来像「关了没生效」。
+      ⇒ 所以这条规则要**持续生效**：在 marker 变化的回调里先扫一遍，
+        把「已交出语言」的非 `lsp` marker 清掉（`dropForeignMarkers`）。
+        按 owner 筛而不是按名字写死 —— owner 叫什么名字是 Monaco 内部的事
+    ⚠ 反过来说：**没有**真服务器的语言（这台机器上的 TypeScript）绝不能动 ——
+      内置那份是唯一的语言特性来源。这正是这件事要挂在 `onServerReady` 上、
+      而不是启动时无脑关一遍的原因（服务器起不来时内置那套还是完整可用的）
 
 ### 待办（按优先级）
 
-1. **【已完成】LSP：诊断 + 补全 / 悬停 / 跳转定义**。下一步是：
-   · 「问题」面板（诊断已经有了，只差一个 UI）
+1. **【已完成】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 「问题」面板**。下一步是：
    · **重命名**（`textDocument/rename` → Monaco 的 `registerRenameProvider`，
      要把 LSP 的 `WorkspaceEdit` 转成 Monaco 的）
    · **自动导入**（补全项里的 `additionalTextEdits` 现在被丢掉了）
    · html / css 的 `triggerCharacters`（见上面那条实测）
    · `$/cancelRequest`：现在取消请求是忽略的（补全结果靠 Monaco 自己丢）
+   · **状态栏那个「错误 / 警告个数」指示器**：数据已经有了，只差一个 UI ——
+     VS Code 点它是跳去问题面板
 2. **插件机制的其余贡献点**：`contributes.grammars`（语法）/ `themes`（主题）/
    `injectTo`（注入语法）/ `snippets`（代码片段）都接了。
    剩下可做的：`commands`（扩展注册的命令进命令面板）、`semanticTokenScopes`、

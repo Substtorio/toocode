@@ -542,14 +542,15 @@ class LspSession {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    // ⚠ 逐个 try 包住：退订失败不能把它后面的步骤带走。
-    //   （开发时 HMR 会走一遍卸载流程，那时事件插件可能已经不在了 ——
-    //    实测报 `unregisterListener` 读不到）
+    // ⚠ 逐个接住：退订失败不能把它后面的步骤带走。
+    //   ★ `unlisten` 是 async 的 —— 它报错时是「被拒绝的 Promise」，
+    //     同步 try/catch 接不住（开发时 HMR 会走这一步，那时事件插件已经没了），
+    //     所以要把返回值也当成 Promise 接一手
     for (const dispose of this.disposers) {
       try {
-        dispose();
+        void Promise.resolve(dispose()).catch(() => {});
       } catch {
-        // 页面正在被拆，退订不上就算了
+        // 同步就抛的也兜住
       }
     }
     this.disposers = [];
