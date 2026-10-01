@@ -47,6 +47,7 @@ import {
   configureLsp,
   disposeLsp,
   openDocument,
+  pathToUri,
 } from "./lsp";
 // 语言服务器 → Monaco 的三个 provider（补全 / 悬停 / 跳转定义）
 import { registerLspLanguage, registerLspOpenHandler } from "./lspFeatures";
@@ -1263,6 +1264,20 @@ function dropForeignMarkers() {
 const lspFeatureHost = {
   pathOfModel,
 
+  /** 日志出口：和 configureLsp 那边共用「输出」面板 */
+  log: (line: string) => console.info(line),
+
+  /**
+   * 保证某个文件**有一份 model**（不必打开标签页）。
+   *
+   * ★ 什么时候会用到：重命名可能改到没被打开过的文件。
+   *   而 Monaco 的批量编辑找不到 model 就直接抛 —— 所以先把 model 建出来
+   */
+  async ensureModel(path: string): Promise<void> {
+    if (path === "" || models.has(path)) return;
+    await modelForPath(path);
+  },
+
   /**
    * 打开别的文件并**等到它真的成了编辑器上的 model**，再返回编辑器。
    *
@@ -1597,6 +1612,8 @@ const WELCOME_SHORTCUTS: readonly WelcomeShortcut[] = [
   { keys: ["Ctrl", "F"], label: "在当前文件中查找" },
   { keys: ["Ctrl", "H"], label: "查找并替换" },
   { keys: ["Ctrl", "/"], label: "切换行注释" },
+  // 重命名走 Monaco 内置的 F2，输入框也是它自带的
+  { keys: ["F2"], label: "重命名符号（语言服务器支持时）" },
   // 字号
   { keys: ["Ctrl", "滚轮"], label: "缩放编辑器字号" },
   { keys: ["Ctrl", "="], label: "放大字号" },
@@ -1628,10 +1645,41 @@ function createModelFor(key: string, content: string, language: string): monaco.
   const existing = models.get(key);
   if (existing) return existing;
 
+  // ★★ 给 model 一个**真的 uri**（以前一直是匿名的 `inmemory://model/N`）。
+  //   不这么做的话「重命名」这类跨文件编辑根本做不了 ——
+  //   Monaco 的批量编辑是**按 uri 找 model** 的，找不到就直接抛
+  //   `bad edit - model not found`（实测源码 StandaloneBulkEditService.apply）
+  const uri = uriForModelKey(key);
+
+  // ⚠ 同一个文件可能以两种写法进来（盘符大小写 / 分隔符不同），
+  //   而 Monaco 的 uri 是**归一化**过的（实测 `file:///c%3A/a` 和 `file:///c:/a`
+  //   解析成同一个字符串）⇒ 第二次 createModel 会抛「已存在」。
+  //   这里就把已有的那份拿过来复用，并把新 key 也指过去 ——
+  //   两边看到的是同一份文档（本来就是同一个文件）
+  const taken = uri === undefined ? null : monaco.editor.getModel(uri);
+  if (taken !== null) {
+    models.set(key, taken);
+    return taken;
+  }
+
   // 语言在创建时一次定好，以后不用再调 setModelLanguage
-  const model = monaco.editor.createModel(content, language);
+  const model = monaco.editor.createModel(content, language, uri);
   models.set(key, model);
   return model;
+}
+
+/**
+ * 给一个 model 的 key 算它的 uri。
+ *
+ * ⚠ 内部占位用的 key（`:welcome:` / `:error:<path>`）**不给** uri ——
+ *   它们不是磁盘上的文件，`Uri.parse` 也解析不出合理的东西。
+ *   匿名 model 的 uri 是 `inmemory://model/N`，两边不会搞混
+ */
+function uriForModelKey(key: string): monaco.Uri | undefined {
+  if (key.startsWith(":")) return undefined;
+  // 未命名文档的假路径正好是一个合法的 uri（scheme = untitled）
+  if (key.startsWith(UNTITLED_PREFIX)) return monaco.Uri.parse(key);
+  return monaco.Uri.parse(pathToUri(key));
 }
 
 /**
@@ -3542,6 +3590,14 @@ const menus = computed<Menu[]>(() => {
         disabled: noFile,
         run: () => runEditorAction("editor.action.commentLine"),
       },
+      { separator: true },
+      {
+        // F2 是 VS Code 的重命名快捷键，输入框也是 Monaco 自己那个
+        label: "重命名符号",
+        shortcut: "F2",
+        disabled: noFile,
+        run: () => runEditorAction("editor.action.rename"),
+      },
     ],
   },
   {
@@ -3978,7 +4034,12 @@ onMounted(async () => {
           // ★ 顺序：先把内置那套交出去（否则两套一起应答，
           //   补全列表里同一项出现两遍），再注册我们自己的
           handLanguageToServer(languageId);
-          registerLspLanguage(languageId, capabilities.triggerCharacters, lspFeatureHost);
+          registerLspLanguage(
+            languageId,
+            capabilities.triggerCharacters,
+            lspFeatureHost,
+            capabilities.supportsRename,
+          );
         }
         // 内置服务可能已经校验过当前打开的文件，顺手清一下它的存货
         dropForeignMarkers();

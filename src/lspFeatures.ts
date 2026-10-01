@@ -19,6 +19,7 @@ import {
   requestCompletion,
   requestDefinition,
   requestHover,
+  requestRename,
   uriToPath,
   type LspCompletionItem,
   type LspHover,
@@ -27,6 +28,7 @@ import {
   type LspMarkedString,
   type LspPosition,
   type LspRange,
+  type LspWorkspaceEdit,
 } from "./lsp";
 import { samePath } from "./pathUtils";
 
@@ -62,6 +64,20 @@ export interface LspFeatureHost {
     path: string,
     selection: monaco.IRange | monaco.IPosition | null,
   ) => Promise<monaco.editor.ICodeEditor | null>;
+
+  /**
+   * 确保某个文件**有一份 model**（不必打开标签页）。
+   *
+   * ★★ 什么时候会用到：重命名可能改到**没被打开过**的文件
+   *   （跨文件的 css 变量、以后 TS 的自动导入）。
+   *   而 Monaco 那套「批量编辑」是按 uri 找 model 的，
+   *   找不到就**直接抛**（实测源码：`if (!model) throw new Error('bad edit - model not found')`）
+   *   ⇒ 所以得先把 model 建出来，而不是等它抛
+   */
+  ensureModel: (path: string) => Promise<void>;
+
+  /** 日志出口。「输出」面板在 App 那边，这里只负责写 */
+  log: (line: string) => void;
 }
 
 // ============================ 翻译：LSP → Monaco ============================
@@ -229,6 +245,54 @@ export function toLocations(
   });
 }
 
+/**
+ * LSP 的 `WorkspaceEdit` → Monaco 的 `WorkspaceEdit`。
+ *
+ * @returns edits 直接交给 Monaco；targets 是涉及到的磁盘路径
+ *   （调用方要先把它们都变成 model，见 host.ensureModel）
+ *
+ * ★ 两种写法都要认：`changes`（按 uri 分组）和 `documentChanges`（数组，
+ *   里面还可能是「新建 / 重命名 / 删除文件」这类操作）。
+ *   重命名只会用到文本编辑，所以后者的文件操作**先跳过**（碰到了记一笔）
+ */
+export function toWorkspaceEdit(
+  result: LspWorkspaceEdit,
+  host: LspFeatureHost,
+): { edits: monaco.languages.IWorkspaceTextEdit[]; targets: string[] } {
+  const edits: monaco.languages.IWorkspaceTextEdit[] = [];
+  const targets = new Set<string>();
+
+  const push = (uri: string, list: Array<{ range: LspRange; newText: string }>) => {
+    // ★ uri 一律过一遍 `monaco.Uri.parse` —— 它会做归一化：
+    //   实测 `file:///c%3A/a.css` 和 `file:///c:/a.css` 解析出来是**同一个字符串**。
+    //   不归一的话「服务器回的 uri」和「model 的 uri」会差一个 %3A，
+    //   而 Monaco 是按这个字符串找 model 的 ⇒ 直接抛「model not found」
+    const resource = monaco.Uri.parse(uri);
+    targets.add(uriToPath(uri));
+    for (const edit of list) {
+      edits.push({
+        resource,
+        // 不传 versionId：传了的话 Monaco 会校验「编辑期间文档没被改过」，
+        // 而重命名是「用户点确认」的瞬间拿到的结果，没必要卡这一道
+        versionId: undefined,
+        textEdit: { range: toRange(edit.range), text: edit.newText },
+      });
+    }
+  };
+
+  for (const [uri, list] of Object.entries(result.changes ?? {})) push(uri, list);
+
+  for (const change of result.documentChanges ?? []) {
+    if (!("textDocument" in change)) {
+      host.log(`[LSP] 重命名里带了文件操作（${change.kind}），暂时不支持，已跳过`);
+      continue;
+    }
+    push(change.textDocument.uri, change.edits);
+  }
+
+  return { edits, targets: [...targets] };
+}
+
 // ============================ 注册 ============================
 
 /**
@@ -276,6 +340,7 @@ export function registerLspLanguage(
   languageId: string,
   triggerCharacters: string[],
   host: LspFeatureHost,
+  supportsRename: boolean,
 ): void {
   if (registeredLanguages.has(languageId)) return;
   registeredLanguages.add(languageId);
@@ -329,6 +394,36 @@ export function registerLspLanguage(
       return toLocations(result, model, host.pathOfModel);
     },
   });
+
+  // ⚠ 重命名**只在服务器声明支持时才注册**（见 LspServerCapabilities.supportsRename）。
+  //   不声明也注册的话，按下 F2 会弹出一个输入框，输完却什么也没发生 ——
+  //   而 json 服务器就是这种情况
+  if (supportsRename) {
+    monaco.languages.registerRenameProvider(languageId, {
+      provideRenameEdits: async (model, position, newName) => {
+        const path = host.pathOfModel(model);
+        if (path === null) return undefined;
+
+        // 一条真有用的日志（不是临时脚手架）：出问题时第一件要确认的事，
+        // 就是「这个请求到底发出去没有」。VS Code 的输出面板里也记这些
+        host.log(`[LSP] 重命名 ${newName}：${path} 第 ${position.lineNumber} 行`);
+
+        const result = await requestRename(path, toPosition(position), newName);
+        if (result === null) return undefined;
+
+        const { edits, targets } = toWorkspaceEdit(result, host);
+        if (edits.length === 0) return undefined;
+
+        host.log(`[LSP] 重命名结果：${edits.length} 处编辑，涉及 ${targets.length} 个文件`);
+
+        // ★★ 先把涉及到的每个文件都保证「有 model」，再交给 Monaco 去应用。
+        //   顺序不能反 —— bulk edit 找不到 model 是直接抛的（见 host.ensureModel）
+        for (const target of targets) await host.ensureModel(target);
+
+        return { edits };
+      },
+    });
+  }
 }
 
 /**

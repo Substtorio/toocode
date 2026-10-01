@@ -568,6 +568,8 @@
 | 诊断的位置对不对 | CDP 直连真窗口读 `getModelMarkers` | marker 字段名写错只是「泡泡线画到别处」，Monaco 不报错 |
 | 语言服务器到底回了什么 | `probe-json-lsp.mjs` 直连服务器 | 隔着 IPC + 映射两层，只看最终结果分不清是谁的错 |
 | 语言特性接对了没有 | **自己写一个假 LSP 服务器**（见 LSP 第二块那条） | 真服务器不产生定义结果 ⇒ 靠它们根本验不了；假服务器输出确定，能做精确断言 |
+| 跨文件重命名到底改了哪些文件 | 同上（这个假服务器改成回**两个文件**） | 真服务器的重命名都是**单文件**的 ⇒ `ensureModel` 那段永远走不到；而且少的编辑是「静默少改一处」 |
+| 按键到底落到谁身上 | 页内派发合成事件 + 读 `document.activeElement` | CDP 的 `Input.dispatchKeyEvent` 在这个 WebView 里会落到别处（整篇文档被替换过） |
 
 两个提醒：
 
@@ -1472,12 +1474,99 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       内置那份是唯一的语言特性来源。这正是这件事要挂在 `onServerReady` 上、
       而不是启动时无脑关一遍的原因（服务器起不来时内置那套还是完整可用的）
 
+- [x] **LSP 第三块：重命名（F2）**（`src/lspFeatures.ts` 里的 rename provider）：
+  ★★★ **真正的门槛不在 `textDocument/rename`，而在「给 model 一个真正的 uri」** ——
+    这是本轮挖出来的最大一件事，而且它是**后面对所有「一批编辑」都通用的地基**。
+    · Monaco 应用 `IWorkspaceTextEdit[]` 时走的是 `StandaloneBulkEditService.apply()`，
+      而它是**按 uri 去全局 model 表里找 model** 的（`monaco.editor.getModel(resource)`）
+    · 而我们之前所有 model 都是**匿名**创建的 ——
+      `monaco.editor.createModel(content, language)` 不带 uri，
+      拿到的 uri 是 `inmemory://model/N`
+    · ⇒ 服务器回的 `file:///c%3A/.../style.css` 永远找不到 model，
+      Monaco 直接**抛** `bad edit - model not found`。界面表现是
+      「输完新名字按回车，什么都没发生」—— 报错只在 console 里，UI 一点动静都没有
+    ★ 修法：`createModelFor()` 里给每个 model 一个真 uri（`uriForModelKey`）：
+      · 以 `:` 开头的内部占位 key（`:welcome:` / `:error:<path>`）**不给** ——
+        它们不是磁盘上的文件，`Uri.parse` 也解析不出合理的东西
+      · `untitled:` 开头的未命名文档：假路径本身就是合法 uri（scheme = untitled）
+      · 其余走 `monaco.Uri.parse(pathToUri(key))`
+    ⚠ ★★ **给了 uri 就要处理「同一个文件两种写法」**：Monaco 的 uri 是**归一化**过的
+      （实测 `file:///c%3A/a.css` 和 `file:///c:/a.css` 解析成同一个字符串），
+      而 `models` 的 key 有两条来路（文件树里 Rust 返回的、LSP 回传 uri 反解出来的），
+      盘符大小写和分隔符都可能不同 ⇒ 第二次 `createModel` 会撞上「已存在的 uri」。
+      ⇒ 所以先 `monaco.editor.getModel(uri)` 探一下，**已经有人占了就复用它**，
+        并把新 key 也指过去（两边看到的是同一份文档 —— 本来就是同一个文件）
+    ★ 只要哪天还要把「一批编辑」交给 Monaco 应用（自动导入的 `additionalTextEdits`、
+      批量替换、格式化），都躲不开这一关
+
+  ★ `toWorkspaceEdit(result, host)`：`changes`（按 uri 分组）和 `documentChanges`
+    （数组，中间还可能夹着「新建 / 重命名 / 删除文件」）两种写法都要认；
+    后者的文件操作**先跳过并记一笔**。
+    ⚠ 每个 uri 都过一遍 `monaco.Uri.parse` —— 归一化必须和 `createModel` 那边一致
+    ⚠ `versionId` 传 `undefined`：传了的话 Monaco 会校验「编辑期间文档没被改过」，
+      而重命名是「用户点确认」那一刻拿到的结果，没必要卡这一道
+  ★★ **目标文件可能从没被打开过**（跨文件重命名就是这样）⇒
+    在返回 `{ edits }` **之前**逐个 `host.ensureModel(target)` 把 model 建出来。
+    顺序不能反 —— bulk edit 找不到 model 是**直接抛**的
+    ★ `ensureModel` 刻意**不打开标签页**，只「建一份 model」：用户没要求看那个文件，
+      不该凭空多出一堆标签（实测：跨文件重命名后标签栏仍然只有 `main.rs` 一个）
+  ★ **只在服务器声明支持时才注册**（`capabilities.supportsRename`）：
+    ⚠ 实测这台机器上 html / css 都回了 `renameProvider: true`，
+      **而 json 压根没这一项**。给 json 也注册的话，按 F2 会弹出一个框、
+      输完名字却什么都不发生 —— 「假的可点」比不注册更糟。
+      实测：json 里按 F2 **连框都不弹**（很干净）
+    ⚠ 服务器可以回 `true`，也可以回 `{ prepareProvider: true }` —— 两种都算支持；
+      只有「没有这一项」或显式 `false` 才算不支持
+    ★ `prepareRename`（`resolveRenameLocation`）**故意没做**：实测本机三个服务器
+      都回 `Unhandled method textDocument/prepareRename`。没有服务器用它，
+      写了也无从验证 —— 等真碰到声明它的服务器再加
+  ★ **F2 走的是 Monaco 内置 action**（`editor.action.rename`，连输入框都是它自带的），
+    和「编辑」菜单里那些一样 —— 我们只负责「让 provider 有数据」。
+    菜单加了一项「重命名符号」（`disabled: noFile`）+ 欢迎页快捷键表加了一条
+    （按约定：快捷键、菜单项、说明三者一起出生）
+  ★ 加了两条**本来就该有**的日志（不是临时脚手架）：
+    `[LSP] 重命名 xxx：<路径> 第 N 行` 和 `[LSP] 重命名结果：n 处编辑，涉及 m 个文件`。
+    ★ 为什么值得留：查这类问题时第一件要确认的事就是「请求到底发出去没有」——
+      本轮正是靠它把「框没提交」和「provider 没被调用」分开的
+
+  ⚠ ★★ **`LAST_FOLDER_KEY` 存的是原始路径，不是 JSON**（写测试夹具时踩到的）：
+    用 `setItem(key, JSON.stringify(path))` 塞进去，应用会拿这个带引号的字符串去
+    `read_dir`，失败后当成「死路径」清掉 ⇒ 表现是「刷新之后没有打开文件夹」。
+    （`RECENT_FOLDERS_KEY` 才是 JSON 数组 —— 两个 key 格式不同）
+  ⚠ **hot exit 会把刚清掉的脏文档写回来**：`Page.reload` 会走 `beforeunload`，
+    于是「先清 localStorage 再刷新」根本没用。要一个干净环境，
+    最省事的办法是给 WebView2 一个**全新的用户数据目录**
+    （`WEBVIEW2_USER_DATA_FOLDER`），localStorage 从零开始
+
+  ★★★ **验证：真服务器（json / html / css）的重命名都是单文件的，跨文件那条路验不了**
+    ⇒ 又写了一个假服务器：它的 `textDocument/rename` 回**两个文件** ——
+      当前文件 + 一个**从来没打开过**的 `other.css`。
+      这种「确定性输出 + 任意制造场景」只有假服务器给得了
+      （做法同上面那条：临时目录放 `rust-analyzer.cmd`，PATH 最前面加它，重启应用）
+    ⚠ ★★ **CDP 的 `Input.dispatchKeyEvent` 在这个 WebView 里不可靠**：
+      上一轮它把 Ctrl+A 和回车送错了地方（整篇文档被替换成一条补全项），
+      这一轮实测「`Input.insertText` 能改到输入框的值，但合成的键盘事件不一定被 Monaco 认」。
+      ⇒ **页内派发合成事件**才稳：
+        `input.value = …; input.dispatchEvent(new Event("input", {bubbles:true}))`，
+        再 `new KeyboardEvent("keydown", {key:"Enter", code:"Enter", keyCode:13, bubbles:true})`
+      ⇒ 通用教训：**自动化 GUI 时先确认「事件到底落到谁身上」**，
+        别把「工具投递失败」当成「产品有问题」
+    ✅ 实测（假服务器，`main.rs` 第 2 行 `value` → `counter`）：
+      **两个文件都改了**（从没打开过的 `other.css` 也改了）、标签栏没多开、
+      `didChange` 正常推给服务器、`.rename-box` 提交后 `display: none` 正常收起
+    ✅ 实测（真服务器）：`.vue` / `.css` 的正经重命名（`div`→`section` 两个标签一起改、
+      `--main-color`→`--accent` 两处一起改）都精确，没有多一个字符少一个字符
+    ⚠ **已知局限：撤销是「按 model」的** —— 实测在当前文件按 Ctrl+Z 只回退当前文件，
+      另一个文件里的改动要切过去再撤销（没去对比 VS Code 的行为）。
+      要做得更整齐得自己维护一份「跨文件编辑组」，暂时不值当
+
 ### 待办（按优先级）
 
-1. **【已完成】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 「问题」面板**。下一步是：
-   · **重命名**（`textDocument/rename` → Monaco 的 `registerRenameProvider`，
-     要把 LSP 的 `WorkspaceEdit` 转成 Monaco 的）
-   · **自动导入**（补全项里的 `additionalTextEdits` 现在被丢掉了）
+1. **【重命名已完成】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 「问题」面板**。
+   下一步是：
+   · **自动导入**（补全项里的 `additionalTextEdits` 现在被丢掉了）——
+     ⚠ 它和重命名是同一类东西（都是「一批编辑交给 Monaco 应用」），
+       所以 uri 那一关已经过了，剩下的只是转换
    · html / css 的 `triggerCharacters`（见上面那条实测）
    · `$/cancelRequest`：现在取消请求是忽略的（补全结果靠 Monaco 自己丢）
 2. **插件机制的其余贡献点**：`contributes.grammars`（语法）/ `themes`（主题）/

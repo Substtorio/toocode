@@ -121,6 +121,25 @@ export interface LspLocationLink {
 export interface LspServerCapabilities {
   /** 哪些字符一敲就该弹补全（CSS 是 `.` `:`、JSON 是 `"` …）。**只有服务器自己知道** */
   triggerCharacters: string[];
+  /**
+   * 服务器声明支持 `textDocument/rename` 吗。
+   *
+   * ⚠ ★ 这个必须**问服务器**，不能一律注册：实测这台机器上
+   *   html / css 回 `renameProvider: true`，而 **json 压根没这一项** ——
+   *   给 json 也注册 rename 的话，按下 F2 会弹出一个框，输完名字却什么也没发生
+   */
+  supportsRename: boolean;
+}
+
+/** `textDocument/rename` 的结果 */
+export interface LspWorkspaceEdit {
+  /** 按 uri 分组的文本编辑 */
+  changes?: Record<string, Array<{ range: LspRange; newText: string }>>;
+  /** 另一种写法：一个数组，能按顺序带「新建 / 重命名 / 删除文件」的操作 */
+  documentChanges?: Array<
+    | { textDocument: { uri: string; version?: number | null }; edits: Array<{ range: LspRange; newText: string }> }
+    | { kind: string; uri?: string }
+  >;
 }
 
 // ============================ 路径 ↔ URI ============================
@@ -373,6 +392,25 @@ export async function requestDefinition(
 }
 
 /**
+ * 重命名：告诉服务器「这里叫 xxx，改成 yyyy」，让它给出要改的每一处。
+ *
+ * ★ 服务器回的是 `WorkspaceEdit` —— **可能涉及多个文件**，
+ *   这也正是它不能靠「自己改 model」实现的原因（要成套地改、还要能撤销）
+ */
+export async function requestRename(
+  path: string,
+  position: LspPosition,
+  newName: string,
+): Promise<LspWorkspaceEdit | null> {
+  const result = await request(path, "textDocument/rename", {
+    textDocument: { uri: pathToUri(path) },
+    position,
+    newName,
+  });
+  return result === null ? null : (result as LspWorkspaceEdit);
+}
+
+/**
  * 一个服务器会话。
  *
  * ★★ 一个会话 = 一个服务器进程 + 一堆文档。**不能一个文件起一个进程** ——
@@ -468,11 +506,22 @@ class LspSession {
     // ★ 从握手回应里把「补全触发字符」掏出来。
     //   这份清单是服务器的私有知识（CSS 的 `.`、JSON 的 `"`），我们不可能内置一份
     const capabilities = (
-      handshake.result as { capabilities?: { completionProvider?: { triggerCharacters?: string[] } } } | undefined
+      handshake.result as {
+        capabilities?: {
+          completionProvider?: { triggerCharacters?: string[] };
+          renameProvider?: unknown;
+        };
+      } | undefined
     )?.capabilities;
     this.triggers = capabilities?.completionProvider?.triggerCharacters ?? [];
-    log(`[LSP] ${this.server.label} 就绪（补全触发字符：${this.triggers.join(" ") || "无"}）`);
-    host?.onServerReady?.(this.server.languages, { triggerCharacters: this.triggers });
+    // 服务器可以回 `true`，也可以回 `{ prepareProvider: … }` —— 两种都算支持；
+    // 只有「没有这一项」或显式 false 才算不支持
+    const supportsRename = capabilities?.renameProvider !== undefined && capabilities.renameProvider !== false;
+    log(
+      `[LSP] ${this.server.label} 就绪（补全触发字符：${this.triggers.join(" ") || "无"}` +
+        `，重命名：${supportsRename ? "支持" : "不支持"}）`,
+    );
+    host?.onServerReady?.(this.server.languages, { triggerCharacters: this.triggers, supportsRename });
   }
 
   /** 这个会话管着这个文档吗（也就是它 didOpen 过） */
