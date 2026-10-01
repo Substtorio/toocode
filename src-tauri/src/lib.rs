@@ -1229,6 +1229,32 @@ async fn lsp_stop(state: State<'_, LspState>, session: String) -> Result<(), Str
     Ok(())
 }
 
+/// 关掉**所有**会话。
+///
+/// ★★ 为什么需要它：前端**刷新页面**时（开发时改一行就 HMR、或者用户按 F5），
+///   旧页面的 `onUnmounted` 里那个 `disposeLsp()` 根本不会执行 ——
+///   页面是被直接拆掉的，不是「卸载」。于是 Rust 侧那些进程全成了孤儿：
+///   没人 stop、也没人会再给它们发消息。
+///   新页面起来时先清一次，就不会一代一代攒下来。
+///
+/// ⚠ 还有个更隐蔽的后果：进程虽然「活着」，但它的 stdin 只有 Rust 手里那一份。
+///   谁也发不了消息，等于白白占着内存。
+#[tauri::command]
+async fn lsp_stop_all(state: State<'_, LspState>) -> Result<(), String> {
+    let all: Vec<LspSession> = {
+        let mut sessions = state.sessions.lock().unwrap();
+        // ★ 先 drain 出来、把锁放掉，再去 kill + wait ——
+        //   wait 是阻塞的，握着锁等子进程退出会把别的命令一起堵住
+        sessions.drain().map(|(_, session)| session).collect()
+    };
+
+    for mut session in all {
+        let _ = session.child.kill();
+        let _ = session.child.wait();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2620,7 +2646,8 @@ pub fn run() {
             lsp_servers,
             lsp_start,
             lsp_send,
-            lsp_stop
+            lsp_stop,
+            lsp_stop_all
         ])
         // 终端会话表。放在 State 里而不是全局变量 —— Tauri 会管它的生命周期
         .manage(PtyState::default())

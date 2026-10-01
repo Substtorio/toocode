@@ -565,6 +565,17 @@
 | 注入语法到底生效没有 | `scripts/verify-injections.mjs` | 缺注入只是「少几个 token」，同样不报错 |
 | 某个配色键深浅两边都有吗 | `scripts/check-theme-colors.mjs` | 只有一边时只表现为「某套主题下颜色不对」，不报错 |
 | Vue 的更新到底触发了没有 | 浏览器里跑一段 `watchEffect` 小实验 | 数据是对的，只是**不更新** —— 肉眼看不出来 |
+| 诊断的位置对不对 | CDP 直连真窗口读 `getModelMarkers` | marker 字段名写错只是「泡泡线画到别处」，Monaco 不报错 |
+| 语言服务器到底回了什么 | `probe-json-lsp.mjs` 直连服务器 | 隔着 IPC + 映射两层，只看最终结果分不清是谁的错 |
+
+两个提醒：
+
+- **「诊断真的到了」和「诊断显示对了」是两件事**。最有用的一条日志不是
+  「收到了几条」，而是**把准备交给 Monaco 的行号也打出来** ——
+  这次就是「日志说 4 行、界面上在 1 行」这个矛盾，把字段名的笔误逼出来的
+- ★★ **`npx vue-tsc --noEmit` 必须真跑、真看输出**。
+  这次那个 `lineNumber` / `startLineNumber` 的错，类型检查**本来是能抓的**（TS2739），
+  但没跑就等于没有。注意 PowerShell 的退出码不可靠，要看有没有 `error TS` 那几行
 
 这两个 `scripts/*.mjs` 的共同思路：**在 Node 里直接跑 `vscode-textmate`**。
 它在浏览器和 Node 里是同一份代码，但应用里要改文件 → 重启 → 开窗口 → 拿眼睛看颜色；
@@ -576,6 +587,12 @@ node scripts/verify-injections.mjs      # 对比有/无注入表的 token
 node scripts/check-theme-match.mjs string.quoted.double.html meta.attribute.x
 node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
 ```
+
+★ 同一个思路在 LSP 上的版本：**直连语言服务器**（`probe-json-lsp.mjs` 那种）。
+Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写分帧，
+把 `didOpen` 一份语法错的文件，几秒钟就能看到服务器回的**原始** `publishDiagnostics`。
+它和「在应用里点一下看泡泡线画在哪」的区别，就是「听服务器自己说」和
+「隔着 IPC + 映射两层猜」的区别。
 
 关键结构：
 
@@ -1141,6 +1158,131 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
       遇到就该去 DOM / 编译产物里看一眼，而不是假设工具错了
     ⇒ 查这类问题的利器：`fetch("/src/App.vue")` 拿到 **Vite 编译后的 JS**，
       直接看 `_createCommentVNode(...)` 的内容对不对 —— 比在浏览器里猜快得多
+
+- [x] **滚动条统一（Monaco ↔ 全局 CSS）**：
+  ★ 编辑器是 Monaco **自己用 div 画的**滚动条，不归 `::-webkit-scrollbar` 管 ——
+    默认 **14px 满宽方角**；侧栏 / 面板 / 欢迎页走全局 CSS（10px 轨道 + 2px 透明边框
+    ⇒ 6px 视觉宽、圆角）。并排放着就是两个应用的样子。
+    现在两边一致：**10px 轨道 + 6px 胶囊滑块 + `#79797966`**
+  ⚠ ★★ **Monaco 的滚动条尺寸是「命名空间选项」，必须挂在 `scrollbar: {}` 下面**。
+    写成顶层的 `verticalScrollbarSize: 10` 会被 **静默忽略** ——
+    不报错、不警告，轨道就是不变（量了半天才反应过来）。
+    源码里长这样：`super(EditorOption.scrollbar, 'scrollbar', defaults, …)`
+  ⚠ ★★ **`…ScrollbarSize` 是轨道宽，`…SliderSize` 是滑块宽**，两个独立选项。
+    只写前者的话滑块会撑满整条轨道（10px 实心条），和 CSS 那套「10px 轨道里
+    一条 6px 滑块」还是不一样
+  ★ 圆角 Monaco 没有选项，只能 CSS 补：`.monaco-editor .scrollbar .slider { border-radius: 3px }`
+    （3px 配 6px 宽 = 两端全圆，和 `::-webkit-scrollbar-thumb` 的 5px 配 6px 视觉一致）
+  ★ 尺寸抽成 `MONACO_SCROLLBAR` 常量，主编辑器和 diff 浮层共用
+
+- [x] **LSP 第一块：进程传输层 + 诊断**（`src-tauri/src/lib.rs` 的 LSP 一节 + `src/lsp.ts`）：
+  ★★ **Rust 只管帧，前端只管语义**，分界线就是 JSON-RPC 的帧：
+    · Rust：起进程、`Content-Length` 分帧、`lsp-message` 事件原样把 JSON 文本发给前端
+      （**不解析** —— 解析留前端，改 LSP 版本 / 加方法都不用重编 Rust）
+    · 前端：请求/通知、`initialize` 握手、`publishDiagnostics` → `setModelMarkers`
+    ★★ **DAP 用的是同一套分帧**，所以这一层写完，DAP 那边是白送的
+  ⚠ ★★ **`Content-Length` 是「字节数」不是「字符数」** ——
+    含中文的 JSON（一个中文错误消息就够了）用 `chars().count()` 算会短一截，
+    于是下一次读从半个字符中间开始，**后面所有消息全部错位**，
+    而且报错信息完全指不到这里。有专门的用例（`content_length_counts_bytes_not_chars`）
+  ⚠ **读输出必须开独立线程**（`read` 是阻塞的）；**stderr 也必须有线程读** ——
+    不读的话管道缓冲区满了，服务器一写日志就卡死在那儿
+  ⚠ ★★ **写完之后必须 `flush()`**：不刷的话消息缓在缓冲区里，
+    服务器那边一直等 —— 表现为「发了 initialize 但永远没回应」
+  ⚠ ★★ **必须先 `listen` 再 `lsp_start`**：反了会丢掉服务器启动时吐的头几帧
+    （终端那个 PTY 踩过同一个坑）。也正因为这个顺序，**会话 id 由前端生成**
+  ⚠ ★★ **服务器反过来发的请求（`client/registerCapability` / `workDoneProgress/create` …）
+    必须回一条**，哪怕内容只是 `null` —— 不回的话它会一直等这个回音，
+    表现为「起来之后就再也不动了」，而且两边都不报错
+  ★ **服务器不自己打包**：VS Code 自带的 `json` / `html` / `css` 三个是真 LSP
+    （`<安装目录>/resources/app/extensions/<x>-language-features/server/dist/node/<x>ServerMain.js`，
+    用 `node … --stdio` 起），PATH 里的 `rust-analyzer` 之类也认。
+    ⚠ 绿色版中间夹着一层版本哈希目录，不能直接拼路径 —— 得枚举候选
+  ★ **会话按「语言」缓存，不是按「文件」**：一个服务器管一堆文件，
+    rust-analyzer 那种要建全项目索引，起十次就是灾难
+  ★ `didChange` 走**全量同步**（把整份文本发过去）：实现简单且不会错位，
+    增量同步要维护一套「按范围打补丁」的逻辑，出错的代价（服务器算的和编辑器不一致）
+    远大于省下的那点带宽
+  ⚠ ★ **LSP 的行列从 0 开始，Monaco 从 1 开始** —— 不 +1 的话报错整体往上偏一行，
+    看起来像「服务器的 range 算错了」，很容易查错方向。
+    而且 **`end.character` 允许超出该行长度**（「直到行尾」就这么表示），
+    Monaco 的 marker 列号越界会**抛异常** ⇒ 必须用 `model.getLineMaxColumn` 夹一次
+  ⚠ ★ **路径归一化的不对称**：LSP 回传的 URI 解出来是归一化的（盘符大写、
+    分隔符 `/`），而 `models` 的 key 来自 Rust 的 `read_dir`，盘符大小写跟着
+    用户选的文件夹走。只做精确匹配会 miss，症状是「诊断一条都不显示」且**不报错**
+    ⇒ `findModel` 要遍历 + `normalizePath` 比对（和 editorBridge 一个理由）
+  ★ 测试：`talks_to_the_real_json_language_server` 是**真起进程**的集成测试 ——
+    起 VS Code 的 JSON 服务器 → `initialize` → `didOpen` 一份语法错的 JSON →
+    等 `publishDiagnostics`。分帧那几条单测只证明「我读得回我自己写的」，
+    证明不了「我读的东西真是别人写的」
+    ⚠ 读消息要放**独立线程** + `recv_timeout`：在主线程 `read_frame` 的话，
+      服务器一不说话测试就**永远挂着** —— 而「测试挂住」比「测试失败」难查得多
+  ⏳ **还没做**：补全 / 悬停 / 跳转定义 / 重命名（这些要在 `lsp.ts` 里加
+    `textDocument/completion` 之类，再注册成 Monaco 的 provider）；
+    面板里的「问题」列表（诊断已经有了，只差一个 UI）
+
+- [x] **LSP 在真窗口里跑通（这一轮把三个「一声不响就变差」的 bug 挖出来了）**：
+  ★★ **① marker 的字段名写错了，诊断会全部跑到第 1 行第 1 列**
+    `IMarkerData` 要的是 `startLineNumber` / `startColumn`，
+    而我写成了 `lineNumber` / `column`（`endLineNumber` / `endColumn` 倒是对的）。
+    Monaco **不报错** —— 它读不到起点，就把这个 marker 当成「零长度、在 1:1」处理。
+    ⇒ 症状：诊断**真的到了**（自己加的日志里行号也对），但泡泡线画在第 1 行第 1 列
+    ⇒ ★ **是「日志说 4 行、界面在 1 行」这个矛盾把我引到字段名上的** ——
+      所以给「收数据」和「改界面」这两步各留一条日志，比只留一条有用得多
+    ⇒ ★★ 类型检查**能抓**（TS2739），这条 bug 活下来纯粹是因为**没真跑 vue-tsc**。
+      结论：改完 `lsp.ts` 这类文件，`npx vue-tsc --noEmit` 是必做步骤，不是可选步骤
+  ★★ **② 会话 id 必须跨「页面刷新」也不重复**
+    原来是 `lsp-${序号}`，而序号是页面里的变量 —— 刷新后从 1 重新数，
+    于是新页面的第一个会话又叫 `lsp-1`，和上一页留在 Rust 里的那个**重名**。
+    Rust 侧 `lsp_start` 是 insert 覆盖 ⇒ 旧的被丢掉 ⇒ 它的 stdin 关掉 ⇒
+    服务器读不到输入就退出 ⇒ `lsp-exit` 事件同样是 `lsp-1` ⇒
+    **被新页面收下**，把新会话直接标成 `stopped` ⇒ 后面的 `initialized` / `didOpen`
+    全被静默丢掉 ⇒「服务器启动了，但一条诊断都没有」，两边都不报错。
+    ⇒ 修法：id 里掺一个时间戳（`lsp-1-m9x4k2`）。**名字重复 ≠ 同一个东西**
+    ⚠ 顺带一个更基本的坑：**`stopped` 一置上，`send()` 就变成空操作** ——
+      这种「一个标志位掐掉整条出路」的设计，出问题时完全没有声音
+  ★★ **③ 刷新页面要主动清掉上一页的会话进程（`lsp_stop_all`）**
+    刷新时旧页面的 `disposeLsp()` **不会执行** ——
+    页面是被拆掉的，不是「卸载」，`onUnmounted` 根本不跑。
+    于是 Rust 侧那些子进程全成了孤儿：没人 stop、也没人再给它发消息。
+    ⇒ `configureLsp()` 里先 `invoke("lsp_stop_all")` 清一次
+    ⇒ 通用点：**「销毁」这件事不能只写在 `onUnmounted` 里** ——
+      崩溃、强杀、刷新都不走回调，必须有「下次启动时自检」的兜底
+  ★★ **④ hot exit 恢复出来的文件从来没 `didOpen` 过**
+    `restoreHotExit()` 自己就把 model 建好了（`createModelFor`），
+    于是后面 `modelForPath()` 走的是**提前返回**，`openDocument` 永远轮不到 ——
+    而语言服务器的规矩是「没见过 didOpen 的文档根本不管」。
+    ⇒ 症状：**恢复出来的文件一条诊断都没有**，而且一声不响
+    ⇒ 修法两层：`modelForPath` 在「model 已存在」那条分支里也调一次 `openDocument`；
+      会话内部用 `versions.has(path)` 挡掉重复的 `didOpen`（同一个 URI 发两次是错的）
+  ★ **验证用的是 CDP 直连真窗口**（`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`）：
+    这是唯一能同时验证「Rust 起进程 + 前端映射 + Monaco 渲染」的地方 ——
+    外围浏览器里没有 `invoke`，起不了子进程
+    ⚠ ★★ **想截 IPC 的念头要早点放弃**：`window.__TAURI_INTERNALS__` 是
+      `{ configurable: false, writable: false }` 的数据属性，它的 `invoke` 也是
+      **不可重定义**的 ⇒ 包不住。
+      而且 `defineProperty` 一抛，**整个注入脚本从那一行就断了** ——
+      后面「轮询 + 包 console」全没执行，现象是「日志对象存在但是空的」，
+      看起来像「包装成功、应用没调用」，其实压根没装上
+      ⇒ 正确姿势：**想看什么就在源码里加一条真正有用的日志**。
+        LSP 这块加的是「打开 xxx（语言，n 字符）」和「xxx：n 条诊断」，
+        本来就该有（VS Code 的输出面板也记这些），不是临时脚手架
+    ★ `scripts` 之外还值得留的一个小工具：**直连语言服务器**拿原始诊断。
+      Node 里 `spawn(node, [jsonServerMain.js, "--stdio"])` + 自己写分帧，
+      几秒钟就能看到「服务器到底回了什么 range」——
+      而这恰好是把「服务器的问题」和「我们映射的问题」分开的唯一办法
+      （排查时实测：服务器回的是 `line:3, character:12`，完全正确，
+        所以问题一定在我们的映射上）
+    ⚠ 诊断条数变化才记日志：每敲一个字服务器都会推一次，不挡的话输出面板会被刷爆，
+      而刷屏的日志等于没有日志
+  ⏳ **已知的重复诊断（还没处理）**：Monaco **自带**的 json / html / css worker
+    和真服务器**跑的是同一份代码**（`vscode-json-languageservice` 那一套），
+    于是同一条错会报两次（owner 分别是 `"json"` 和 `"lsp"`）。
+    实测两者位置、消息完全一致，泡泡线重叠 ⇒ 界面上看不出来。
+    VS Code 自己**不带**内置 worker，只用真服务器那一套。
+    ⇒ 想清掉的话：`monaco.languages.json.jsonDefaults.setDiagnosticsOptions({ validate: false })`
+      （**只有 JSON 有这个开关**，html / css 那边 Monaco 没给）。
+      留着的好处是「服务器挂了还有内置那份顶着」，取舍要自己定
 
 ### 待办（按优先级）
 

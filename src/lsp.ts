@@ -85,6 +85,24 @@ export function uriToPath(uri: string): string {
   return path;
 }
 
+/**
+ * 路径的最后一段，只为日志好读。
+ *
+ * ★ 日志里写全路径没意义 —— 屏幕上开着的基本都在同一个项目里，
+ *   而全路径一长，真正想看的那几个字反而被挤没了
+ */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() ?? path;
+}
+
+/**
+ * 每个文档上一次报出来的诊断条数。
+ *
+ * ★ 只为了「条数没变就不记日志」—— 每敲一个字服务器都会推一次诊断，
+ *   不挡的话「输出」面板会被刷屏，而刷屏的日志等于没有日志
+ */
+const lastDiagnosticCount = new Map<string, number>();
+
 // ============================ 翻译 ============================
 
 /**
@@ -97,6 +115,12 @@ export function uriToPath(uri: string): string {
  * ⚠ ★★ 还要**夹一下列号**：LSP 允许 `end.character` 超出这一行的长度
  *   （比如「直到行尾」就用一个很大的值表示），而 Monaco 的 marker
  *   列号越界会**抛异常**。用 model 的真实行宽夹一次最稳
+ *
+ * ⚠ ★★ **字段名必须是 `startLineNumber` / `startColumn`**，不是 `lineNumber` /
+ *   `column`。写成后者 Monaco 不会报错 —— 它只是读不到起点，
+ *   然后把这个 marker 当成「零长度、在 1:1」处理。
+ *   症状极难认：诊断**确实到了**（日志里行号也对），但泡泡线画在第 1 行第 1 列。
+ *   ⇒ 这类错类型检查能抳（TS2739），所以改完一定得真跑一次 vue-tsc
  */
 export function toMarker(
   diagnostic: LspDiagnostic,
@@ -112,8 +136,10 @@ export function toMarker(
   const end = clamp(diagnostic.range.end.line, diagnostic.range.end.character);
 
   return {
-    ...start,
-    ...{ endLineNumber: end.lineNumber, endColumn: end.column },
+    startLineNumber: start.lineNumber,
+    startColumn: start.column,
+    endLineNumber: end.lineNumber,
+    endColumn: end.column,
     severity: SEVERITY[diagnostic.severity ?? 1] ?? monaco.MarkerSeverity.Error,
     message: diagnostic.message,
     source: diagnostic.source,
@@ -153,6 +179,14 @@ let log: (line: string) => void = () => {};
 export function configureLsp(options: LspHost, logger?: (line: string) => void) {
   host = options;
   if (logger) log = logger;
+
+  // ★★ 先清掉**上一次页面**留下的会话进程。
+  //   刷新页面（HMR / F5）时旧页面的 disposeLsp() 不会执行 ——
+  //   页面是被拆掉的，不是「卸载」，onUnmounted 根本不跑。
+  //   不清的话每刷一次就多留一个语言服务器进程，谁也没法再用它
+  void invoke("lsp_stop_all").catch(() => {
+    // 还没起来 / 没有残留都无所谓，不值得报错
+  });
 }
 
 /** 拆掉所有会话（退出 / 换工作区时用） */
@@ -224,7 +258,15 @@ class LspSession {
     private readonly server: LspServerInfo,
     private readonly root: string | null,
   ) {
-    this.id = `lsp-${++LspSession.sequence}`;
+    // ★★ id 必须**跨页面刷新**也不重复。
+    //   以前是单纯的 `lsp-${序号}` —— 而序号是页面里的变量，刷新后从 1 重新数，
+    //   于是新页面的第一个会话拿到的还是 `lsp-1`，和上一页留在 Rust 里的
+    //   那个重名。Rust 侧 `lsp_start` 是 insert 覆盖：旧的被丢掉 →
+    //   它的 stdin 跟着关掉 → 服务器读不到输入就退出 →
+    //   而**同一个 id 的退出事件会被新页面收下**，把新会话直接标成 stopped，
+    //   于是后面的 `initialized` / `didOpen` 全被静默丢掉 ——
+    //   症状是「服务器启动了，但一条诊断都没有」，而且两边都不报错
+    this.id = `lsp-${++LspSession.sequence}-${Date.now().toString(36)}`;
   }
 
   async start(): Promise<void> {
@@ -287,9 +329,15 @@ class LspSession {
   }
 
   openDocument(path: string, languageId: string): void {
+    // ★ 已经开过的不要重复发。调用方那边（App 里 modelForPath）为了覆盖
+    //   「hot exit 恢复出来的文件从来没 didOpen 过」这种情况，会重复调进来；
+    //   而同一个 URI 发两次 didOpen 在协议上是错的
+    if (this.versions.has(path)) return;
+
     const model = host?.findModel(path);
     if (model === undefined || model === null) return;
     this.versions.set(path, 1);
+    log(`[LSP] 打开 ${baseName(path)}（${languageId}，${model.getValue().length} 字符）`);
     this.notify("textDocument/didOpen", {
       textDocument: {
         uri: pathToUri(path),
@@ -317,6 +365,9 @@ class LspSession {
 
   closeDocument(path: string): void {
     if (!this.versions.delete(path)) return;
+    // 顺手把「上次几条诊断」的记忆也清掉 ——
+    // 不然关掉再打开、而且条数恰好一样时，那一行日志就不会记了
+    lastDiagnosticCount.delete(path);
     this.notify("textDocument/didClose", { textDocument: { uri: pathToUri(path) } });
   }
 
@@ -337,15 +388,27 @@ class LspSession {
   /** 发一个请求并等回应 */
   private request(method: string, params: unknown): Promise<JsonRpc> {
     const id = this.nextRequestId++;
-    const promise = new Promise<JsonRpc>((resolve) => this.waiting.set(id, resolve));
+    // ⚠ executor 这里要用**块体**：写成表达式体 `(resolve) => this.waiting.set(id, resolve)`
+    //   的话，TS 6.0.3 会认为下面 `.catch` 回调里的 `resolve` 不存在（TS2304）。
+    //   （实测：单单拿这几行放一个空文件里也能复现，不是本文件的其它问题）
+    const promise = new Promise<JsonRpc>((resolve) => {
+      this.waiting.set(id, resolve);
+    });
     void this.send({ jsonrpc: "2.0", id, method, params }).catch((error) => {
       // ⚠ 发不出去也要把等待者叫醒 —— 否则这个 Promise 永远挂着，
       //   连带着启动流程卡死在「正在初始化」
-      this.waiting.delete(id);
       log(`[LSP] 发送 ${method} 失败：${String(error)}`);
-      resolve({ jsonrpc: "2.0", error: String(error) });
+      this.settle(id, { jsonrpc: "2.0", error: String(error) });
     });
     return promise;
+  }
+
+  /** 叫醒一个在等回音的请求。没人在等就当没发生 */
+  private settle(id: number, message: JsonRpc): void {
+    const waiter = this.waiting.get(id);
+    if (waiter === undefined) return;
+    this.waiting.delete(id);
+    waiter(message);
   }
 
   /** 发一个通知（不要回应） */
@@ -361,11 +424,7 @@ class LspSession {
   private handle(message: JsonRpc): void {
     // ① 是别人**回应我们**的请求
     if (message.id !== undefined && message.method === undefined) {
-      const settle = this.waiting.get(message.id as number);
-      if (settle) {
-        this.waiting.delete(message.id as number);
-        settle(message);
-      }
+      this.settle(message.id as number, message);
       return;
     }
 
@@ -404,5 +463,18 @@ class LspSession {
     // ★ 用 "lsp" 当 owner：Monaco 按 owner 分组，
     //   换一批诊断时只清掉这个 owner 的，不会误伤别的（比如以后的 linter）
     monaco.editor.setModelMarkers(model, "lsp", markers);
+
+    // ★ 只在**条数变了**的时候记一行。
+    //   每敲一个字服务器都会推一次诊断，不这么挡的话「输出」面板会被刷爆，
+    //   而刷屏的日志等于没有日志
+    const previous = lastDiagnosticCount.get(path);
+    if (previous !== markers.length) {
+      lastDiagnosticCount.set(path, markers.length);
+      log(
+        markers.length === 0
+          ? `[LSP] ${baseName(path)}：没有问题`
+          : `[LSP] ${baseName(path)}：${markers.length} 条诊断（第一处在 ${markers[0].startLineNumber} 行）`,
+      );
+    }
   }
 }

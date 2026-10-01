@@ -1454,7 +1454,16 @@ function createModelFor(key: string, content: string, language: string): monaco.
  */
 async function modelForPath(path: string): Promise<monaco.editor.ITextModel> {
   const existing = models.get(path);
-  if (existing) return existing;
+  if (existing) {
+    // ★★ 已经建过 model 的文件也要**交给语言服务器一次**。
+    //   最典型的来源是 hot exit：它自己就把 model 建好了（见 restoreHotExit），
+    //   于是这里走的是提前返回，`openDocument` 永远轮不到 ——
+    //   而语言服务器那边的规矩是「没见过 didOpen 的文档根本不管」，
+    //   结果是**恢复出来的文件一条诊断都没有**，还一声不响。
+    //   同一个文件重复调用是安全的：会话那边会挡掉重复的 didOpen。
+    if (!isUntitledPath(path)) void openDocument(path, languageFromPath(path));
+    return existing;
+  }
 
   const content = await invoke<string>("read_file", { path });
   const model = createModelFor(path, content, languageFromPath(path));
