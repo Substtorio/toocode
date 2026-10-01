@@ -839,6 +839,9 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
     `--color-tab-bg-hover` ← `tab.hoverBackground`、
     `--color-activitybar-active-border` ← `activityBar.activeBorder`
     （活动栏那条竖线原来是借用 `activityBar.foreground` 的，VS Code 专门有键管它）
+    ⚠ 这个变量后来**删掉了** —— 选中态从「左侧竖线」改成「方块」之后，
+      `activityBar.activeBorder` 这个键转去给选中图标上色了（改名成 `--color-icon-active`）。
+      见下面「活动栏选中态」那条
   ★★ **修正一条旧结论**：以前记的是「`tab.hoverBackground` 在 Dark Modern / Dark+
     Dark VS 三层里都不存在，是一条永远取不到值的死映射」。**这是错的** ——
     它确实存在，定义在 `dark_modern.json` 里。
@@ -1022,8 +1025,8 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
       `Select-String -Path <主题目录>\*.json -Pattern '"activityBar\.'`
       （主题目录在 `resources/app/extensions/theme-defaults/themes`，
         ⚠ 绿色版中间还夹着一层版本哈希目录）
-    ★ VS Code 写的是 `:not(.checked):hover` —— 也就是**激活项不给这个方块**
-      （它已经有左侧那条蓝竖线了，再叠一个方块就分不清「哪个是当前视图」）
+    ★ VS Code 写的是 `:not(.checked):hover` —— 也就是**激活项不给这一档方块**
+      （它自己有一档更明显的，见下面「活动栏选中态」那条）
     ★ 为什么用 `::after` 而不是把背景刷在 `.activity-item` 上：
       按钮是满宽的（48×48），刷背景得到的是「一条顶到两边的色带」，
       而不是「围着图标的一个方块」
@@ -1042,6 +1045,27 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
       （只给 svg 加 `position: relative` 是没用的，auto 还是同一档）
       ★ 验证办法：临时把方块改成不透明红 `#c0392b !important` 截图 ——
         图标还能看见就说明层级对了；顺便也能看出四角有没有被活动栏的圆角切掉
+  ★★ **活动栏选中态：方块 + 蓝色图标（不再用左侧那根蓝竖线）**：
+    原来是「激活项在活动栏最左边画一条 2px 蓝竖线」（用 `activityBar.activeBorder`）。
+    改成：**同一个圆角方块，但底色深一档** + **图标变成强调蓝**。
+    · 方块色 `modernActivityBarItem.activeBackground`（深 `#FFFFFF22` / 浅 `#e4e6f1`）——
+      它正好是 `hoverBackground` 那档的加重版，所以「悬停 / 选中」是同一个视觉语言，
+      只是深浅不同
+    · 图标色 `activityBar.activeBorder`（深 `#0078D4` / 浅 `#005FB8`）——
+      **同一个主题键换了个去处**，从画线改成上色
+    ⚠ ★ 变量名做过一次重命名，很容易看漏：
+      · `--color-icon-active`（旧）= `activityBar.foreground` → 改名成 **`--color-icon-hover`**
+        （它本来就是悬停色，旧名字误导）
+      · `--color-activitybar-active-border` → 删掉，键改名为 **`--color-icon-active`**
+      · 新增 `--color-icon-active-bg`
+      新增变量时**一定 grep 一遍旧名字**：深色块里同时留着旧的
+      `--color-icon-active: #ffffff` 和新加的 `#0078d4`，同名两条谁后写谁赢，
+      于是蓝色根本不生效（而且不报错）
+    ⚠ ★ **`.activity-item.active` 必须写在 `.activity-item:hover` 后面**：
+      两者优先级一样（都是 0,2,0），后写的赢。顺序反了的话，
+      鼠标悬停在「当前视图」上时蓝色会退回灰色
+    ⚠ 方块尺寸框用的是同一个 `::after`（只是换了背景色），所以内缩/圆角/`z-index`
+      那几条约束全都自动适用
   ⚠ ★★ **拿「克隆到浮层上放大」验证图标时有个陷阱**：
     把 svg `cloneNode` 到活动栏**外面**之后，`.activity-item svg` 这条选择器
     **就不匹配了**（它要求是活动栏的后代）——

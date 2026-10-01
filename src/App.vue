@@ -327,9 +327,6 @@ const CSS_VAR_BY_COLOR: Array<[cssVar: string, vscodeKey: string]> = [
   ["--color-selection", "menu.selectionBackground"],
   ["--color-menu-bg", "editorWidget.background"],
   ["--color-menu-border", "menu.border"],
-  /* 活动栏上「当前视图」左侧那条竖线。VS Code 专门有 activityBar.activeBorder 管它，
-     比借用 activityBar.foreground 更准确 */
-  ["--color-activitybar-active-border", "activityBar.activeBorder"],
   /* ⚠ statusBarItem.hoverBackground **故意不映射** ——
      状态栏是固定蓝、本来就不跟主题走（见下面 THEME_VARS_CLEAR_ONLY），
      而主题里那个值是浅灰半透明（深色 #F1F1F133），铺在蓝底上是错的。
@@ -340,12 +337,21 @@ const CSS_VAR_BY_COLOR: Array<[cssVar: string, vscodeKey: string]> = [
   ["--color-text-dim", "tab.inactiveForeground"],
   ["--color-text-emphasis", "tab.activeForeground"],
   ["--color-icon", "activityBar.inactiveForeground"],
-  ["--color-icon-active", "activityBar.foreground"],
-  /* 鼠标悬停在活动栏图标上时，图标背后那个圆角方块。
-     ★ 这是 VS Code 「modern UI」的一套键，**主题文件里真有**（深浅都有）：
-       深色 #FFFFFF11（半透明白）、浅色 #F2F2F2。
-       所以能走正常映射，不用像 terminal.ansi* 那样写死两套 */
+  /* 悬停时的图标颜色。★ 原来叫 --color-icon-active，改名了 ——
+     那个名字现在留给「当前视图那个蓝色图标」（见本表最后两行） */
+  ["--color-icon-hover", "activityBar.foreground"],
+  /* ★★ 图标背后那两个圆角方块 + 当前视图的图标颜色。
+     这几个都是 VS Code 「modern UI」的键，**主题文件里真有**（深浅都有）：
+       hoverBackground  深 #FFFFFF11 / 浅 #F2F2F2
+       activeBackground 深 #FFFFFF22 / 浅 #e4e6f1（就是 hover 那档的加重版）
+     所以能走正常映射，不用像 terminal.ansi* 那样写死两套
+     ★ activeBorder（深 #0078D4 / 浅 #005FB8）就是那条强调蓝。
+       它以前是给「激活项左侧那条竖线」用的（那个变量叫
+       --color-activitybar-active-border）—— 竖线改成方块之后，
+       **同一个键换了个去处**：从画线转去给图标上色 */
   ["--color-icon-hover-bg", "modernActivityBarItem.hoverBackground"],
+  ["--color-icon-active-bg", "modernActivityBarItem.activeBackground"],
+  ["--color-icon-active", "activityBar.activeBorder"],
   ["--color-link", "textLink.foreground"],
 ];
 
@@ -4700,7 +4706,7 @@ watch(activeTabPath, async (path) => {
 }
 
 .activity-item {
-  position: relative;   /* 给下面那条 ::before 竖线当定位基准 */
+  position: relative;   /* 给下面那个 ::after 方块当定位基准 */
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4713,7 +4719,13 @@ watch(activeTabPath, async (path) => {
   cursor: pointer;
 }
 
-.activity-item:hover,
+.activity-item:hover {
+  color: var(--color-icon-hover);
+}
+
+/* 当前视图：图标变成强调蓝。
+   ⚠ 必须写在 :hover **后面** —— 两者优先级一样，后写的赢。
+     顺序反了的话，「悬停的正好是当前视图」时会退回灰色 */
 .activity-item.active {
   color: var(--color-icon-active);
 }
@@ -4774,23 +4786,22 @@ watch(activeTabPath, async (path) => {
   background: transparent;
 }
 
-/* 只在**非激活**的项上亮 —— 和 VS Code 一致（它写的是 `:not(.checked):hover`）。
-   激活项已经有左侧那条蓝竖线了，再叠一个方块反而分不清「哪个是当前视图」 */
+/* 只在**非激活**的项上亮 —— VS Code 也是这么写的（`:not(.checked):hover`）：
+   当前视图有它自己那档更明显的背景（见下面一条），不用再叠悬停色 */
 .activity-item:not(.active):hover::after {
   background: var(--color-icon-hover-bg);
 }
-/* 激活项左侧那条 2px 竖线 —— VS Code 的标志性细节。
-   ★ 用 activityBar.activeBorder 而不是 activityBar.foreground：
-     前者就是专门管这条线的，后者是图标颜色（两者恰好都偏白，但语义不同）
-   用伪元素而不是额外加一个 div：它是纯装饰，不该进 DOM 结构 */
-.activity-item.active::before {
-  content: "";
-  position: absolute;
-  left: 0;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--color-activitybar-active-border);
+
+/* ★ 当前视图：同一个方块，但底色**更深一档** ——
+   `modernActivityBarItem.activeBackground`（深 #FFFFFF22 / 浅 #e4e6f1）
+   正好是 hoverBackground 那个值的加重版。再加上图标变蓝，两个信号一起表达「你在这里」
+
+   ★ 原来这里画的是一条 2px 的蓝竖线（`activityBar.activeBorder`）。
+     换成方块之后那个键没浪费 —— 它现在给图标上色（见 --color-icon-active）。
+     为什么换成方块：竖线贴在活动栏最左边，和「图标身上的方块」不是一个视觉系统，
+     两个同时上反而分不清哪个才是选中 */
+.activity-item.active::after {
+  background: var(--color-icon-active-bg);
 }
 
 .sidebar {
@@ -5954,12 +5965,13 @@ kbd {
      反馈主要靠**文字提亮**承担（见 --color-tab-hover-fg） */
   --color-tab-bg-hover: #282828;
   --color-tab-hover-fg: #cccccc;
-  /* 活动栏「当前视图」左侧那条竖线。VS Code 用 activityBar.activeBorder 管它 */
-  --color-activitybar-active-border: #007acc;
-  /* 悬停在活动栏图标上时背后那个圆角方块。
-     ★ 值就是 modernActivityBarItem.hoverBackground 的深色档（半透明白）——
+  /* 活动栏图标的三种颜色 + 背后那两个圆角方块。
+     ★ 这几个值都是主题里那几个键的**深色档** ——
        这里只是主题没加载时（比如直接在浏览器里看）的兜底 */
-  --color-icon-hover-bg: #ffffff11;
+  --color-icon-hover: #d7d7d7;      /* activityBar.foreground */
+  --color-icon-active: #0078d4;     /* activityBar.activeBorder，强调蓝 */
+  --color-icon-hover-bg: #ffffff11; /* modernActivityBarItem.hoverBackground */
+  --color-icon-active-bg: #ffffff22;/* modernActivityBarItem.activeBackground */
   /* ★ 「浮起」风格的底：活动栏 / 侧栏 / 编辑器 / 面板都是浮在它上面的卡片，
      卡片之间的缝隙里露出来的就是它。必须比**所有**卡片都深，否则缝隙看不出来。
      注意它不是任何主题键 —— 主题里没有比 activityBar.background(#181818) 更深的值了，
@@ -5987,11 +5999,10 @@ kbd {
        铺一整块太刺眼（这是实测反馈）。这里要的是「压暗了、但还看得出是蓝的」那一档 */
   --color-user-bubble: #1e3f5c;
 
-  /* 活动栏图标。这两个值必须和「活动栏背景」配套 ——
+  /* 活动栏图标的**静止色**。它必须和「活动栏背景」配套 ——
      背景深，图标就得浅；背景浅，图标就得深。
-     所以它们在下面浅色主题里会被覆盖，不再是一处定义两处通用 */
+     另外两档（hover / active）和那两个方块在下面 */
   --color-icon: #858585;
-  --color-icon-active: #ffffff;   /* 兼任激活项左侧那条竖线 */
 
   --color-hover: #2a2d2e;
   --color-selection: #094771;
@@ -6079,13 +6090,15 @@ kbd {
   --color-user-bubble: #d8e8f8;
 
   /* 活动栏背景变浅了，图标就必须翻成深的，
-     否则灰图标糊在浅灰底上根本看不清。
-     这两个值一变，激活项那条竖线也跟着变黑（它俩共用 --color-icon-active）*/
+     否则灰图标糊在浅灰底上根本看不清 */
   --color-icon: #616161;
-  --color-icon-active: #000000;
-  /* ★ 悬停方块在浅色下**不能用深色那套半透明白** ——
-     白铺在白底上等于没画。浅色主题给的是实色 #F2F2F2 */
+  --color-icon-hover: #1f1f1f;
+  --color-icon-active: #005fb8;
+  /* ★ 浅色下这两个方块都**不能用深色那套半透明白** —— 白铺在白底上等于没画。
+     浅色主题给的是实色：hover #F2F2F2、active #e4e6f1（后者略深一点，
+     而且带一点点蓝调，和蓝色的选中图标配得上）*/
   --color-icon-hover-bg: #f2f2f2;
+  --color-icon-active-bg: #e4e6f1;
 
   --color-hover: #e8e8e8;
   --color-selection: #0060c0;
