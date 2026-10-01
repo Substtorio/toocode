@@ -25,6 +25,23 @@ const children = computed<FileNode[]>(() => props.node.children ?? []);
 
 const canExpand = computed(() => isFolder.value && children.value.length > 0);
 
+/**
+ * 展开 / 收起的箭头 —— **VS Code 原生的 codicon `chevron-down`**，
+ * 从 `raw.githubusercontent.com/microsoft/vscode-codicons/main/src/icons/chevron-down.svg`
+ * 一字不改拄来的（不凭记忆描）。
+ *
+ * ★★ 它是「细长无柄」的：只有一撇一捺，**没有竖杆** ——
+ *   这就是 VS Code 文件树那个箭头的形状。
+ *   旧版用的 `▸` / `▾` 是实心三角，又粗又短。「无柄」是第一眼的不像之处
+ * ★ 只维护**一条**路径：收起态是把这张图转 -90°，
+ *   和 VS Code 一样（`.monaco-tl-twistie.collapsed:before { transform: rotate(-90deg) }`）。
+ *   两张图各写一份的话，迟早会有一次只改了其中一个
+ * ⚠ codicon 是**填充**图形（图上只有 `fill="currentColor"`，没有 stroke），
+ *   所以这里也不给 stroke —— 按描边画会得到「粗轮廓图」，和原生不是一个东西
+ */
+const CHEVRON_DOWN =
+  "M3.14598 5.85423L7.64598 10.3542C7.84098 10.5492 8.15798 10.5492 8.35298 10.3542L12.853 5.85423C13.048 5.65923 13.048 5.34223 12.853 5.14723C12.658 4.95223 12.341 4.95223 12.146 5.14723L7.99998 9.29323L3.85398 5.14723C3.65898 4.95223 3.34198 4.95223 3.14698 5.14723C2.95198 5.34223 2.95098 5.65923 3.14598 5.85423Z";
+
 // 高亮跟随「当前激活的文件」—— 注意点标签栏上的标签也会让这里跟着变，
 // 因为大家读的是同一个状态
 const isActive = computed(() => selection?.activePath.value === props.node.path);
@@ -44,8 +61,10 @@ function handleClick() {
   <div class="node">
     <div class="label" :class="{ selected: isActive }" @click="handleClick">
       <!-- 箭头位置始终占位：没有箭头的文件才能和文件夹左对齐 -->
-      <span class="arrow">
-        <template v-if="canExpand">{{ expanded ? "▾" : "▸" }}</template>
+      <span class="arrow" :class="{ collapsed: !expanded }">
+        <svg v-if="canExpand" viewBox="0 0 16 16" aria-hidden="true">
+          <path :d="CHEVRON_DOWN" />
+        </svg>
       </span>
       <span class="name">{{ props.node.name }}</span>
     </div>
@@ -88,12 +107,32 @@ function handleClick() {
   color: var(--color-text-on-accent);
 }
 
-/* 固定宽度：保证「有箭头」和「没箭头」的行内容对齐 */
+/* 固定宽度：保证「有箭头」和「没箭头」的行内容对齐。
+   宽度**没改**（还是 12px）—— 只是把里面的文字字符换成了图标，
+   这样树的对齐、缩进一点都没动，改的只有图标本身 */
 .arrow {
   flex: 0 0 12px;
-  text-align: center;
-  font-size: 10px;
-  opacity: 0.7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 尺寸从 VS Code 的 twistie 换算过来：
+   它那里是 `width: 16px` 的方框 + `font-size: 10px` 的图标，
+   而 codicon 的设计网格是 16 单位 ⇒ 画出来那撇捺只有 ~7px 长。
+   所以这里给 10px —— 小了才「细」，大了立刻变成一顶帽子 */
+.arrow svg {
+  width: 10px;
+  height: 10px;
+  /* codicon 是填充图形，没有 stroke（见 CHEVRON_DOWN 的说明） */
+  fill: currentColor;
+  /* 悬浮一层，在深色下不至于发糊 */
+  opacity: 0.85;
+}
+
+/* 收起态 = 同一张图转 -90°（VS Code 就是这么做的） */
+.arrow.collapsed svg {
+  transform: rotate(-90deg);
 }
 
 .name {

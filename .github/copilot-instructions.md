@@ -574,8 +574,9 @@
 | 改 `modeConfiguration` 到底生效没有 | 看补全条数会不会变 + 直接数 provider | 它**不报错也不生效**（那份 defaults 上根本没有订阅），只看代码会以为它管用 |
 | 调试协议的真实顺序 | 直连适配器的探针（自己写分帧，`probe-dap*.mjs`） | 规范说的和 debugpy 实际的**不一样**：`launch` 不回响应、`initialized` 在后面 —— 按规范写会死锁，而且不报错 |
 | 一行上两个 glyph 装饰落在哪 | 打印那个元素的 `className` | 会**合并到同一个元素**上 ⇒ 两个 `::after` 互相污染，叠出四不像 |
+| 树里那个小箭头到底多粗多细 | CDP 截图 + `clip.scale: 4` 放大 | 6px 的东西在 1x 下**肉眼判不出**粗和细，只能放大看 |
 
-两个提醒：
+三个提醒：
 
 - **「诊断真的到了」和「诊断显示对了」是两件事**。最有用的一条日志不是
   「收到了几条」，而是**把准备交给 Monaco 的行号也打出来** ——
@@ -583,6 +584,14 @@
 - ★★ **`npx vue-tsc --noEmit` 必须真跑、真看输出**。
   这次那个 `lineNumber` / `startLineNumber` 的错，类型检查**本来是能抓的**（TS2739），
   但没跑就等于没有。注意 PowerShell 的退出码不可靠，要看有没有 `error TS` 那几行
+- ★★ **用 CDP 驱动真窗口时，表达式里的中文绝不能走 PowerShell 管道**：
+  PS 5.1 默认按 **ASCII** 把东西喂给原生命令，
+  `Get-Content expr.js -Raw | node cdp-eval.mjs --stdin` 里的 `查看` 会变成 `??`
+  ⇒ `querySelector` 找不到元素，而报的是
+  「Cannot read properties of undefined (reading 'click')」这种**完全指不到原因**的错
+  ⇒ 两条出路：含中文的表达式**写成独立脚本交给 node 跑**（node 自己读文件），
+    或者干脆把中文换成 ASCII（比如把属性名写成英文）
+  ★ 同理：只要输出里有中文，`> file` / `Out-File` 之后的文件都要**显式 `-Encoding utf8`**
 
 这两个 `scripts/*.mjs` 的共同思路：**在 Node 里直接跑 `vscode-textmate`**。
 它在浏览器和 Node 里是同一份代码，但应用里要改文件 → 重启 → 开窗口 → 拿眼睛看颜色；
@@ -1820,6 +1829,32 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       只靠真机验证的话，这条规则过几天就没人能验了
     ★ 通用教训：**判重的 key 要选「身份」，不要选「位置」** ——
       路径是位置（换个地方就变），扩展名 + 相对路径才是身份
+
+- [x] **文件树的展开 / 收起箭头换成 VS Code 同款的 codicon chevron**：
+  起因是用户说「展开收齐的图标改成和 vscode 同款的细长无柄箭头」。
+  ★★ **差异的关键在「无柄」**：旧版用的是 `▸` / `▾`（实心三角）——
+    又粗又短；而 VS Code 用的是一个**只有一撇一捺、没有竖杆**的细箭头。
+    「无柄」是第一眼的不像之处，粗细则是一眼之后的第二眼
+  ★ 图标路径是**从 codicons 仓库现取的**（照项目老规矩，不凭记忆描一个「大概像」）：
+    `https://raw.githubusercontent.com/microsoft/vscode-codicons/main/src/icons/chevron-down.svg`
+  ★★ **只维护一条路径，收起态把它转 -90°** —— 这是照 VS Code 抄的：
+    `.monaco-tl-twistie.collapsed:before { transform: rotate(-90deg) }`。
+    两张图各写一份的话，迟早会有一次只改了其中一个
+  ★ 尺寸也是从 VS Code 的 CSS 里换算的：它那边是
+    `width: 16px` 的方框 + `font-size: 10px` 的图标，
+    而 codicon 的设计网格是 16 单位 ⇒ 画出来那撇捺只有 ~7px 长。
+    我们实测：**10px 的 svg、可见箭头 6.25 × 3.44px、行高 23.5px**
+    （VS Code 的行高是 22px，基本对得上）。**小了才「细」，大了立刻变成一顶帽子**
+  ⚠ `.arrow` 的宽度**没动**（还是 12px）—— 只把里面的文字字符换成图标，
+    这样树的缩进、对齐一点都没变，改的只有图标本身
+    （12px 的槽里放 10px 的图标，居中；实测槽 12×10、svg 10×10）
+  ⚠ codicon 是**填充**图形：`fill: currentColor`，**不给 stroke** ——
+    按描边画会得到「粗轮廓图」，和原生不是一个东西
+  ✅ 深浅两套都截图核对过（`Page.captureScreenshot` + `clip.scale: 4` 放大，
+    1x 下这种 6px 的东西根本判不出来）：
+    浅色 fill `#3b3b3b`、深色 fill `#cccccc`（都是 currentColor），
+    形状 / 粗细 / 对齐都对；`.github` `.vscode` 展开、其余四个收起，两种箭头同框
+    ⚠ 验证时把主题切成了深色，**验完记得切回去**（主题是存 localStorage 的）
 
 ### 待办（按优先级）
 
