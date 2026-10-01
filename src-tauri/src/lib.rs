@@ -3,10 +3,14 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Mutex;
+// ⚠ `Child` 这个名字已经被 portable_pty 占了（终端那块的），
+//   所以 std 的这个显式改名成 StdChild —— 两边混用会编不过，但报错信息不好懂
+use std::process::{
+    Child as StdChild, ChildStderr, ChildStdin, ChildStdout, Command, Stdio,
+};
+use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 
 // ============================ 数据结构 ============================
@@ -831,9 +835,579 @@ async fn git_show_head(path: String, relative: String) -> Result<String, String>
     .map_err(|error| format!("读取 HEAD 版本失败：{error}"))?
 }
 
+// ============================ 语言服务器（LSP）============================
+//
+// 这一节只干一件事：**把「一个跑在管道上的服务器进程」变成前端能用的消息流**。
+// 它不知道 LSP 有哪些方法、也不知道 diagnostics 长什么样 —— 那些在前端的
+// `lsp.ts` 里。分界线就是「JSON-RPC 的帧」：Rust 负责帧，前端负责语义。
+//
+// ★★ 为什么值得这么分：**DAP 用的是同一套分帧**
+//   （一样的 `Content-Length: N\r\n\r\n<body>`），只是消息类型不同。
+//   所以这一节写完，DAP 那边的传输层是白送的 —— 换个 emit 事件名就能用。
+//
+// ★ 为什么必须放 Rust 而不是前端直接连：浏览器 / WebView 没法起子进程，
+//   也没法读写它的 stdio。这是「桌面版才能做的事」里最典型的一件。
+
+/// 读**一帧**。
+///
+/// LSP 的分帧格式是 HTTP 那套的简化版：
+/// ```text
+/// Content-Length: 42\r\n
+/// \r\n
+/// {"jsonrpc":"2.0",…}
+/// ```
+/// 可以有多余的头（比如 `Content-Type`），我们只认必需的 `Content-Length`。
+///
+/// ⚠ ★★ `Content-Length` 是**字节数**，不是字符数。
+///   含中文的 JSON（比如一个中文错误消息）用 `.chars().count()` 算就会短一截，
+///   于是下一次读会从半个字符中间开始 —— 后面**所有**消息全部错位，
+///   而且报错信息完全指不到这里
+///
+/// 返回 `Ok(None)` 表示对端关掉了管道（进程退出），是正常结束不是错误
+fn read_frame(reader: &mut impl BufRead) -> Result<Option<String>, String> {
+    let mut length: Option<usize> = None;
+    // 已经读到过至少一个头 —— 用来区分「头部结束的空行」和「帧之间多出来的空行」
+    let mut saw_header = false;
+
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .map_err(|error| format!("读取 LSP 头部失败：{error}"))?;
+        // 读到 EOF 且一个字节都没有 = 对端关了
+        if read == 0 {
+            return Ok(None);
+        }
+
+        let line = line.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            // ★ 帧与帧之间**没有**分隔符（一个帧的正文后面直接就是下一个帧的头），
+            //   所以正常情况下这里不应该出现空行。
+            //   但真发出来了也不该把整个会话弄挂 —— 当成噪声跳过，等真正的头
+            if saw_header {
+                break; // 头部结束，下面是正文
+            }
+            continue;
+        }
+        saw_header = true;
+
+        // 头名字大小写不敏感（规范就是这么写的），其余的头一律忽略
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                length = Some(
+                    value
+                        .trim()
+                        .parse()
+                        .map_err(|_| format!("Content-Length 不是数字：{value}"))?,
+                );
+            }
+        }
+    }
+
+    let Some(length) = length else {
+        return Err("LSP 头部里没有 Content-Length".to_string());
+    };
+
+    let mut buffer = vec![0u8; length];
+    reader
+        .read_exact(&mut buffer)
+        .map_err(|error| format!("读取 LSP 正文失败：{error}"))?;
+
+    // ★ 到这一步 buffer 里**一定是**完整的 UTF-8 ——
+    //   因为我们按字节数读满了整帧，不会截在字符中间。
+    //   （这也是为什么正文要单独 read_exact，不能和头部一起 read_line）
+    Ok(Some(String::from_utf8_lossy(&buffer).into_owned()))
+}
+
+/// 一个可用的语言服务器
+#[derive(Serialize, Clone)]
+struct LspServerInfo {
+    /// 稳定标识（"json" / "rust-analyzer" …）。前端拿它当会话 id 的一部分
+    id: String,
+    /// 给人看的名字（菜单 / 状态栏里显示）
+    label: String,
+    /// 这个服务器管哪些语言 id。★ 要和语法扫描给出的语言 id 对得上
+    languages: Vec<String>,
+    /// 可执行文件（node.exe / rust-analyzer.exe …）
+    program: String,
+    args: Vec<String>,
+}
+
+/// 跑起来的会话
+struct LspSession {
+    /// 留着是为了 stop 时能 kill —— 不存的话进程就没人管了
+    child: StdChild,
+    /// ★ 包成 Arc<Mutex<…>> 是为了「拿得到就行」：
+    ///   `lsp_send` 不必在整个写操作期间占着 sessions 那把大锁
+    stdin: Arc<Mutex<ChildStdin>>,
+}
+
+#[derive(Default)]
+struct LspState {
+    sessions: Mutex<HashMap<String, LspSession>>,
+}
+
+/// 发给前端的每条消息
+#[derive(Serialize, Clone)]
+struct LspMessage {
+    session: String,
+    /// 原始 JSON 文本。★ Rust 不解析它 —— 解析留前端，
+    /// 这样改 LSP 版本 / 加方法都不用重编 Rust
+    body: String,
+}
+
+/// 写一帧
+fn write_frame(writer: &mut impl Write, body: &str) -> std::io::Result<()> {
+    // ⚠ 同样：这里是**字节**长度
+    write!(writer, "Content-Length: {}\r\n\r\n", body.as_bytes().len())?;
+    writer.write_all(body.as_bytes())?;
+    // ⚠ flush 不能省 —— 不刷的话消息会缓在缓冲区里，
+    //   服务器那边就一直在等，表现为「发了初始化但永远没回应」
+    writer.flush()
+}
+
+/// 枚举本机可用的语言服务器。
+///
+/// ★ 思路和语法 / 主题那两块一样：**不自己打包服务器，用机器上已有的**。
+///   · VS Code 自带 json / html / css 三个服务器（是真 LSP，用 node 起）
+///   · 用户 PATH 里的 rust-analyzer 之类也认
+fn find_lsp_servers() -> Vec<LspServerInfo> {
+    let mut servers: Vec<LspServerInfo> = Vec::new();
+
+    // node 在哪儿 —— VS Code 自带的三个服务器都要靠它跑
+    let node = which("node");
+
+    // ---- 1) VS Code 自带的三个 ----
+    // 路径是 <安装目录>/resources/app/extensions/<x>-language-features/server/dist/node/<x>ServerMain.js
+    // ⚠ 绿色版会多一层版本哈希目录，所以不能直接拼 —— 得枚举候选
+    if let Some(node) = &node {
+        for (id, label, languages, dir) in [
+            ("json", "JSON", &["json", "jsonc"][..], "json-language-features"),
+            ("html", "HTML", &["html"][..], "html-language-features"),
+            ("css", "CSS", &["css", "scss", "less"][..], "css-language-features"),
+        ] {
+            let Some(script) = find_bundled_server(dir, id) else {
+                continue;
+            };
+            servers.push(LspServerInfo {
+                id: id.to_string(),
+                label: label.to_string(),
+                languages: languages.iter().map(|s| s.to_string()).collect(),
+                program: node.clone(),
+                // `--stdio` 是 vscode-languageserver 认的开关：
+                // 不加的话它默认也是 stdio，但显式写出来更清楚
+                args: vec![script, "--stdio".to_string()],
+            });
+        }
+    }
+
+    // ---- 2) PATH 里的独立服务器 ----
+    for (bin, id, label, languages) in [
+        ("rust-analyzer", "rust", "Rust", &["rust"][..]),
+        ("typescript-language-server", "typescript", "TypeScript", &["typescript", "javascript"][..]),
+        ("pyright-langserver", "python", "Python", &["python"][..]),
+    ] {
+        let Some(program) = which(bin) else { continue };
+        // pyright 要显式给 --stdio；其余的直接跑
+        let args = if bin == "pyright-langserver" {
+            vec!["--stdio".to_string()]
+        } else {
+            Vec::new()
+        };
+        servers.push(LspServerInfo {
+            id: id.to_string(),
+            label: label.to_string(),
+            languages: languages.iter().map(|s| s.to_string()).collect(),
+            program,
+            args,
+        });
+    }
+
+    servers
+}
+
+/// 在 VS Code 的安装目录里找 `<ext>/server/dist/node/<name>ServerMain.js`
+fn find_bundled_server(extension: &str, name: &str) -> Option<String> {
+    let relative = Path::new("resources")
+        .join("app")
+        .join("extensions")
+        .join(extension)
+        .join("server")
+        .join("dist")
+        .join("node")
+        .join(format!("{name}ServerMain.js"));
+
+    for root in vscode_install_roots() {
+        // 标准安装：根目录下就是 resources/…
+        let direct = root.join(&relative);
+        if direct.is_file() {
+            return Some(direct.to_string_lossy().into_owned());
+        }
+
+        // 绿色版：根目录下还有一层版本目录
+        let Ok(children) = fs::read_dir(&root) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let nested = child.path().join(&relative);
+            if nested.is_file() {
+                return Some(nested.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
+/// 在 PATH 里找一个可执行文件。
+///
+/// ★ 为什么不用 `which` 那个 crate：就这么几行，引一个依赖不值当
+/// ⚠ Windows 上要试 PATHEXT 里的后缀（.exe / .cmd / .bat …），
+///   否则 `which("node")` 永远找不到 node
+fn which(bin: &str) -> Option<String> {
+    let path = std::env::var_os("PATH")?;
+    let suffixes: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_lowercase())
+            .collect()
+    } else {
+        vec![String::new()]
+    };
+
+    for dir in std::env::split_paths(&path) {
+        for suffix in &suffixes {
+            let candidate = dir.join(format!("{bin}{suffix}"));
+            if candidate.is_file() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    None
+}
+
+/// 列出可用的语言服务器
+#[tauri::command]
+async fn lsp_servers() -> Vec<LspServerInfo> {
+    // 要遍历目录、查 PATH，算阻塞 IO —— 别占住 async 的线程
+    tauri::async_runtime::spawn_blocking(find_lsp_servers)
+        .await
+        .unwrap_or_default()
+}
+
+/// 起一个语言服务器，返回会话 id
+#[tauri::command]
+async fn lsp_start(
+    app: AppHandle,
+    state: State<'_, LspState>,
+    session: String,
+    server_id: String,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let info = find_lsp_servers()
+        .into_iter()
+        .find(|s| s.id == server_id)
+        .ok_or_else(|| format!("找不到语言服务器：{server_id}"))?;
+
+    let mut command = Command::new(&info.program);
+    command.args(&info.args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    // cwd 只在目录真的存在时才设 —— 设一个不存在的路径会让 spawn 整个失败
+    //（终端那块踩过同一个坑）
+    if let Some(dir) = cwd.as_ref().filter(|d| Path::new(d).is_dir()) {
+        command.current_dir(dir);
+    }
+
+    // ⚠ Windows 上不给这个的话会闪一个黑框（和 git 命令同一个坑）
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动语言服务器失败：{error}"))?;
+
+    let stdin = child.stdin.take().ok_or("拿不到语言服务器的 stdin")?;
+    let stdout = child.stdout.take().ok_or("拿不到语言服务器的 stdout")?;
+    let stderr = child.stderr.take().ok_or("拿不到语言服务器的 stderr")?;
+
+    spawn_lsp_reader(app.clone(), session.clone(), stdout);
+    spawn_lsp_stderr(app, session.clone(), stderr);
+
+    state.sessions.lock().unwrap().insert(
+        session,
+        LspSession {
+            child,
+            stdin: Arc::new(Mutex::new(stdin)),
+        },
+    );
+
+    Ok(())
+}
+
+/// 读服务器的输出，一帧一条事件发给前端
+fn spawn_lsp_reader(app: AppHandle, session: String, stdout: ChildStdout) {
+    // ★ 必须开独立线程：`read` 是阻塞的，挂在命令里会把命令线程整个卡死
+    //   （终端的 pty 那块踩过同一个坑）
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_frame(&mut reader) {
+                Ok(Some(body)) => {
+                    let _ = app.emit(
+                        "lsp-message",
+                        LspMessage {
+                            session: session.clone(),
+                            body,
+                        },
+                    );
+                }
+                // EOF = 服务器退出了，正常结束
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = app.emit("lsp-error", format!("{session}: {error}"));
+                    break;
+                }
+            }
+        }
+        // 不管怎么结束都通知一声 —— 前端要拿它把「已连接」状态收回去
+        let _ = app.emit("lsp-exit", session);
+    });
+}
+
+/// 服务器的 stderr 也得有人读。
+///
+/// ⚠ 不读的话管道缓冲区会满，服务器一写日志就**卡死在那儿** ——
+///   表现是「服务器起来了一会儿就没反应了」，而 stdout 那边什么都看不到
+fn spawn_lsp_stderr(app: AppHandle, session: String, stderr: ChildStderr) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = app.emit("lsp-stderr", format!("[{session}] {line}"));
+        }
+    });
+}
+
+/// 往前端指定的会话发一帧
+#[tauri::command]
+async fn lsp_send(state: State<'_, LspState>, session: String, message: String) -> Result<(), String> {
+    // ★ 先把 stdin 的 Arc 取出来、把 sessions 那把锁放掉，再去写 ——
+    //   写管道是会阻塞的，握着大锁写会把别的会话一起堵住
+    let stdin = {
+        let sessions = state.sessions.lock().unwrap();
+        let found = sessions
+            .get(&session)
+            .ok_or_else(|| format!("没有这个会话：{session}"))?;
+        Arc::clone(&found.stdin)
+    };
+
+    let mut stdin = stdin.lock().unwrap();
+    // ⚠ `&mut *stdin` 而不是 `&mut stdin`：MutexGuard 本身不是 Write，
+    //   要显式解引用成里面的 ChildStdin
+    write_frame(&mut *stdin, &message).map_err(|error| format!("写给语言服务器失败：{error}"))?;
+    Ok(())
+}
+
+/// 关掉一个会话（同时把进程杀掉）
+#[tauri::command]
+async fn lsp_stop(state: State<'_, LspState>, session: String) -> Result<(), String> {
+    let mut sessions = state.sessions.lock().unwrap();
+    if let Some(mut found) = sessions.remove(&session) {
+        // kill 失败不是错误 —— 进程可能已经自己退了
+        let _ = found.child.kill();
+        let _ = found.child.wait();
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- 语言服务器的分帧 ----------
+
+    #[test]
+    fn reads_a_simple_frame() {
+        let raw = "Content-Length: 7\r\n\r\n{\"a\":1}";
+        let mut reader = BufReader::new(raw.as_bytes());
+        let frame = read_frame(&mut reader).unwrap();
+        assert_eq!(frame.as_deref(), Some("{\"a\":1}"));
+    }
+
+    #[test]
+    fn reads_several_frames_in_a_row() {
+        // ★ 帧与帧之间**没有**分隔符 —— 一个帧的正文后面直接跟着下一个帧的头。
+        //   （我第一版测试在这里多写了一个 \r\n，结果把正确的实现测挂了）
+        let raw = "Content-Length: 2\r\n\r\n[]Content-Length: 3\r\n\r\n\"x\"";
+        let mut reader = BufReader::new(raw.as_bytes());
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("[]"));
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("\"x\""));
+    }
+
+    #[test]
+    fn tolerates_a_stray_blank_line_between_frames() {
+        // 不合规范但真有实现会多吐一个空行。跳过它，不要把整个会话弄挂
+        let raw = "Content-Length: 2\r\n\r\n[]\r\nContent-Length: 3\r\n\r\n\"x\"";
+        let mut reader = BufReader::new(raw.as_bytes());
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("[]"));
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("\"x\""));
+    }
+
+    #[test]
+    fn content_length_counts_bytes_not_chars() {
+        // ★★ 这是最容易写错的一处：
+        //   "一" 只有 1 个字符，但 UTF-8 下是 3 个字节。
+        //   用 chars().count() 算头部就会写 1，于是下一次读从半个字中间开始 ——
+        //   后面所有消息全部错位，而且报错信息指不到这里。
+        //   中文报错消息在真实服务器里很常见（比如 tsserver），必然踩到
+        let body = "无";
+        let mut framed: Vec<u8> = Vec::new();
+        write_frame(&mut framed, body).unwrap();
+
+        let text = String::from_utf8(framed.clone()).unwrap();
+        assert_eq!(text, "Content-Length: 3\r\n\r\n无");
+
+        // 而且真的能读回来
+        let mut reader = BufReader::new(framed.as_slice());
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some(body));
+    }
+
+    #[test]
+    fn ignores_extra_headers() {
+        // 规范允许多余的头（Content-Type 之类），只认 Content-Length 就行
+        let raw = "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: 2\r\nX-Other: 1\r\n\r\n{}";
+        let mut reader = BufReader::new(raw.as_bytes());
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn header_name_is_case_insensitive() {
+        let raw = "content-length: 2\r\n\r\n[]";
+        let mut reader = BufReader::new(raw.as_bytes());
+        assert_eq!(read_frame(&mut reader).unwrap().as_deref(), Some("[]"));
+    }
+
+    #[test]
+    fn eof_is_not_an_error() {
+        // 对端关掉管道 = 进程退出了，是正常结束
+        let mut reader = BufReader::new(&b""[..]);
+        assert!(read_frame(&mut reader).unwrap().is_none());
+    }
+
+    /// 真的把 VS Code 自带的 JSON 语言服务器起起来，走一遍完整流程。
+    ///
+    /// ★ 为什么值得写这个：分帧那几条用例只证明「我自己写的读和写能互相配合」，
+    ///   证明不了「读的东西真是别人写的」。这个测试拿**真实的服务器**验证，
+    ///   而且顺带把 initialize 握手、didOpen、诊断推送整条链路都跑了一遍。
+    ///
+    /// ⚠ 机器上没有 VS Code / node 时**直接返回** —— 这不是失败，
+    ///   只是这台机器没这个条件（和 finds_vscode_builtin_extensions 一个态度）
+    #[test]
+    fn talks_to_the_real_json_language_server() {
+        let Some(script) = find_bundled_server("json-language-features", "json") else {
+            return;
+        };
+        let Some(node) = which("node") else { return };
+
+        let mut child = Command::new(node)
+            .arg(&script)
+            .arg("--stdio")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("起不来 JSON 语言服务器");
+        let mut stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        // ★★ 读消息要放在**独立线程**里，主线程用 recv_timeout 收。
+        //   直接在主线程 read_frame 的话，服务器一旦不说话测试就**永远挂着** ——
+        //   而「测试挂住」比「测试失败」难查得多（没有报错，只有一直转圈）
+        let (sender, receiver) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            while let Ok(Some(frame)) = read_frame(&mut reader) {
+                if sender.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let wait_for = |receiver: &std::sync::mpsc::Receiver<String>, needle: &str| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                let Ok(frame) = receiver.recv_timeout(left) else {
+                    return false;
+                };
+                if frame.contains(needle) {
+                    return true;
+                }
+            }
+        };
+
+        // 1) 握手。回应里必须带 capabilities —— 那是服务器能力的清单
+        write_frame(
+            &mut stdin,
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"processId":null,"rootUri":null,"capabilities":{}}}"#,
+        )
+        .unwrap();
+        assert!(
+            wait_for(&receiver, "\"capabilities\""),
+            "服务器没有正确回应 initialize"
+        );
+
+        // 2) initialized 通知（告诉它可以开始干活了）
+        write_frame(
+            &mut stdin,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+        )
+        .unwrap();
+
+        // 3) 打开一份**语法错的** JSON，等它推诊断回来。
+        //    ★ 这里用 `{ "a": }` —— 少了一个值，是 json 解析器一定会报的错
+        write_frame(
+            &mut stdin,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///d%3A/no/such/broken.json","languageId":"json","version":1,"text":"{ \"a\": }"}}}"#,
+        )
+        .unwrap();
+
+        assert!(
+            wait_for(&receiver, "publishDiagnostics"),
+            "没等到服务器推诊断"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn finds_the_bundled_language_servers() {
+        // 条件不具备时跳过（见上一个测试的说明）
+        if which("node").is_none() {
+            return;
+        }
+        let servers = find_lsp_servers();
+        // 有 VS Code 就应该至少认出 json / html / css 三个之一
+        if find_bundled_server("json-language-features", "json").is_some() {
+            let json = servers.iter().find(|s| s.id == "json");
+            assert!(json.is_some(), "没认出 JSON 语言服务器");
+            // ★ 语言 id 必须和语法扫描给出的对得上，否则永远匹配不上
+            assert!(json.unwrap().languages.contains(&"json".to_string()));
+        }
+    }
 
     // ---------- 源代码管理（git status 的解析）----------
 
@@ -2042,10 +2616,16 @@ pub fn run() {
             clear_secret,
             chat_stream,
             git_status,
-            git_show_head
+            git_show_head,
+            lsp_servers,
+            lsp_start,
+            lsp_send,
+            lsp_stop
         ])
         // 终端会话表。放在 State 里而不是全局变量 —— Tauri 会管它的生命周期
         .manage(PtyState::default())
+        // 语言服务器会话表。同样的理由
+        .manage(LspState::default())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

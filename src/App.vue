@@ -40,6 +40,15 @@ import MenuList from "./components/MenuList.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import TerminalPanel from "./components/TerminalPanel.vue";
 import { fileTreeExpansionKey, fileTreeSelectionKey } from "./injectionKeys";
+// 语言服务器客户端。★ 它不知道 `models` 表长什么样 —— 以两个函数的
+// 形式把口子开给它（和 editorBridge 一个套路）
+import {
+  changeDocument,
+  closeDocument,
+  configureLsp,
+  disposeLsp,
+  openDocument,
+} from "./lsp";
 // 应用图标：直接拿 Tauri 打包用的那张 128×128 —— 不用再维护第二份图。
 // ⚠ 以前用的是 32x32 那张，因为当时只显示 16px。logo 放大到 22px 之后，
 //   高分屏下 32px 的源会被拉大（2x 屏需要 44 物理像素）⇒ 发糊，所以换大的
@@ -1167,6 +1176,12 @@ function watchDirtyState(path: string, model: monaco.editor.ITextModel) {
   contentSubscriptions.set(
     path,
     model.onDidChangeContent(() => {
+      // ★ 内容变了就同步给语言服务器，让它重算诊断。
+      //   放在这里而不是「保存时」—— LSP 要的就是实时，
+      //   等存盘才报错那和编译没区别了。
+      //   （changeDocument 自己会挡掉「没 didOpen 过的路径」）
+      changeDocument(path);
+
       // savedVersions 里没记录（比如未命名文档）时 get 返回 undefined，
       // 比较结果一定是 false → 判定为脏。这正是我们要的
       if (model.getAlternativeVersionId() === savedVersions.get(path)) {
@@ -1450,6 +1465,10 @@ async function modelForPath(path: string): Promise<monaco.editor.ITextModel> {
 
   // 内容一变就重新判断脏状态（订阅细节见 watchDirtyState）
   watchDirtyState(path, model);
+
+  // 交给语言服务器。★ 没装对应服务器、或这个语言没服务器时它自己就退了 ——
+  //   调用方不用先问「有没有」，那反而会多一次 IPC
+  if (!isUntitledPath(path)) void openDocument(path, languageFromPath(path));
 
   return model;
 }
@@ -1903,6 +1922,11 @@ async function saveFileAs(path: string): Promise<boolean> {
   models.delete(path);
   models.set(target, model);
 
+  // ★ 语言服务器那边也得搬：旧路径 didClose、新路径 didOpen。
+  //   只改一边的话，服务器会一直拿旧 URI 报错 —— 而那个文件已经不在了
+  if (!isUntitledPath(path)) closeDocument(path);
+  void openDocument(target, languageFromPath(target));
+
   // 内容刚落盘，所以新路径的基线就是「现在」
   savedVersions.delete(path);
   savedVersions.set(target, model.getAlternativeVersionId());
@@ -2044,6 +2068,9 @@ function resetWorkspace() {
   // 跳过欢迎页那个 model（编辑器正用着它），也跳过未命名文档
   for (const [key, model] of models) {
     if (key === WELCOME_KEY || isUntitledPath(key)) continue;
+    // 告诉语言服务器这个文件关了 —— 不然它会一直攥着旧内容，
+    // 下次打开同一个文件时报的错可能来自上一次的版本
+    closeDocument(key);
     unwatchDirtyState(key);
     model.dispose();
     models.delete(key);
@@ -3472,6 +3499,29 @@ onMounted(async () => {
   // 语言 id 得先注册好，否则模型会退化成纯文本
   await loadSyntaxExtensions();
 
+  // 把语言服务器客户端的两个口子接上。★ 放在恢复标签之前 ——
+  // 恢复出来的标签一走 modelForPath 就会 openDocument
+  configureLsp(
+    {
+      findModel: (path) => {
+        const direct = models.get(path);
+        if (direct) return direct;
+        // ★★ 兜底走一遍归一化比对。为什么需要：
+        //   语言服务器回传的 URI 是**归一化过**的（分隔符统一成 `/`、盘符统一大写），
+        //   而 `models` 的 key 来自 Rust 的 `read_dir` —— 盘符大小写跟着用户
+        //   选的文件夹走，完全可能是小写。
+        //   只做精确匹配的话会 miss，症状是「诊断一条都不显示」而且**不报错**。
+        //   （和 editorBridge 那边同一个理由，所以那边用的也是遍历）
+        const wanted = normalizePath(path);
+        for (const [key, model] of models) {
+          if (normalizePath(key) === wanted) return model;
+        }
+        return null;
+      },
+      workspaceRoot: () => workspaceRoot.value,
+    },
+    (line) => console.info(line),
+  );
   // 再把 VS Code 自带的主题接过来。它和语法扩展是两件事，各自独立失败
   await loadVscodeThemes();
 
@@ -3556,6 +3606,8 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleChatShortcut, true);
   // 拆掉状态桥：它抓着编辑器实例和 model，留着就是泄漏
   provideEditorBridge(null);
+  // 关掉所有语言服务器进程。不关的话它们会活到系统重启
+  void disposeLsp();
   unlistenClose?.();
   unlistenResize?.();
 
