@@ -2667,6 +2667,21 @@ push 完代码、Release 还是空的 —— **这是正常的**，不是没传�
 tag 填 `v0.1.0`（对上 `tauri.conf.json` 里的 `version`）→ 把
 `bundle/nsis/Toocode_0.1.0_x64-setup.exe` 拖进附件区 → Publish。
 
+### 0.2.0 的实测记录（照着上面这一套走了一遍）
+
+| 项目 | 值 |
+| --- | --- |
+| `release\toocode.exe` | 8.5 MB（裸 exe） |
+| `bundle\nsis\Toocode_0.2.0_x64-setup.exe` | 4.8 MB ← **要发给别人的就是它** |
+| exe 内嵌版本 | `FileVersion` / `ProductVersion` 都是 `0.2.0` |
+| release 冒烟 | 起得来；`invoke("lsp_servers")` 回 4 个（**后端真的可用**）；活动栏 4 项；`[data-tooltip]` 16 个而 `[title]` 0 个（tooltip 接管生效） |
+
+⚠ **`toocode.secret` 在这台机器上还是「旧的明文格式」**（35 字节，没有 `TOOCODE1` 头）——
+那不是 bug：代码本来就兼容它，**下次在配置界面保存一次就会自动写成 DPAPI 加密格式**。
+想让老用户一升级就换过去，得改成「读的时候顺手迁一下」
+⚠ 打包前记得先 `Get-Process toocode | Stop-Process -Force` 并确认 1420 释放，
+  否则 dev 那边的 cargo 会和打包抢 `target` 的锁
+
 ### ⚠ 提交前确认 target 没被加进来
 
 `src-tauri/target` 有 **6 GB 以上**，一旦提交仓库就毁了。
@@ -2743,13 +2758,30 @@ $log = "$env:TEMP\toocode-build.log"
 $p = Start-Process -FilePath "cmd.exe" `
   -ArgumentList "/c", "npm run tauri build --prefix $dir -- --bundles nsis" `
   -RedirectStandardOutput $log -RedirectStandardError "$log.err" `
-  -NoNewWindow -PassThru
+  -WindowStyle Hidden -PassThru
 "PID = $($p.Id)"
 
 # 随时看进度（去掉 \r，是因为 cargo 的进度条会反复刷同一行）：
-Get-Content $log -Tail 10 | ForEach-Object { $_ -replace "`r","" } | Where-Object { $_.Trim() }
+Get-Content $log -Tail 10 -Encoding utf8 | ForEach-Object { $_ -replace "`r","" } | Where-Object { $_.Trim() }
 ```
 
 ★ 输出重定向还有一个好处：**不会因为输出太长（几万行）而被工具/终端提前截断**
 ★ 只想验证「编译能不能过」、不做安装包：改用 `-- --no-bundle`（不联网，快得多）
 ★ 要发给别人只需要 NSIS 那一个的话：`-- --bundles nsis`，能少下载几十 MB 的 WiX
+⚠ 日志里有中文，`Get-Content` 要配 `-Encoding utf8`，否则看到的是乱码
+
+★★ **必须是 `-WindowStyle Hidden`，不能是 `-NoNewWindow`**（实测踩过，浪费了一整轮）：
+后者让打包的 `cmd.exe` 和我们的终端**共用同一个控制台**，
+于是「工具清理 / 打断那个终端」时，控制台级的 Ctrl+C 会**一起送进打包进程** ——
+表现是日志停在 `Terminate batch job (Y/N)?`，而 `Compiling toocode` 那行之后什么都没有。
+`-WindowStyle Hidden` 给它一个**独立控制台**，就免疫了。
+（第一版文档写的就是 `-NoNewWindow`，照着自己写的做，正好踩中）
+
+⚠★ **别在共享终端里 `Wait-Process -Timeout 2400` 等它** —— 那会把 shell 占住，
+后面发的命令全排在被占的 shell 后面，现象是「命令没输出」「30 秒超时」
+「多行命令被拆成几段、只剩最后一行在跑」，很容易误判成「打包又坏了」。
+⇒ 改成每隔一会儿开一条**新命令**看日志尾部（日志在文件里，什么时候看都行）
+
+★ 打包完成的标志在 **stderr** 里（不在 stdout）：
+`Finished 1 bundle at:` + `…\bundle\nsis\Toocode_0.2.0_x64-setup.exe`
+★ `release\bundle\nsis\` 里**旧版本的安装包不会被删**，0.1.0 和 0.2.0 会同时在
