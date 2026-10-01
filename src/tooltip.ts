@@ -58,6 +58,19 @@ let owner: Element | null = null;
 let showTimer: ReturnType<typeof setTimeout> | null = null;
 let observer: MutationObserver | null = null;
 
+/**
+ * 光标**最新**的位置。
+ *
+ * ★★ 为什么不能直接用 `mouseover` 事件里的 `clientX/clientY`：
+ *   那是「**刚进入这个元素那一刻**」的坐标，而提示条是 500ms 之后才弹的 ——
+ *   在一个宽元素里（长标签、状态栏那串完整路径、树的一行）横向滑一段再停下，
+ *   弹出来的框还钉在你「进来」的那个点上，离光标老远。
+ *   实测：从 x=352 进去、滑到 x=728 停下，框出现在 364。
+ *   ★ 而**在同一个元素里移动是不会再触发 mouseover 的** ——
+ *     所以光靠 mouseover 根本拿不到后面的位置，必须自己听着 mousemove
+ */
+const pointer = { x: 0, y: 0 };
+
 /** 上一次「藏起来」的时刻。用来实现那个「紧接着悬停就立刻显示」 */
 let hiddenAt = 0;
 
@@ -115,7 +128,7 @@ function hide(): void {
   owner = null;
 }
 
-function show(element: Element, x: number, y: number): void {
+function show(element: Element): void {
   if (tip === null) return;
 
   const text = element.getAttribute("data-tooltip") ?? "";
@@ -127,19 +140,34 @@ function show(element: Element, x: number, y: number): void {
   //   直接显示的坏处是第一次会闪一下（先出现在右下角、再跳到左边）
   tip.style.visibility = "hidden";
   tip.style.display = "block";
-  const rect = tip.getBoundingClientRect();
+  const { width, height } = tip.getBoundingClientRect();
 
-  let left = x + CURSOR_GAP_X;
-  let top = y + CURSOR_GAP_Y;
-
-  // 右边放不下就贴着右边（而不是让它溢出到窗口外）
-  if (left + rect.width > window.innerWidth - VIEWPORT_MARGIN) {
-    left = Math.max(VIEWPORT_MARGIN, window.innerWidth - rect.width - VIEWPORT_MARGIN);
+  // 默认放在光标右下方
+  let left = pointer.x + CURSOR_GAP_X;
+  // ★★ 右边放不下就翻到光标**左边**，而不是「贴着窗口右边缘」——
+  //    后者对一个宽提示条（一长串路径能到 700px）来说是错的：
+  //    它会把框横跨到**光标上方**，看着像「弹到老远的地方」
+  if (left + width > window.innerWidth - VIEWPORT_MARGIN) {
+    left = pointer.x - width - CURSOR_GAP_X;
   }
+
   // 下面放不下就翻到光标上面
-  if (top + rect.height > window.innerHeight - VIEWPORT_MARGIN) {
-    top = Math.max(VIEWPORT_MARGIN, y - rect.height - CURSOR_GAP_X);
+  let top = pointer.y + CURSOR_GAP_Y;
+  if (top + height > window.innerHeight - VIEWPORT_MARGIN) {
+    top = pointer.y - height - CURSOR_GAP_Y;
   }
+
+  // 兼底：夹进窗口。
+  // ⚠ 两个 Math.max 不能合 —— 窗口比提示条还窄时，
+  //   `innerWidth - width - MARGIN` 会是个负数，直接用会把框推到视口外面
+  left = Math.min(
+    Math.max(left, VIEWPORT_MARGIN),
+    Math.max(VIEWPORT_MARGIN, window.innerWidth - width - VIEWPORT_MARGIN),
+  );
+  top = Math.min(
+    Math.max(top, VIEWPORT_MARGIN),
+    Math.max(VIEWPORT_MARGIN, window.innerHeight - height - VIEWPORT_MARGIN),
+  );
 
   tip.style.left = `${Math.round(left)}px`;
   tip.style.top = `${Math.round(top)}px`;
@@ -163,6 +191,13 @@ export function installTooltips(): void {
   captureAll(document.body);
 
   const onOver = (event: MouseEvent) => {
+    // 兜底：万一只发过一次 mouseover、没有 mousemove（合成事件、笔 / 手指），
+    // 至少还能用这一份坐标
+    if (event.clientX !== 0 || event.clientY !== 0) {
+      pointer.x = event.clientX;
+      pointer.y = event.clientY;
+    }
+
     const next = ownerOf(event.target);
     // 还在同一个元素内部转（比如从文字移到它旁边的图标），别打断
     if (next === owner) return;
@@ -171,13 +206,17 @@ export function installTooltips(): void {
     if (next === null) return;
 
     owner = next;
-    const { clientX, clientY } = event;
     const delay = Date.now() - hiddenAt < INSTANT_WINDOW ? 0 : HOVER_DELAY;
     showTimer = setTimeout(() => {
       showTimer = null;
       // 等这 500ms 里鼠标可能已经走了 —— 走的时候 owner 会被清掉
-      if (owner === next) show(next, clientX, clientY);
+      if (owner === next) show(next);
     }, delay);
+  };
+
+  const onMove = (event: MouseEvent) => {
+    pointer.x = event.clientX;
+    pointer.y = event.clientY;
   };
 
   const onOut = (event: MouseEvent) => {
@@ -196,6 +235,8 @@ export function installTooltips(): void {
   // 捕获阶段：这些都是「别处也会处理」的事件，冒泡阶段挂可能轮不到我们
   document.addEventListener("mouseover", onOver, true);
   document.addEventListener("mouseout", onOut, true);
+  // ★ 光标最新位置就靠它（见 pointer 的说明）—— 频率很高，但只是两个赋值
+  document.addEventListener("mousemove", onMove, true);
   document.addEventListener("mousedown", onDismiss, true);
   document.addEventListener("wheel", onDismiss, true);
   document.addEventListener("keydown", onKeyDown, true);
@@ -206,6 +247,7 @@ export function installTooltips(): void {
   disposers.push(
     () => document.removeEventListener("mouseover", onOver, true),
     () => document.removeEventListener("mouseout", onOut, true),
+    () => document.removeEventListener("mousemove", onMove, true),
     () => document.removeEventListener("mousedown", onDismiss, true),
     () => document.removeEventListener("wheel", onDismiss, true),
     () => document.removeEventListener("keydown", onKeyDown, true),
