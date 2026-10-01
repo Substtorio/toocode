@@ -2523,13 +2523,79 @@ static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::
 
 fn http_client() -> &'static reqwest::Client {
     HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
+            // ★★ 默认**不读系统代理**，只认环境变量。
+            //
+            // 这一段是拿真接口一步步试出来的，值得记下来：
+            //   · `reqwest` 0.12 的默认 feature 里带了 `system-proxy` ——
+            //     它会去读 **Windows「Internet 选项」里那个代理**
+            //     （`HKCU\...\Internet Settings` 的 `ProxyEnable` / `ProxyServer`）。
+            //     本机就是开的：`ProxyEnable=1`、`ProxyServer=127.0.0.1:7897`（Clash 那种）
+            //   · 走那条路时请求**必然**失败：
+            //     `error sending request … ← client error (Connect) ← unexpected EOF during handshake`
+            //     （CONNECT 建上了，然后对端把连接关掉，TLS 握手当场结束）
+            //   · 而**同一个 URL、同样的 body**：
+            //     · `curl`（会读 IE 代理）→ 401，0.12s
+            //     · `curl --noproxy "*"`（直连）→ 401，1.1s
+            //     · PowerShell → 401
+            //     · 只有我们过不去 —— 换成 `.no_proxy()` 之后**立刻就好了**
+            //       （回答正常流式返回、`read_file` 工具也调起来了）
+            //   ⇒ 结论：**那个系统代理不可靠**（它的规则完全可能把某个域名路由到死节点上），
+            //     而 Windows 的「IE 代理」本来就是**给浏览器**用的约定 ——
+            //     Node / Python requests 这些默认都不读它，跟着它走反而会踩别人的坑
+            //
+            // ★ 但**不能**因此把代理整个砍掉：有人直连就是不通（比如用 OpenAI 的接口），
+            //   对他们是必须的。所以保留**环境变量**这条路 —— 这也是绝大多数 CLI 工具的规矩
+            //   （`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`，大小写都认）
+            //   ⚠ `no_proxy()` 只是**关掉自动发现**，下面显式加的代理照样生效
+            //     （所以顺序要紧：先 no_proxy 再 proxy）
+            .no_proxy()
             // 模型「思考 + 写代码」可能要很久，超时给宽一点；
             // 但**不能不给** —— 没有超时的话网络一断这个命令就永远挂着
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .expect("构造 HTTP 客户端不该失败")
+            .timeout(std::time::Duration::from_secs(300));
+
+        let from_env = [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ]
+        .iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty());
+
+        if let Some(value) = from_env {
+            match reqwest::Proxy::all(value.trim()) {
+                Ok(proxy) => builder = builder.proxy(proxy),
+                // 填错了不该让整个应用起不来 —— 说一声，然后按「不用代理」继续
+                Err(error) => eprintln!("[网络] 环境变量里的代理填得不对，已忽略：{error}"),
+            }
+        }
+
+        builder.build().expect("构造 HTTP 客户端不该失败")
     })
+}
+
+/// 把 reqwest 的错误**连同底层原因**一起说清楚。
+///
+/// ★★ 为什么必须自己走一遍 source 链：`reqwest::Error` 的 Display 只有最外面那一句
+///   —— `error sending request for url (…)`，**完全指不到原因**。
+///   真正有用的（连接被拒 / DNS 解不开 / TLS 握手失败 / 超时）都在 `source()` 里。
+///   实测：先看到的就是那句废话，只能靠猜；把链走完才知道是「连接被重置」还是别的
+fn describe_http_error(context: &str, error: &reqwest::Error) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(inner) = source {
+        let text = inner.to_string();
+        // 有几层只是把上面那句话重复一遍（hyper 那层常常如此），去掉重复的
+        if !parts.iter().any(|part| part == &text) {
+            parts.push(text);
+        }
+        source = inner.source();
+    }
+    format!("{context}：{}", parts.join(" ← "))
 }
 
 /// 发起一次对话，把响应**原始文本**逐块 emit 回前端。
@@ -2587,7 +2653,7 @@ async fn chat_stream(
                 "chat-end",
                 ChatEndEvent {
                     request_id,
-                    error: Some(format!("请求失败：{err}")),
+                    error: Some(describe_http_error("请求失败", &err)),
                 },
             );
             return Ok(());
@@ -2623,7 +2689,7 @@ async fn chat_stream(
                     "chat-end",
                     ChatEndEvent {
                         request_id,
-                        error: Some(format!("读取响应中断：{err}")),
+                        error: Some(describe_http_error("读取响应中断", &err)),
                     },
                 );
                 return Ok(());

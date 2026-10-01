@@ -2061,6 +2061,42 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       出来的新文档**没有桩**，症状是「面板停在配置界面」。
       ⇒ 每个脚本要自己注册一遍
 
+- [x] **修一个「发布前才发现」的大 bug：Topilot 请求必然失败（系统代理）**：
+  ★ 现象：第一次拿**真接口**跑（之前一次都没跑过），报
+    `请求失败：error sending request for url (…)`
+  ★★ **第一步是先把错误信息修好**：`reqwest::Error` 的 Display 只有最外面那一句，
+    完全指不到原因。加了个 `describe_http_error()` 把 `source()` 链走完，
+    变成 `… ← client error (Connect) ← unexpected EOF during handshake`
+    ⇒ **没有这一步，后面所有排查都是猜**
+  ★★★ **真正的根因**：`reqwest` 0.12 的默认 feature 里带了 **`system-proxy`** ——
+    它会去读 **Windows「Internet 选项」里那个代理**
+    （`HKCU\Software\...\Internet Settings` 的 `ProxyEnable` / `ProxyServer`）。
+    本机就是开的：`ProxyEnable=1`、`ProxyServer=127.0.0.1:7897`（Clash 那种）。
+    而走那条路请求**必然**失败
+    ⇒ 修法：`.no_proxy()` **默认不读系统代理**，但保留环境变量那条路
+      （`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`，大小写都认）——
+      这也是绝大多数 CLI 工具的规矩。对「直连就是不通」的人是必须的
+    ★ 为什么这样取舍：Windows 的「IE 代理」本来就是**给浏览器**用的约定，
+      Node / Python requests 这些默认都不读它；跟着它走反而会踩别人的坑。
+      ⚠ `no_proxy()` 只关掉**自动发现**，显式加的代理照样生效 ⇒ **顺序要紧**（先 no_proxy 再 proxy）
+  ★★ **排查过程本身值得记：四个假设全被实测推翻** ——
+    · 「reqwest 不做 Happy Eyeballs，优先试 IPv6」→ **没有 AAAA 记录**，`-6` 直接解析失败
+    · 「两个 A 记录里有一个坏的」→ 逐 IP 测确实有一个（TCP 通、curl 超时），
+      但**把 DNS 钉死到好的那个 IP 上照样失败** ⇒ 不是地址选择
+    · 「ALPN 里那个 h2 被中间盒搞坏」→ 加 `.http1_only()` **照样失败**
+    · 「TLS 后端装的是 rustls」→ `cargo tree -e features -i "reqwest@0.12.28"`
+      显示只有 `default-tls`（= Schannel，和 curl 一样）
+    ⇒ 最后是靠「一次只改一个变量」试到 `.no_proxy()` 才好
+    ★ 顺带验证出来的事实：**Windows 自带的 curl 也会读 IE 代理**
+      （`curl` 和 `curl --noproxy "*"` 都能拿到 401，0.12s / 1.1s）
+  ✅ 修完实测（真接口）：文字 **1 秒**就冒出来（0 → 44 → 227，分多次增长 = 真流式）、
+    **调了 3 个工具**（`list_directory` → `search_in_folder` → `read_file`）、
+    答案正确（`@tauri-apps/api` 那些）、切走再切回来 227 字 + 3 个工具都在
+  ⏳ 遗留：**代理只能靠环境变量**（GUI 里没有那一栏）。想要的话得在配置里加一个
+    「代理」输入框，并按代理串缓存 client —— 暂时不值当
+  ⚠ 另一个观察：这台机器的 DNS **时好时坏**（Clash 的 TUN + fake-ip），
+    偶发 `dns error ← 不知道这样的主机 (os error 11001)`。那不是我们的问题
+
 ### 待办（按优先级）
 
 1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。
