@@ -2682,6 +2682,53 @@ tag 填 `v0.1.0`（对上 `tauri.conf.json` 里的 `version`）→ 把
 ⚠ 打包前记得先 `Get-Process toocode | Stop-Process -Force` 并确认 1420 释放，
   否则 dev 那边的 cargo 会和打包抢 `target` 的锁
 
+### 用 gh 发版（省掉手点网页）—— 2026-10-02 实际走通
+
+**装**：`winget install --id GitHub.cli -e --scope user`（非管理员、不写 Program Files、
+不弹 UAC，走的是 zip 便携版，装到 `%LOCALAPPDATA%\Microsoft\WinGet\Packages\...\bin\`）
+⚠ **PATH 加的是用户级，已经在跑的 VS Code 读不到** —— 用户在新终端里敲 `gh` 仍然是
+  `无法将"gh"项识别为 cmdlet`。要么重启 VS Code，要么在命令里先刷一次：
+  `$env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")`
+  （或者干脆给完整路径 `& "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\<包名>\bin\gh.exe"`）
+
+**登录 —— 三个坑，全踩过**：
+1. ★★ **别在工具终端里跑 `gh auth login`**。它的交互式提示（方向键选择、`Press Enter to open...`）
+   在我们的终端里不可靠：实测**打印完验证码之后进程自己就退出了**，于是「没人轮询」
+   ⇒ 用户在浏览器里授权了也取不到令牌，两边都看不出原因。
+2. ★★ **设备码轮询必须每一步都记日志**。第一版把 `catch` 里写成 `continue` 静默跳过，
+   结果是「代理偶发 TLS 握手失败」这种失败**完全不可见**，表现为「用户说授权了但没动静」。
+   实测日志：`POLL 3 schannel: failed to receive handshake`。
+3. ★★ **gh 只认 `HTTPS_PROXY` / `HTTP_PROXY` 环境变量，不读 Windows「Internet 选项」里的代理**
+   （它是 Go 写的，走 `ProxyFromEnvironment`）。不设的话 `gh auth login --with-token`
+   会因为「验证令牌时连不上 api.github.com」而失败（`hosts.yml` 不生成）。
+   ⇒ 跑 gh 之前先 `$env:HTTPS_PROXY = "http://127.0.0.1:7897"`。
+
+可靠做法是**脚本化走设备码接口**（不需要 TTY）：
+```
+POST https://github.com/login/device/code        client_id=178c6fc778ccc68e1d6a&scope=repo,read:org,gist,workflow
+POST https://github.com/login/oauth/access_token client_id=...&device_code=...&grant_type=urn:ietf:params:oauth:grant-type:device_code
+```
+拿到 `user_code` 后告诉用户去 `https://github.com/login/device` 输码（同时 `Set-Clipboard` 放剪贴板 +
+`Start-Process` 打开浏览器），自己每 `interval` 秒轮询一次，`authorization_pending` 就继续，
+`access_token` 一到就：`$token | & gh auth login --with-token`。
+- ⚠★ `--with-token` **会校验 scope**：只给 `repo` 会报
+  `error validating token: missing required scope 'read:org'` ⇒ **至少 `repo` + `read:org`**
+  （`gist` / `workflow` 是 gh 默认那套，一起给最省事）
+- ★ 同一个 OAuth 应用**已授权过之后就不再弹授权页**了，用户只需输一次码 ⇒ 重试的代价很低
+- ⚠ 令牌只能拿到一次：`--with-token` 失败的话那个令牌就没了，得重新授权（所以**先确认 scope 别报错**再让用户点）
+
+**发版**：
+```powershell
+gh release create v0.2.0 --title "Toocode 0.2.0" --notes-file "$env:TEMP\notes.md" `
+  "src-tauri\target\release\bundle\nsis\Toocode_0.2.0_x64-setup.exe"
+```
+- tag 已存在也能用（会用现成的）；已存在同名 Release 时会报
+  `a release with the same tag name already exists` ⇒ 那就别重复建，直接 `gh release view` 看状态
+- 校验：`gh release view v0.2.0 --json assets` 里的 `digest` 能和本地 `Get-FileHash` 对上
+  （实测 0.2.0 一致），`state` 要是 `uploaded`
+- 顺带 `gh auth setup-git` 会给 git 装 **host 级** credential helper
+  （`credential.https://github.com.helper`），但连接性还是两说 —— 直连 github 依旧时好时坏
+
 ### ⚠ 提交前确认 target 没被加进来
 
 `src-tauri/target` 有 **6 GB 以上**，一旦提交仓库就毁了。
