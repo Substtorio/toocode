@@ -4730,15 +4730,17 @@ watch(activeTabPath, async (path) => {
 
    ★ 写在 CSS 而不是 svg 的属性上：「图标是填充的」这件事只有一个出处，
      模板里不用重复三遍。将来真要加一个描边图标，再按需开例外 */
-/* ⚠ `position: relative` + `z-index: 1` 不只是为了好看 —— 见下面 ::after 那段 */
+/* ⚠ `position: relative` + `z-index: 1` 是为了**压在下面那个悬停方块上面**，不只是好看 */
 .activity-item svg {
   position: relative;
   /* ★★ 这个 1 不能省，而且**不能只写 position: relative**。
-     按钮里的三个东西（::before 竖线、svg、::after 方块）都是「定位元素」：
+     按钮里的三个东西（::before 竖线、svg、::after 悬停方块）都是「定位元素」：
      ::before / svg 是 `z-index: auto`，::after 是 `z-index: 0` ——
      而 auto 和 0 在绘制时是**同一档**，同档里按 DOM 顺序画。
-     ::after 排在 svg **后面**，所以方块会盖在图标上面。
-     只有把 svg 抬到 1（真正比 0 大）才稳。 */
+     ::after 排在 svg **后面**，所以方块会盖在图标上面（截出来看就是图标发灰）。
+     只有把 svg 抬到 1（真正比 0 大）才分得开。
+     ★ 验证办法：把方块临时改成不透明红 `#c0392b !important` 截图 ——
+       图标还能看见就说明层级对了 */
   z-index: 1;
   fill: currentColor;
 }
@@ -4748,23 +4750,27 @@ watch(activeTabPath, async (path) => {
    因为按钮是满宽的（48×48），给它加背景得到的是「一条顶到两边的色带」，
    而不是「围着图标的一个方块」。
 
-   ---- 尺寸和圆角都是从 VS Code 的 modern UI 抄的 ----
-   · 边长 `action高度 - 4` ⇒ 48 - 4 = **44**，也就是 `inset: 2px`
-   · 圆角 `--vscode-cornerRadius-small` = **4px**
-   （VS Code 的写法是 `width/height: calc(var(--activity-bar-action-height, 36px) - 4px)`
-     加 `left: calc((bar宽 - action高 + 4px) / 2)` —— 因为它的活动栏宽度可以变。
-      我们这里活动栏固定 48、按钮也固定 48，`inset: 2px` 是同一个结果，还更直白）
+   ---- 尺寸和颜色是 VS Code 的 modern UI 给的，但**内缩量我们故意加大了** ----
+   · 颜色 `modernActivityBarItem.hoverBackground`（见 CSS_VAR_BY_COLOR）
+   · 圆角 `--vscode-cornerRadius-small` = 4px，VS Code 的边长是 `action高度 - 4`
+     ⇒ 48 - 4 = 44，也就是 `inset: 2px`
 
-   ⚠ ★ **z-index 那两句不能省**。按 CSS 绘制顺序，绝对定位的伪元素画在
-     **在流内联元素**（svg 那层）之后 —— 默认情况下这个方块会压在图标上面。
-     给 svg 加 `position: relative; z-index: 1`，方块留在 0，
-     两者才真正分到两档（写成 `auto` 和 `0` 是同一档，仍然靠 DOM 顺序，没用）*/
+   ⚠ ★ **我们改成 `inset: 6px`（36×36）+ 圆角 6px**，没有照抄那 2px。
+     原因有两个，第二个是实打实的 bug：
+     ① 2px 几乎是贴着活动栏两边的，看着像「一条色带被切短了」，不像一个独立的块。
+        内缩到 6px、圆角放大到 6px，才有「浮起来」的感觉
+     ② ★★ **活动栏自己有 `border-radius: var(--radius-card)`（8px）+ `overflow: hidden`**。
+        方块贴在 2px 处时，**上面两个角会被活动栏的圆角切掉** ——
+        因为活动栏那个圆角弧在 x=2 处才升到 y≈2.7，方块左上角 (2,2) 正好在弧外面。
+        缩到 6px 就完全落在直边范围内了，一点都不会被切
+     （想让方块更小/更大就调这个 inset；它和「活动栏圆角是 8px」是绑在一起的，
+       改半径的时候记得回头看一眼这里） */
 .activity-item::after {
   content: "";
   position: absolute;
-  inset: 2px;
+  inset: 6px;
   z-index: 0;
-  border-radius: 4px;
+  border-radius: 6px;
   background: transparent;
 }
 
@@ -4773,7 +4779,6 @@ watch(activeTabPath, async (path) => {
 .activity-item:not(.active):hover::after {
   background: var(--color-icon-hover-bg);
 }
-
 /* 激活项左侧那条 2px 竖线 —— VS Code 的标志性细节。
    ★ 用 activityBar.activeBorder 而不是 activityBar.foreground：
      前者就是专门管这条线的，后者是图标颜色（两者恰好都偏白，但语义不同）

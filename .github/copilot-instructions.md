@@ -1013,10 +1013,10 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
   ★★ **悬停时图标背后浮出一个圆角方块** —— 这是 VS Code「modern UI」的活动栏样式：
     直接从装好的 VS Code 里抄的参数（`workbench.desktop.main.css` 里那批
     `.modern-ui .activitybar ... .action-item:not(.checked):hover .active-item-indicator`）：
-    · 边长 `action高度 - 4` ⇒ 48 - 4 = **44**，也就是 `inset: 2px`
-    · 圆角 `--vscode-cornerRadius-small` = **4px**
-    · 颜色 `modernActivityBarItem.hoverBackground`
-    ★★ **这个键主题文件里真有**（深色 `#FFFFFF11` 半透明白、浅色 `#F2F2F2` 实色）——
+    颜色 `modernActivityBarItem.hoverBackground`，圆角 `--vscode-cornerRadius-small` = 4px，
+    边长 `action高度 - 4`（VS Code 就是 `inset: 2px`）
+    ★★ **`modernActivityBarItem.hoverBackground` 主题文件里真有**
+      （深色 `#FFFFFF11` 半透明白、浅色 `#F2F2F2` 实色）——
       所以能走正常的 `CSS_VAR_BY_COLOR` 映射，**不用**像 `terminal.ansi*` 那样写死两套。
       查一个键存不存在的最快办法：
       `Select-String -Path <主题目录>\*.json -Pattern '"activityBar\.'`
@@ -1027,12 +1027,21 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
     ★ 为什么用 `::after` 而不是把背景刷在 `.activity-item` 上：
       按钮是满宽的（48×48），刷背景得到的是「一条顶到两边的色带」，
       而不是「围着图标的一个方块」
+    ⚠ ★★ **内缩量我们故意没照抄那 2px，改成 `inset: 6px`（36×36）+ 圆角 6px**。
+      ② 是个实打实的 bug：**活动栏自己有 `border-radius: var(--radius-card)`（8px）
+         + `overflow: hidden`** —— 方块贴在 2px 处时**上面那两个角会被活动栏的圆角切掉**
+         （那个圆角弧在 x=2 处才升到 y≈2.7，方块左上角 (2,2) 正好落在弧外面）。
+         缩到 6px 就完全落在直边范围内了
+      ① 顺带也更符合「浮起来」的观感：2px 几乎贴着两边，像一条被切短的色带；
+         6px + 6px 圆角才像一个独立的块
+      （想让方块更大就调这个 inset，但**它和「活动栏圆角是 8px」绑着**，
+        改半径时要回来看一眼这里）
     ⚠ ★★ **`z-index` 那里有个真陷阱**：`z-index: auto` 和 `z-index: 0` 在绘制时
       **是同一档**，同档里按 DOM 顺序画 —— 而 `::after` 排在 svg **后面**，
       所以方块会盖在图标上。必须写成 svg `z-index: 1` / 方块 `0` 才真正分档。
       （只给 svg 加 `position: relative` 是没用的，auto 还是同一档）
       ★ 验证办法：临时把方块改成不透明红 `#c0392b !important` 截图 ——
-        图标还能看见就说明层级对了
+        图标还能看见就说明层级对了；顺便也能看出四角有没有被活动栏的圆角切掉
   ⚠ ★★ **拿「克隆到浮层上放大」验证图标时有个陷阱**：
     把 svg `cloneNode` 到活动栏**外面**之后，`.activity-item svg` 这条选择器
     **就不匹配了**（它要求是活动栏的后代）——
