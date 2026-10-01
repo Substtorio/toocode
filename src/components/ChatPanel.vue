@@ -26,6 +26,16 @@ import {
   rejectChange,
   reviewChange,
 } from "../agentChanges";
+// 会话（一段可以独立存、独立切回来的对话）。存储细节全在那边，见文件头
+import {
+  loadSessions,
+  MAX_SESSIONS,
+  newSession,
+  saveSessions,
+  titleFrom,
+  type ChatSession,
+  type ChatSessionMessage,
+} from "../chatSessions";
 
 const props = defineProps<{ visible: boolean; workspaceRoot: string | null }>();
 
@@ -154,21 +164,46 @@ const canSaveConfig = computed(() => {
   return hasKey.value === true;
 });
 
-/** 界面上显示的消息 */
-interface UiMessage {
-  id: number;
-  role: "user" | "assistant" | "tool";
-  /** 正文（工具调用时是空的） */
-  text: string;
-  /** text 渲染出来的 HTML。★ 渲染是**节流**的，见 scheduleRender */
-  html: string;
-  /** 推理过程（推理模型才有） */
-  reasoning: string;
-  /** 这次回复里发起的工具调用 */
-  tools: { name: string; args: string; result: string; done: boolean }[];
-}
+/**
+ * 会话列表（最新的排最前）。
+ *
+ * ★★ 消息内容和它放在一起，切会话就只是改一个 `activeSessionId` ——
+ *   而不是「把 messages 和 history 两份都换掉」。
+ *   两份换的话漏一个就会出现「界面上是 A、发给模型的是 B」这种
+ *   不报错、只答非所问的怪事
+ */
+const sessions = ref<ChatSession[]>([]);
+const activeSessionId = ref("");
+const sessionsOpen = ref(false);
+const sessionWrapEl = ref<HTMLElement | null>(null);
 
-const messages = ref<UiMessage[]>([]);
+const activeSession = computed(
+  () => sessions.value.find((session) => session.id === activeSessionId.value) ?? null,
+);
+
+/**
+ * 当前会话的消息 / 发给模型的历史。
+ *
+ * ★ 用 `computed` 派生，不自己再存一份（理由见上面 sessions 的说明）。
+ * ★ 带 setter 是因为 `retry` 和清空要**整份替换**这两份数据
+ */
+const messages = computed<ChatSessionMessage[]>({
+  get: () => activeSession.value?.messages ?? [],
+  set: (value) => {
+    if (activeSession.value !== null) activeSession.value.messages = value;
+  },
+});
+
+const history = computed<ChatMessage[]>({
+  get: () => activeSession.value?.history ?? [],
+  set: (value) => {
+    if (activeSession.value !== null) activeSession.value.history = value;
+  },
+});
+
+/** 列表里按最后更新排（新建的永远在最上面） */
+const sortedSessions = computed(() => [...sessions.value].sort((a, b) => b.updatedAt - a.updatedAt));
+
 const input = ref("");
 
 /**
@@ -226,7 +261,7 @@ let renderTimer: number | null = null;
  *   一段 3000 字的回答要解析上百次，每次都是 O(n) —— 长回答会肉眼可见地卡。
  *   节流之后开销直接降一个数量级，而视觉上完全看不出区别
  */
-function scheduleRender(message: UiMessage) {
+function scheduleRender(message: ChatSessionMessage) {
   if (renderTimer !== null) return; // 已经排上了，等它跑
   renderTimer = window.setTimeout(() => {
     renderTimer = null;
@@ -240,7 +275,7 @@ function scheduleRender(message: UiMessage) {
  * ★ 流结束时必须调 —— 否则最后 80ms 里的内容还在定时器里没来得及渲染，
  *   表现是「回答的结尾几个字突然不见了」
  */
-function flushRender(message: UiMessage) {
+function flushRender(message: ChatSessionMessage) {
   if (renderTimer !== null) {
     clearTimeout(renderTimer);
     renderTimer = null;
@@ -249,7 +284,6 @@ function flushRender(message: UiMessage) {
 }
 
 /** 供模型看的对话历史 —— 和 UI 上是两套结构，各管各的 */
-const history = ref<ChatMessage[]>([]);
 
 watch(
   config,
@@ -316,13 +350,18 @@ async function forgetKey() {
 
 onUnmounted(() => {
   controller?.abort();
+  document.removeEventListener("mousedown", onDocumentMouseDown, true);
+  // 顺手存一次 —— 万一最后一轮的落盘还在路上就被拆了
+  persist();
 });
 
-// 面板第一次显示时才去问密钥状态 —— 没打开过这个视图就不该碰它
+// 面板第一次显示时才去问密钥状态 / 读聊天记录 —— 没打开过这个视图就不该碰它们
 watch(
   () => props.visible,
   (visible) => {
-    if (visible && hasKey.value === null) void refreshKeyState();
+    if (!visible) return;
+    if (hasKey.value === null) void refreshKeyState();
+    if (sessions.value.length === 0) void initSessions();
   },
   { immediate: true },
 );
@@ -409,6 +448,10 @@ async function send() {
     errorText.value = "还没有配置 API 密钥";
     return;
   }
+  // 面板刚打开、会话还没读回来时的一小段窗口 —— 等一下再发
+  if (activeSession.value === null) await initSessions();
+  const session = activeSession.value;
+  if (session === null) return;
 
   // ★ 附加的上下文只把**路径清单**交给模型，让它自己用 read_file 去看。
   //   直接把文件内容拼进来会撑爆上下文，而且模型未必需要全部；
@@ -427,6 +470,11 @@ async function send() {
     reasoning: "",
     tools: [],
   });
+
+  // ★ 标题取自**第一条**用户消息 —— 列表里总得有个能认出来的名字。
+  //   之后不再改：跟着对话内容变来变去的标题只会让人找不到
+  if (session.messages.length === 1) session.title = titleFrom(text);
+  session.updatedAt = Date.now();
 
   // 上下文已经跟着这条消息发出去了，清掉（VS Code 也是这个行为）
   contexts.value = [];
@@ -480,7 +528,7 @@ async function runTurn() {
   controller = new AbortController();
 
   // 本轮的 UI 承载对象 —— 流式增量都往它上面贴
-  const draft: UiMessage = {
+  const draft: ChatSessionMessage = {
     id: ++uiSeq,
     role: "assistant",
     text: "",
@@ -540,6 +588,11 @@ async function runTurn() {
     flushRender(reply);
     busy.value = false;
     controller = null;
+    const session = activeSession.value;
+    if (session !== null) session.updatedAt = Date.now();
+    // ★ 一轮说完就落盘（而不是每个 chunk 都存）——
+    //   整份 JSON.stringify + 一次写文件，一轮一次完全能接受
+    persist();
     await scrollToBottom();
   }
 }
@@ -550,7 +603,7 @@ async function runTurn() {
  * ★ 复制的是**原文**（message.text），不是渲染好的 HTML ——
  *   贴到编辑器里要的就是源码，带一堆 <p> 标签没有任何用
  */
-async function copyMessage(message: UiMessage) {
+async function copyMessage(message: ChatSessionMessage) {
   try {
     // Tauri 的 WebView 跑在 http://tauri.localhost 上，属于「可信来源」，
     // 所以 navigator.clipboard 是可用的（它只对安全上下文开放）
@@ -579,25 +632,146 @@ function stop() {
   controller?.abort();
 }
 
-/**
- * 清空这次对话。
- *
- * ★ 这是**破坏性**操作：整段对话和上下文全没了，而且**没有撤销**。
- *   所以这里问一句 —— 配合「把它挪到顶栏」是两道独立的防线：
- *   位置隔离防手滑，确认防「点错了但还以为只是收起面板」
- */
-function clearChat() {
-  if (messages.value.length === 0) return;
-  if (!window.confirm("确定要清空这次对话吗？清空后无法恢复。")) return;
+// ---------- 会话的增 / 删 / 切 ----------
 
-  controller?.abort();
-  messages.value = [];
-  history.value = [];
+/** 当前「在聊哪个」。只存一个 id，很小，放 localStorage 不会和 hot exit 抢配额 */
+const ACTIVE_CHAT_KEY = "toocode:activeChat";
+
+/** 落盘。★ 不 await —— 调用它的地方都是「顺手存一下」，不该把对话拖慢 */
+function persist() {
+  void saveSessions(sessions.value);
+}
+
+/**
+ * 切过去之后把还没渲染过的消息补上。
+ *
+ * ★ `html` 不存盘（它是从 `text` 现算的派生数据），所以从磁盘读回来的消息
+ *   是「没有 HTML」的 —— 不补的话切回旧会话就是一片空白
+ */
+function renderMessages(session: ChatSession) {
+  for (const message of session.messages) {
+    if (message.html === undefined) message.html = renderMarkdown(message.text);
+  }
+}
+
+function activateSession(id: string) {
+  const session = sessions.value.find((item) => item.id === id);
+  if (session === undefined) return;
+
+  activeSessionId.value = session.id;
+  renderMessages(session);
+  window.localStorage.setItem(ACTIVE_CHAT_KEY, session.id);
+
+  // 上一个会话的报错 / 停止原因不该带到这一个里
   errorText.value = null;
   stopReason.value = null;
   copiedId.value = null;
-  contexts.value = [];
+  void scrollToBottom();
 }
+
+/** 面板第一次显示时才去读聊天记录 */
+async function initSessions() {
+  const loaded = await loadSessions();
+  sessions.value = loaded.length > 0 ? loaded : [newSession()];
+
+  // ★ 消息 id 要接在历史里最大的那个后面 —— 不然新消息会和旧消息撞 id，
+  //   而 id 是列表的 key（撞了 Vue 会复用错节点，症状是「内容串了」）
+  uiSeq = sessions.value.reduce(
+    (max, session) =>
+      session.messages.reduce((inner, message) => Math.max(inner, message.id), max),
+    0,
+  );
+
+  const last = window.localStorage.getItem(ACTIVE_CHAT_KEY);
+  const target = sessions.value.find((session) => session.id === last) ?? sessions.value[0];
+  activeSessionId.value = target.id;
+  renderMessages(target);
+}
+
+/** 新建一段对话。
+ *
+ * ★ 这里原来是「清空对话」（还带一个确认框）。有了会话之后它就没必要了 ——
+ *   新建**不会**毁掉旧的，所以不用问；而「清空」和「新建」给用户的结果一样
+ *   （都是一段空对话），两个按钮干一件事只会让人犹豫点哪个
+ * ⚠ 流式进行中不让切：那时候 `reply` 指着旧会话里的那条消息，
+ *   切走之后流还在往一个看不见的地方写。要做成可切的话，
+ *   得把 `controller` 和 `busy` 都变成**按会话**的 —— 那是另一件事了
+ */
+function newChat() {
+  if (busy.value) return;
+
+  const session = newSession();
+  sessions.value.unshift(session);
+  // ★ 别让列表无限长，而且**从列表里就丢掉** ——
+  //   只在存盘时截断的话，界面上有、文件里没有，两边就对不上了
+  if (sessions.value.length > MAX_SESSIONS) {
+    sessions.value = sessions.value.slice(0, MAX_SESSIONS);
+  }
+
+  activateSession(session.id);
+  persist();
+}
+
+function openSession(id: string) {
+  if (busy.value) return;
+  sessionsOpen.value = false;
+  activateSession(id);
+}
+
+/** 删除一段对话。★ 这是**破坏性**操作（而且没有撤销），所以问一句 */
+function deleteChat(id: string) {
+  if (busy.value) return;
+
+  const index = sessions.value.findIndex((session) => session.id === id);
+  if (index === -1) return;
+  const target = sessions.value[index];
+  if (!window.confirm(`确定要删除「${target.title}」这段对话吗？删除后无法恢复。`)) return;
+
+  sessions.value.splice(index, 1);
+
+  // 删的正好是当前这段 ⇒ 挪到相邻一段去；一段都不剩就开个新的
+  if (id === activeSessionId.value) {
+    if (sessions.value.length === 0) {
+      newChat();
+      return; // newChat 自己会落盘
+    }
+    activateSession(sessions.value[Math.min(index, sessions.value.length - 1)].id);
+  }
+  persist();
+}
+
+/** 列表右边那个时间。★ 只说「大概多久以前」就够 —— 精确到秒没人看 */
+function timeLabel(timestamp: number): string {
+  const diff = Date.now() - timestamp;
+  if (diff < 60_000) return "刚刚";
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+
+  const date = new Date(timestamp);
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    const hh = String(date.getHours()).padStart(2, "0");
+    const mm = String(date.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+  }
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+/**
+ * 点别处就把会话列表收起来。
+ *
+ * ⚠ 开关按钮自己是包在 `sessionWrapEl` 里的 —— 不收进「外面」那一类，
+ *   否则点开关时会「先被 mousedown 关掉、再被 click 打开」，永远关不上
+ */
+function onDocumentMouseDown(event: MouseEvent) {
+  const target = event.target;
+  if (target instanceof Node && sessionWrapEl.value?.contains(target) === true) return;
+  sessionsOpen.value = false;
+}
+
+watch(sessionsOpen, (open) => {
+  if (open) document.addEventListener("mousedown", onDocumentMouseDown, true);
+  else document.removeEventListener("mousedown", onDocumentMouseDown, true);
+});
 
 /** 「+」按钮：请 App.vue 打开快速打开（上下文模式） */
 function requestContext() {
@@ -777,30 +951,81 @@ function onChatLogClick(event: MouseEvent) {
           <span class="chat-model-name">{{ modelDisplayName(config.model) }}</span>
         </button>
 
-        <button
-          class="chat-icon-button"
-          type="button"
-          title="清空对话"
-          :disabled="messages.length === 0"
-          @click="clearChat"
-        >
-          <!-- 垃圾桶 -->
-          <svg
-            viewBox="0 0 16 16"
-            width="14"
-            height="14"
-            fill="none"
-            stroke="currentColor"
-            stroke-width="1.4"
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            aria-hidden="true"
+        <!-- 会话：新建 + 历史列表。
+             ★ 这里原来是「清空对话」（带确认框）。有了会话之后它就没必要了 ——
+               新建**不会**毁掉旧的，所以不用问；而「清空」和「新建」的结果
+               又是一样的（都是一段空对话），两个按钮干一件事只会让人犹豫点哪个 -->
+        <div ref="sessionWrapEl" class="chat-sessions-wrap">
+          <button
+            class="chat-icon-button"
+            type="button"
+            title="新建聊天"
+            :disabled="busy"
+            @click="newChat"
           >
-            <path d="M3.2 4.6h9.6" />
-            <path d="M6.4 4.6V3.2a.8.8 0 0 1 .8-.8h1.6a.8.8 0 0 1 .8.8v1.4" />
-            <path d="M4.8 4.6l.5 7.6a.8.8 0 0 0 .8.8h3.8a.8.8 0 0 0 .8-.8l.5-7.6" />
-          </svg>
-        </button>
+            <!-- 加号 -->
+            <svg
+              viewBox="0 0 16 16"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              aria-hidden="true"
+            >
+              <path d="M8 3.4v9.2M3.4 8h9.2" />
+            </svg>
+          </button>
+
+          <button
+            class="chat-icon-button"
+            type="button"
+            :title="`聊天记录（${sessions.length}）`"
+            :disabled="busy"
+            :class="{ active: sessionsOpen }"
+            @click="sessionsOpen = !sessionsOpen"
+          >
+            <!-- 表盘 + 指针 = 历史。★ 不用「列表」图标：那和文件树 / 搜索结果撞脸 -->
+            <svg
+              viewBox="0 0 16 16"
+              width="14"
+              height="14"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.4"
+              stroke-linecap="round"
+              aria-hidden="true"
+            >
+              <circle cx="8" cy="8" r="5.6" />
+              <path d="M8 4.9V8l2.3 1.5" />
+            </svg>
+          </button>
+
+          <div v-if="sessionsOpen" class="chat-sessions">
+            <div class="chat-sessions-head">聊天记录</div>
+            <button
+              v-for="session in sortedSessions"
+              :key="session.id"
+              class="chat-session"
+              :class="{ active: session.id === activeSessionId }"
+              type="button"
+              @click="openSession(session.id)"
+            >
+              <span class="chat-session-title">{{ session.title }}</span>
+              <span class="chat-session-time">{{ timeLabel(session.updatedAt) }}</span>
+              <!-- 删除。⚠ 它不能是 <button> 套 <button>（HTML 不允许，浏览器会
+                   把嵌套那个拆出去），所以是行内的兄弟节点 -->
+              <span
+                class="chat-session-delete"
+                title="删除这段对话"
+                @click.stop="deleteChat(session.id)"
+              >
+                ×
+              </span>
+            </button>
+          </div>
+        </div>
       </div>
 
       <div ref="logEl" class="chat-log" @click="onChatLogClick">
@@ -1592,6 +1817,118 @@ function onChatLogClick(event: MouseEvent) {
 .chat-icon-button:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+/* 下拉打开时按钮保持高亮 —— 让人知道「这个面板是从哪儿出来的」 */
+.chat-icon-button.active {
+  background: var(--color-hover);
+  color: var(--color-text);
+}
+
+/* ---------- 会话（新建 + 历史列表）---------- */
+
+/* ★ 外面这层要 `position: relative` —— 下拉浮层以它为基准 */
+.chat-sessions-wrap {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 2px;
+}
+
+.chat-sessions {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  z-index: 5;
+  width: 240px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 5px;
+  /* 和菜单 / 悬停提示用同一个底色（都是 editorWidget.background），
+     免得同一个面板里弹出两种颜色的浮层 */
+  background: var(--color-menu-bg);
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.14);
+}
+
+.chat-sessions-head {
+  padding: 2px 6px 4px;
+  color: var(--color-text-dim);
+  font-size: 11px;
+}
+
+/* 一行 = 一段对话 */
+.chat-session {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 4px 6px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.chat-session:hover {
+  background: var(--color-hover);
+}
+
+/* 当前这段。⚠ 写在 :hover **之后**（同优先级后写的赢），
+   否则鼠标划过去会把选中色盖掉 */
+.chat-session.active {
+  background: var(--color-selection);
+  color: var(--color-text-on-accent);
+}
+
+.chat-session-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.chat-session-time {
+  flex: 0 0 auto;
+  color: var(--color-text-dim);
+  font-size: 10px;
+}
+
+/* 选中项里那行小字跟着反白 —— 它自己的 dim 色在深蓝底上看不清 */
+.chat-session.active .chat-session-time {
+  color: inherit;
+}
+
+/* 删除：平时**不显示**。
+   ★ 用 opacity 而不是 display —— display 一改标题的宽度就跳一下
+   ⚠ 必须留 :focus-visible：只靠 :hover 的话键盘用户看不到焦点在哪 */
+.chat-session-delete {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  border-radius: 3px;
+  color: inherit;
+  font-size: 13px;
+  line-height: 15px;
+  text-align: center;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.chat-session:hover .chat-session-delete,
+.chat-session-delete:focus-visible {
+  opacity: 0.8;
+}
+
+.chat-session-delete:hover {
+  background: var(--color-hover);
+  opacity: 1;
 }
 
 /* 模型框。取代原来那个纯图标的「配置」按钮。
