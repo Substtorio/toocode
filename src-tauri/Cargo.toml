@@ -1,6 +1,6 @@
 [package]
 name = "toocode"
-version = "0.1.0"
+version = "0.2.0"
 description = "Toocode —— 一个仿 VS Code 的桌面代码编辑器"
 authors = ["you"]
 edition = "2021"

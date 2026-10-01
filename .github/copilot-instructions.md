@@ -2543,8 +2543,8 @@ npm run tauri build  # 打包发布版
 | 文件 | 用途 |
 | --- | --- |
 | `toocode.exe` | 裸的可执行文件，单独拿走也能跑（需要系统有 WebView2） |
-| `bundle/nsis/Toocode_0.1.0_x64-setup.exe` | 安装程序 —— **要发给别人就传这个**，双击就装 |
-| `bundle/msi/Toocode_0.1.0_x64_en-US.msi` | MSI 安装包，企业部署用的 |
+| `bundle/nsis/Toocode_0.2.0_x64-setup.exe` | 安装程序 —— **要发给别人就传这个**，双击就装 |
+| `bundle/msi/Toocode_0.2.0_x64_en-US.msi` | MSI 安装包，企业部署用的 |
 
 ⚠ 第一次打包会**编译 Rust release**（比 dev 慢得多，可能十几分钟），
   而且 `target` 会从 6 GB 涨到 10+ GB —— 先确认磁盘够用
@@ -2562,6 +2562,48 @@ cargo clean   # 清理构建产物
 ---
 
 ## 6. 发布到 GitHub
+
+### 发布前要改的版本号（**四处**，别只改一处）
+
+| 文件 | 说明 |
+| --- | --- |
+| `package.json` | 只影响 npm 那边的自称 |
+| `package-lock.json` | ★ **不要手改** —— `npm install --package-lock-only` 会同步它 |
+| `src-tauri/tauri.conf.json` | ★★ **安装包名就是照它来的**（`Toocode_<版本>_x64-setup.exe`），也是 tag 要对上的那个 |
+| `src-tauri/Cargo.toml` | crate 版本 → exe 的文件属性（`FileVersion` / `ProductVersion`） |
+
+⚠ ★★ **改完 `tauri.conf.json`，dev 下必须重启 dev server 才生效** ——
+  标题栏那个版本号是 `import appConf from "../src-tauri/tauri.conf.json"` 读的，
+  而 **Tauri 的官方模板就让 Vite 忽略整个 `src-tauri/`**
+  （`vite.config.ts` 里 `watch: { ignored: ["**/src-tauri/**"] }`，
+  为的是不去 watch 9 GB 的 `target`）
+  ⇒ 那个文件的改动 **Vite 永远感知不到**，模块缓存一直是旧的。
+  实测：磁盘上已经是 `0.2.0`、裸路径取也是 `0.2.0`，
+  而 `?import` 那条路仍然吐 `version = "0.1.0"`，标题栏上也还是旧版本 ——
+  **重启 dev server 才跟上来**。
+  ★ **打包不受影响**：`npm run tauri build` 是冷编译 + 读磁盘。
+  ⚠ 别为了这个去改 ignore 规则（加一条 `!**/src-tauri/tauri.conf.json`）——
+    万一 negation 不被支持，就变成去 watch 9 GB 的 target，代价比这大得多
+
+### 发布前的冒烟测试
+
+这一版动过**全局**的东西（tooltip 接管所有 `title`、内置语言服务交接、
+文件树箭头、打开文件夹切视图），它们的失败方式往往不是崩，而是「某处悄悄变差」。
+⇒ 用 CDP 驱动真窗口跑一遍（写法见「怎么验证『看不见的判断』」那一节），
+这一版的清单与实测：
+
+| 步骤 | 期望 | 实测 |
+| --- | --- | --- |
+| 起始 | 打开上次的文件夹、文件树有内容 | ✅ 15 行 |
+| 点一个文件 | 标签出现、状态栏出现语言 | ✅ `.gitignore` → `ignore` |
+| 悬停标签 | 提示条弹出、**`[title]` 残留数 = 0** | ✅ |
+| `Ctrl+Shift+F` 输入关键词 | 搜索视图 + 有结果 | ✅ 31 条 |
+| `Ctrl+Shift+G` | 源代码管理视图 | ✅ |
+| `Ctrl+Shift+M` | 面板打开、标签是「问题」 | ✅ |
+| `` Ctrl+` `` | 面板开 / 关 | ✅ |
+| `Ctrl+Alt+I` | Topilot 打开、会话按钮在 | ✅ 2 个 |
+| `F9` | 出现断点装饰（再按一次撤掉，别给用户留下） | ✅ |
+| 全程 | **控制台 error / warning 干净** | ✅ 干净 |
 
 ### 仓库根在哪里
 

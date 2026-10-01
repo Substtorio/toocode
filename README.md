@@ -65,8 +65,8 @@ npm run tauri build
 
 产物在 `src-tauri/target/release/` 下：
 
-- `bundle/nsis/Toocode_0.1.0_x64-setup.exe` —— 安装程序，双击就能装（推荐发给别人用这个）
-- `bundle/msi/Toocode_0.1.0_x64_en-US.msi` —— MSI 安装包
+- `bundle/nsis/Toocode_0.2.0_x64-setup.exe` —— 安装程序，双击就能装（推荐发给别人用这个）
+- `bundle/msi/Toocode_0.2.0_x64_en-US.msi` —— MSI 安装包
 - `toocode.exe` —— 裸的可执行文件，单独拿走也能跑
 
 （改应用图标：画一张 1024×1024 的 PNG，然后 `npm run tauri icon <那个png>`）
