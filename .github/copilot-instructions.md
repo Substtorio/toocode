@@ -1915,6 +1915,63 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     · 深浅两套截图核对过（select 的**弹出列表**是系统画的，
       它只认 `color-scheme`，而 App.vue 已经按主题设了）
 
+- [x] **悬停提示（tooltip）换成 VS Code 的样式**：
+  起因是用户说「鼠标悬停显示的 Title 的样式也学一下 vscode 的样式」。
+  ★★ **根因：原生 `title` 提示的样式没有任何办法改** ——
+    它是 WebView2 / 系统画的那个小方框，CSS 碰不到，也不看 `color-scheme`，
+    于是深色主题下会弹出一个浅色的框，和整个界面格格不入。
+    VS Code 的悬停提示**根本不是原生的**，是它自己画的一层浮层
+    （`.workbench-hover`）。所以想「跟 VS Code 一样」，只能也自己画一层
+  ★★ **做法是全局接管 `title` 属性，而不是给 47 处 `:title` 各挂一个指令**：
+    · 启动时把页面上所有 `[title]` 搬成 `data-tooltip`，**并删掉 `title`** ——
+      不删的话原生那个还会自己弹出来，变成两个框叠在一起
+    · `MutationObserver` 盯着后续新增 / 变化的元素 —— 标签页、文件树、
+      搜索结果都是动态出来的，静态扫一遍远远不够
+    · 好处：模板里 47 处 `:title="…"` **一行都不用改**。
+      做成 `v-tooltip` 指令的话以后每加一处都要记得加，迟早会漏 ——
+      而漏掉的表现是「就那一个地方不是 VS Code 的样子」，不报错
+    ⚠ `attributeFilter: ["title"]` 不能省：不然 Vue 每改一次 class / style
+      都要喊我们一次
+    ⚠ `capture()` 里 `removeAttribute("title")` 会**再次触发观察者**，
+      所以处理函数里要判「现在还有没有 title」—— 少了这一句就是无限循环
+  ★ **样式和数值全是从 VS Code 里量出来的**（不是自己拍的）：
+    `font-size: 13px` / `line-height: 19px` / `border-radius: 5px` /
+    `max-width: 700px` / `padding: 2px 8px`（来自
+    `.workbench-hover.compact .hover-contents`，compact 就是「一行纯文字」）/ 
+    `box-shadow: 0 0 12px rgba(0,0,0,.14)`（= `--vscode-shadow-lg`）
+  ★★ **一个主题变量都没新增**：JS 里 `editorHoverWidget.background`
+    的默认值**就是** `editorWidget.background`，而那个早就映射成
+    `--color-menu-bg` 了 ⇒ 直接复用
+    ★ `editorHoverWidget.border` 的默认值是「前景色 20% 透明」
+      （`transparent(foreground, .2)`）⇒ 用 **`color-mix`** 现算，
+      而不是写死两套色值 —— 后者会和主题跑偏，而且不报错
+      ⚠ 先写 `border: 1px solid transparent` 占位：`color-mix` 万一不被支持，
+        也只是「没有边框」，而不是整条 border 失效、盒子矮 2px
+  ★ 两个行为细节也是照抄的：
+    · 延迟取 `workbench.hover.delay` —— **非 macOS 上默认 500ms**
+      （JS 里 `default: pt ? 1500 : 500`）
+    · **刚藏起来不到 200ms 又悬停 → 立刻显示**（`get delay()` 里就是这么写的）。
+      没有这一条，在列表里一行行扫过去会一顿一顿的
+      ⚠ 只有「**真的显示过**」才记那个时刻：快速扫过去（一次都没来得及显示）
+        不给这个加速，否则鼠标划过一堆按钮会一路闪现提示条
+  ★ `pointer-events: none`：鼠标永远落不到提示条身上。
+    不然光标一移进去就会把「当前是谁」换掉、提示条自己把自己弄消失。
+    （VS Code 那个可以选中文字，我们不需要那个能力）
+  ★ `z-index: 110` —— 比快速打开（100）再高一档，提示条永远在最上面
+  ⚠ **`title` 在无障碍里是「最后兜底的名称来源」**：窗口那三个按钮
+    （只有图标、没有文字）就是靠它命名的。搬走之后要把这份信息补回去，
+    但只补**真正光秃秃**的那种（没有 `aria-label`、也没有可见文字）——
+    `aria-label` 优先级比可见文字高，随便加会**把名称改得更糟**。实测补了 13 个
+  ✅ 实测（真窗口 + CDP）：
+    · `[title]` 剩下的元素数 **0**、搬成 `data-tooltip` 的 **23** 个
+    · 悬停后 **150ms 还藏着**（延迟生效）、750ms 显示，位置 = 光标 + (12,16)
+    · `mouseout` 收起；200ms 内换一个元素 → **60ms 就显示了**（不等待）
+    · 长文本靠近右边缘时**往左翻**（实测 box 左边 462 < 光标 540）
+    · 浅色 bg `#F8F8F8` / 深色 bg `#202020`（都是 `editorWidget.background`），
+      边框 `color(srgb 0.8 0.8 0.8 / 0.2)`，13px / 19px / 5px / 2px 8px 全对
+    · `.monaco-editor` **内部一个都没接管**（不然一悬停编辑器就弹提示）
+    ⚠ 验证时改了主题，**验完记得切回去**
+
 ### 待办（按优先级）
 
 1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。

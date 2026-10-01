@@ -8584,4 +8584,46 @@ body {
 .monaco-editor .scrollbar .slider {
   border-radius: 3px;
 }
+
+/* ---------- 悬停提示（tooltip）----------
+
+   ★★ 为什么需要自己画一层：**原生 `title` 提示的样式没有任何办法改** ——
+     WebView2 / 系统用的那个小方框 CSS 碰不到，也不认 `color-scheme`，
+     于是深色主题下会弹出一个浅色的框。
+     VS Code 的悬停提示根本不是原生的，是它自己画的（`.workbench-hover`）。
+
+   ★ 下面每一行都是从 VS Code 的量出来的值（见 tooltip.ts 头部的清单）：
+     13px / 19px / 5px 圆角 / 700px 上限 / `2px 8px` 内边距 /
+     `--vscode-shadow-lg` = `0 0 12px rgba(0,0,0,.14)`
+
+   ★ 颜色一个变量都不用新增：
+     `editorHoverWidget.background` 的默认值**就是** `editorWidget.background`，
+     而那个已经映射成 `--color-menu-bg` 了
+
+   ⚠ `z-index` 要比快速打开（100）再高一档 —— 提示条永远在最上面 */
+.toocode-tooltip {
+  position: fixed;
+  z-index: 110;
+  max-width: 700px;
+  padding: 2px 8px;
+  font-size: 13px;
+  line-height: 19px;
+  font-family: inherit;
+  color: var(--color-text);
+  background: var(--color-menu-bg);
+  /* 先给个透明的边框占住 1px，下面的 color-mix 万一不被支持
+     也只是「没有边框」，而不是整条 border 失效、盒子矮 2px */
+  border: 1px solid transparent;
+  /* ★ VS Code 里 `editorHoverWidget.border` 的默认值是「前景色 20% 透明」
+       （`transparent(foreground, .2)`）。
+     用 color-mix 现算而不是写死两套色值 —— 后者会和主题跑偏，而且不报错 */
+  border-color: color-mix(in srgb, var(--color-text) 20%, transparent);
+  border-radius: 5px;
+  box-shadow: 0 0 12px rgba(0, 0, 0, 0.14);
+  /* ★ 鼠标永远落不到它身上 —— 否则光标移进去会把 owner 换掉、
+     提示条自己把自己弄消失（VS Code 那个可以选中文字，我们不需要）*/
+  pointer-events: none;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 </style>
