@@ -213,6 +213,26 @@ function toggleView(id: ViewId) {
   sidebarVisible.value = true;
 }
 
+/**
+ * 切到「资源管理器」视图（并确保侧栏是开着的）。
+ *
+ * ★ 为什么需要单独一个函数而不是调 `toggleView("explorer")`：
+ *   那个是**开关**语义 —— 已经激活时会把它关掉，正好是这里不想要的。
+ *
+ * ★ 存在的理由：打开文件夹之后**必须**能看到文件树。
+ *   而 `activeView` / `sidebarVisible` 是两个独立的状态 ——
+ *   用户在搜索视图里（或者干脆把侧栏关掉了）点「打开文件夹」，
+ *   树确实读了、工作区也确实换了，可**眼睛能看到的地方一点变化都没有**。
+ *   这种「点了没反应」比报错更让人不知所措
+ *
+ * ★ 和 showSearchView / showDebugView 是同一族函数（一个动作 + 一个视图），
+ *   区别是这里既不用送焦点、也不用加载数据
+ */
+function showExplorerView() {
+  activeView.value = "explorer";
+  sidebarVisible.value = true;
+}
+
 // ---------- Topilot 面板（右侧独立的一块）----------
 //
 // ★ 为什么不复用 activeView / sidebarVisible：Topilot 在**右边**，
@@ -2575,18 +2595,21 @@ async function openFolder() {
   if ((await askAboutUnsaved("切换工作区")) === "cancel") return;
 
   resetWorkspace();
-  await openFolderPath(selected);
+  if (await openFolderPath(selected)) flashSaveNotice(`已打开 ${fileNameOf(selected)}`);
 }
 
 /**
  * 打开一个「已知路径」的文件夹（不走文件对话框）。
  * 启动时恢复、点欢迎页的最近列表，都走它。
  *
+ * ★ 返回「是不是真的打开了」：调用方靠它决定要不要报一句成功提示。
+ *   一个只会默默失败的函数，调用方就只能自己再去探一遍 treeError
+ *
  * ★ 打不开就把它从最近列表里剔掉：
  *   一个已经不存在（或读不了）的路径留在那儿，下次还会再骗你一次。
  *   踢掉之后回到「没有打开文件夹」的状态，让用户重新选。
  */
-async function openFolderPath(path: string) {
+async function openFolderPath(path: string): Promise<boolean> {
   workspaceRoot.value = path;
   await loadTree();
 
@@ -2600,11 +2623,20 @@ async function openFolderPath(path: string) {
     fileTree.value = [];
     treeError.value = null;
     flashSaveNotice(`打不开 ${fileNameOf(path)}，已从最近列表移除`);
-    return;
+    return false;
   }
 
   window.localStorage.setItem(LAST_FOLDER_KEY, path);
   rememberFolder(path);
+
+  // ★ 打开成功之后把视图切回资源管理器 ——
+  //   不然「在搜索视图里点打开文件夹」看起来就像什么都没发生。
+  //   ⚠ 放在**成功分支**里而不是函数开头：打不开的时候侧栏里根本没有树可看，
+  //     切过去只会露出一块空侧栏，反而更让人困惑
+  //   ⚠ 启动时恢复上次文件夹也走这条路，但那时 activeView / sidebarVisible
+  //     本来就是默认值（explorer / true），所以这次调用是个空操作
+  showExplorerView();
+  return true;
 }
 
 /** 点欢迎页「最近」里的文件夹 */
@@ -2612,7 +2644,7 @@ async function openRecentFolder(path: string) {
   if ((await askAboutUnsaved("切换工作区")) === "cancel") return;
 
   resetWorkspace();
-  await openFolderPath(path);
+  if (await openFolderPath(path)) flashSaveNotice(`已打开 ${fileNameOf(path)}`);
 }
 
 /** 关闭当前工作区 */
