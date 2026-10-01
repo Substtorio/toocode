@@ -346,9 +346,16 @@
     改成顶层用 try 包一次拿到 `appWindow`（拿不到就是 null），各处写 `appWindow?.xxx()` ——
     这样「直接用浏览器打开 dev server 看 UI」也不会白屏了
 - [x] **标题栏图标 + 底部面板（终端 / 输出 / 调试控制台）**：
-  ★ 图标直接 `import appIconUrl from "../src-tauri/icons/32x32.png"` ——
-    **Vite 能解析这个路径**（`src-tauri` 也在项目根里），不用再维护第二份小图，
-    32x32 的原图用 CSS 缩到 16px 显示就行
+  ★ 图标直接 `import appIconUrl from "../src-tauri/icons/128x128.png"` ——
+    **Vite 能解析这个路径**（`src-tauri` 也在项目根里），不用再维护第二份小图。
+    ⚠ 原来用的是 **32x32** 那张（当时只显示 16px）。logo 放大到 22px 后，
+      高分屏下 32px 的源会被拉大（2× 屏需要 44 物理像素）⇒ 发糊，所以换成 128x128
+  ★ 悬停在 logo 上显示版本号：`import appConf from "../src-tauri/tauri.conf.json"`
+    然后 `:title="`${appConf.productName} ${appConf.version}`"` ——
+    **直接读 `tauri.conf.json` 才是对的**：安装包名、git tag 都是照着它来的，
+    写死一个字符串就等于多了第二份真相。
+    ⚠ `tsconfig.json` 里要开 `resolveJsonModule`（已经开了）；
+      `src-tauri` 在项目根里，Vite 默认就允许 serve，不用改 `server.fs`
   ★ **面板不横跨侧栏** —— 和 VS Code 一致，它只占编辑器下方那块。
     所以要在 `.main` 里包一层 `.workspace`（纵向 flex），
     ⚠ **`.workspace > .editor-area { min-height: 0 }` 必须加** ——
@@ -1100,6 +1107,27 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
       `flex: 0 0 48px` 失效、宽度塌成 24px，截出来的图全是错的
       （实测踩到过，还以为图标溢出了）
 
+- [x] **标题栏 logo 放大 + 悬停显示版本号**（顺带抓到一个注释写错的事故）：
+  ★ logo 从 16px 放大到 **22px**（标题栏 35px，上下各留 6.5px，再大就开始挤）。
+    图源跟着从 `32x32.png` 换成 `128x128.png` —— 22px 在 2× 屏上需要 44 物理像素，
+    32px 的源会被拉大发糊
+  ★ 版本号**直接读 `tauri.conf.json`**：`import appConf from "../src-tauri/tauri.conf.json"`
+    然后 `:title="\`${appConf.productName} ${appConf.version}\`"`。
+    它是唯一权威的那份 —— 安装包名、git tag 都照着它来。写死字符串 = 多一份真相。
+    ⚠ `tsconfig.json` 要开 `resolveJsonModule`（已开）
+  ⚠ ★★ **踩到一个自己制造的事故：`.vue` 模板里的注释必须是 `<!-- -->`，
+    不是 `/* */`**。我写成了 `*/` 收尾，于是**注释没闭合** ——
+    后面的 `<img>` 和下一段注释全被**吞进注释里**，
+    编译出来就是 `_createCommentVNode(" … */ <img … <!-- 菜单栏 …")`。
+    ⇒ 症状：图片元素**根本不在 DOM 里**，而页面其它部分一切正常（不报错）
+    ⇒ ★★ **而且 `get_errors` 早就报警了，是我把它当成了「IDE 没重新解析 SFC 的残留」**：
+      报的是「已声明 `appIconUrl`，但从未读取其值」——
+      因为那两行 import 全在注释里，编译出来的渲染函数确实没引用它们。
+      **「变量说没被用到」是一个可以直接查证的硬事实**，
+      遇到就该去 DOM / 编译产物里看一眼，而不是假设工具错了
+    ⇒ 查这类问题的利器：`fetch("/src/App.vue")` 拿到 **Vite 编译后的 JS**，
+      直接看 `_createCommentVNode(...)` 的内容对不对 —— 比在浏览器里猜快得多
+
 ### 待办（按优先级）
 
 1. **LSP / 智能提示**。可以直接复用 `loadSyntaxExtensions()` 建好的那份「扩展名 → 语言 id」表
@@ -1130,8 +1158,8 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
    - `logo.png` 是 1024×1024 的源图
    - `scripts/make-logo.ps1` 能重新生成它（想改颜色 / 形状不用从头写）
    - `npm run tauri icon logo.png` 展开成全套（`.ico` / `.icns` / 各尺寸 png / iOS / Android）
-   ★ 应用内标题栏那个小图标（`import appIconUrl from "../src-tauri/icons/32x32.png"`）
-     自动跟着换了，一行代码都没改
+   ★ 应用内标题栏那个小图标（`import appIconUrl from "../src-tauri/icons/128x128.png"`）
+     自动跟着换了（只在换大小时改了一行 CSS）
    ⚠ **已经打包出去的安装包不会自动更新图标** —— 图标是编译时嵌进 exe 的，
      换了图标必须重新 `npm run tauri build`
    ⚠ 生成 PNG 别走「用浏览器渲染 SVG 再截图」那条路：Playwright 在这个环境里
