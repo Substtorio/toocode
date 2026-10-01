@@ -25,11 +25,10 @@ import {
 } from "./agentChanges";
 // 把 VS Code 的主题文件翻译成 Monaco 主题的地方（插件机制的第二块）
 import { loadVscodeTheme } from "./vscodeTheme";
-import { isInside, relativePath } from "./pathUtils";
+import { isInside, normalizePath, relativePath } from "./pathUtils";
 // 编辑器状态桥：把「用户此刻在编辑什么」暴露给 Agent
 import {
   MAX_SELECTION_CHARS,
-  normalizePath,
   provideEditorBridge,
   type EditorContext,
   type OpenDocument,
@@ -49,6 +48,8 @@ import {
   disposeLsp,
   openDocument,
 } from "./lsp";
+// 语言服务器 → Monaco 的三个 provider（补全 / 悬停 / 跳转定义）
+import { registerLspLanguage, registerLspOpenHandler } from "./lspFeatures";
 // 应用图标：直接拿 Tauri 打包用的那张 128×128 —— 不用再维护第二份图。
 // ⚠ 以前用的是 32x32 那张，因为当时只显示 16px。logo 放大到 22px 之后，
 //   高分屏下 32px 的源会被拉大（2x 屏需要 44 物理像素）⇒ 发糊，所以换大的
@@ -632,14 +633,17 @@ const activeTabPath = ref<string | null>(null);
 /**
  * 打开一个文件。
  * 已经在标签栏里就只切换激活项 —— 这就是「同一个文件不会开出两个标签」的保证。
+ * ★ 参数是**路径**而不是 FileNode：函数体本来就只用到了 path，
+ *   而「跳到定义」那边手里只有一条路径（甚至可能是工作区外面的文件）——
+ *   要是收 FileNode，那边就得在调之前先拼一个假节点出来，纯属多余
  */
-function openFile(node: FileNode) {
-  if (!openTabs.value.includes(node.path)) {
-    openTabs.value.push(node.path);
+function openFile(path: string) {
+  if (!openTabs.value.includes(path)) {
+    openTabs.value.push(path);
   }
-  activeTabPath.value = node.path;
+  activeTabPath.value = path;
   // 用户主动打开 ⇒ 记一笔导航历史
-  recordVisit(node.path);
+  recordVisit(path);
 }
 
 /** 点击标签栏上的标签 */
@@ -1123,6 +1127,84 @@ let fontSizeSubscription: monaco.IDisposable | null = null;
 // 一个文件对应一个 model。切文件时换 model，而不是换文本 ——
 // 这样每个文件的撤销栈和视图状态都能各自保留下来。
 const models = new Map<string, monaco.editor.ITextModel>();
+
+// ---------- 语言特性的两个口子 ----------
+//
+// 补全 / 悬停 / 跳转定义这三件事在 lspFeatures.ts 里注册，但它不该知道
+// `models` 这张表和编辑器实例长什么样 —— 所以还是开两个函数当窗口
+//
+// ★ 为什么第二个口子非有不可：跳转定义的目标在**别的文件**里时，
+//   Monaco 的 standalone 版自己不会去开那个文件（见 lspFeatures 里的说明），
+//   得由我们把它接到自己的标签栏 / model 体系上
+const lspFeatureHost = {
+  /**
+   * 从一个 model 反查磁盘路径。
+   *
+   * ⚠ 只能**遍历**着找，不能读 `model.uri`：我们的 model 是匿名建的
+   *   （`createModel(content, language)` 没传 uri ⇒ `inmemory://model/3`），
+   *   路径只存在 `models` 这张表的 key 上。
+   *   之所以不建反向索引表：索引得跟着 openFile / 另存为 / 关标签 /
+   *   resetWorkspace 一起维护，总有漏的地方，而漏掉的表现是
+   *   「文件明明开着却读不到」，不报错。标签最多十几个，遍历不会漏
+   */
+  pathOfModel(model: monaco.editor.ITextModel): string | null {
+    for (const [path, candidate] of models) {
+      if (candidate === model) return path;
+    }
+    return null;
+  },
+
+  /**
+   * 打开别的文件并**等到它真的成了编辑器上的 model**，再返回编辑器。
+   *
+   * ⚠ 「等到」这一步不能省：Monaco 拿到编辑器之后会立刻用目标位置
+   *   `setSelection`。要是那一刻编辑器上还挂着上一个 model，
+   *   目标行号在新 model 里完全可能越界，而 Monaco 遇到越界会**抛异常**
+   *
+   * ⚠ ★ 光返回编辑器还不够：**选区得自己设**。Monaco 默认那套之所以会挪光标，
+   *   是它在里面调了 `setSelection`；而我们一旦返回非 null，默认那套
+   *   就再也没机会跑了（`openCodeEditor` 是「谁先返回就用谁」）。
+   *   漏了这一步的症状很好认：**文件确实开了，但光标停在 1:1**
+   */
+  async openLocation(
+    path: string,
+    selection: monaco.IRange | monaco.IPosition | null,
+  ): Promise<monaco.editor.ICodeEditor | null> {
+    const editor = editorInstance.value;
+    if (editor === null || path === "") return null;
+
+    // 已经在标签栏里就只切过去，没有才新开一个
+    if (!openTabs.value.includes(path)) openFile(path);
+    else activateTab(path);
+
+    let model: monaco.editor.ITextModel;
+    try {
+      model = await modelForPath(path);
+    } catch {
+      // 读不出来（文件没了 / 不是文本）—— 返回 null，让 Monaco 那边当无事发生
+      return null;
+    }
+
+    // ★ 这里不等 activeTabPath 那个 watch：它是异步的，而我们要的是
+    //   「返回之前 model 已经挂上去了」。直接挂一次最快，watch 那边随后
+    //   会再设一次同一个 model，没有副作用
+    if (editor.getModel() !== model) editor.setModel(model);
+
+    // 和 Monaco 默认实现一样的两种写法：带 endLineNumber 的是范围，
+    // 否则是单个位置
+    if (selection !== null) {
+      if ("endLineNumber" in selection) {
+        editor.setSelection(selection);
+        editor.revealRangeInCenter(selection, monaco.editor.ScrollType.Immediate);
+      } else {
+        editor.setPosition(selection);
+        editor.revealPositionInCenter(selection, monaco.editor.ScrollType.Immediate);
+      }
+    }
+
+    return editor;
+  },
+};
 
 // ---------- 「脏」状态 ----------
 //
@@ -2524,7 +2606,7 @@ async function openSearchResult(match: SearchMatch) {
   // 反过来的话，watch 可能在登记之前就已经跑完了，跳转就丢了
   pendingReveal.value = { path: match.path, line: match.line, column: match.column };
 
-  openFile({ name: fileNameOf(match.path), path: match.path, type: "file" });
+  openFile(match.path);
 }
 
 /** 打开搜索视图并把焦点送进输入框 —— 快捷键和菜单共用这一个入口 */
@@ -3281,7 +3363,7 @@ function onQuickOpenSelect(key: string) {
   }
 
   const node = filePalette.value.byPath.get(key);
-  if (node) openFile(node);
+  if (node) openFile(node.path);
 }
 
 /**
@@ -3528,9 +3610,22 @@ onMounted(async () => {
         return null;
       },
       workspaceRoot: () => workspaceRoot.value,
+
+      // ★ 服务器一握完手，就按它声明的能力给对应的语言注册补全 / 悬停 / 跳转定义。
+      //   为什么得等到这一刻：`triggerCharacters` 只有服务器自己知道，
+      //   而它必须写在注册那一行里
+      onServerReady: (languageIds, capabilities) => {
+        for (const languageId of languageIds) {
+          registerLspLanguage(languageId, capabilities.triggerCharacters, lspFeatureHost);
+        }
+      },
     },
     (line) => console.info(line),
   );
+
+  // 「跳到别的文件」也得有人接手 —— 见 registerLspOpenHandler 里的说明。
+  // ★ 放在编辑器创建**之后**：它靠「后注册的先跑」抢在 Monaco 默认实现前面
+  registerLspOpenHandler(lspFeatureHost);
   // 再把 VS Code 自带的主题接过来。它和语法扩展是两件事，各自独立失败
   await loadVscodeThemes();
 
@@ -3603,6 +3698,24 @@ onMounted(async () => {
   if (lastFolder) await openFolderPath(lastFolder);
 });
 
+/**
+ * 退订时把异常吃掉。
+ *
+ * ⚠ ★ 为什么需要：开发时 Vue 的 HMR 会走一遍 `onUnmounted`，而那一刻
+ *   `window.__TAURI_EVENT_PLUGIN_INTERNALS__` 可能已经不在了 ——
+ *   报的是 `Cannot read properties of undefined (reading 'unregisterListener')`。
+ *   抛出去的后果不只是“报个错”：它是个 unhandled rejection，
+ *   而且会**把后面剩下的清理全跳掉**（包括销毁编辑器、释放 model）。
+ *   退订失败本来就不是大事，不该拖垮后面的步骤
+ */
+function safeUnlisten(unlisten: (() => void) | null | undefined) {
+  try {
+    unlisten?.();
+  } catch {
+    // 页面正在被拆，退订不上就算了
+  }
+}
+
 onUnmounted(() => {
   window.removeEventListener("keydown", handleKeydown);
   window.removeEventListener("click", closeMenu);
@@ -3617,8 +3730,8 @@ onUnmounted(() => {
   provideEditorBridge(null);
   // 关掉所有语言服务器进程。不关的话它们会活到系统重启
   void disposeLsp();
-  unlistenClose?.();
-  unlistenResize?.();
+  safeUnlisten(unlistenClose);
+  safeUnlisten(unlistenResize);
 
   // 定时器也是需要释放的外部资源，否则回调可能在组件销毁后才触发
   if (saveNoticeTimer) clearTimeout(saveNoticeTimer);

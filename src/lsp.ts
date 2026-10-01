@@ -58,6 +58,71 @@ interface LspDiagnostic {
   message: string;
 }
 
+// ======================= 语言特性的数据形状 =======================
+//
+// ⚠ 下面这些行列**都从 0 开始**（和 Monaco 相反），转换在 lspFeatures.ts 里做。
+//   只声明我们真正会读的字段 —— LSP 的字段很多，全抄一遍只会掩盖「我们到底用了什么」
+
+export interface LspPosition {
+  line: number;
+  character: number;
+}
+
+export interface LspRange {
+  start: LspPosition;
+  end: LspPosition;
+}
+
+/** `textDocument/completion` 的一项 */
+export interface LspCompletionItem {
+  label: string;
+  /** 1=Text 2=Method 3=Function …（★ 和 Monaco 的编号**不一样**，见 lspFeatures.ts） */
+  kind?: number;
+  detail?: string;
+  documentation?: string | { kind: string; value: string };
+  sortText?: string;
+  filterText?: string;
+  insertText?: string;
+  /** 1 = 纯文本，2 = 片段（里面有 $1 / ${2:name} 要展开） */
+  insertTextFormat?: number;
+  textEdit?: {
+    range?: LspRange;
+    newText: string;
+    /** `InsertReplaceEdit` 的两种范围，比 range 更准 */
+    insert?: LspRange;
+    replace?: LspRange;
+  };
+}
+
+/** `textDocument/hover` 的内容有四种写法，都得摊平 */
+export type LspMarkedString =
+  | string
+  | { language: string; value: string }
+  | { kind: string; value: string };
+
+export interface LspHover {
+  contents: LspMarkedString | LspMarkedString[];
+  range?: LspRange;
+}
+
+export interface LspLocation {
+  uri: string;
+  range: LspRange;
+}
+
+/** 服务器也可以回 `LocationLink`（三个范围，更精确） */
+export interface LspLocationLink {
+  targetUri: string;
+  targetRange: LspRange;
+  targetSelectionRange: LspRange;
+}
+
+/** 握手时从服务器那边学到、后续要用到的能力 */
+export interface LspServerCapabilities {
+  /** 哪些字符一敲就该弹补全（CSS 是 `.` `:`、JSON 是 `"` …）。**只有服务器自己知道** */
+  triggerCharacters: string[];
+}
+
 // ============================ 路径 ↔ URI ============================
 
 /**
@@ -163,6 +228,16 @@ export interface LspHost {
   findModel: (path: string) => monaco.editor.ITextModel | null;
   /** 工作区根。既当 `initialize` 的 rootUri，也当服务器的 cwd */
   workspaceRoot: () => string | null;
+  /**
+   * 某个语言的服务器握完手了。
+   *
+   * ★ 为什么要这个回调：**`triggerCharacters` 只有服务器自己知道**
+   *   （CSS 是 `.` `:`、JSON 是 `"` `:`……），而 Monaco 的
+   *   `registerCompletionItemProvider` 要求在**注册时**就写死它们。
+   *   所以做不到「先把 provider 注册好、以后再补触发字符」——
+   *   只能等到服务器真的起来了，再按它的声明注册一遍
+   */
+  onServerReady?: (languageIds: string[], capabilities: LspServerCapabilities) => void;
 }
 
 let host: LspHost | null = null;
@@ -236,6 +311,67 @@ export function closeDocument(path: string): void {
   for (const session of sessions.values()) session.closeDocument(path);
 }
 
+// ======================= 语言特性请求 =======================
+//
+// ★ 这三个都是「有人问才去问服务器」，所以每个都要先回答一个问题：
+//   **这个文档归哪个会话管？** 答案是「didOpen 过它的那个」（见 sessionFor）——
+//   而不是「路径扩展名对得上的那个」。后者会猜错（同一个 `.json` 可能归
+//   别的服务器管），而且猜错的表现是“服务器不认识这个文档”⇒ 什么都不回，不报错
+
+/** 找到正在管这个文档的会话 */
+function sessionFor(path: string): LspSession | null {
+  for (const session of sessions.values()) {
+    if (session.handles(path)) return session;
+  }
+  return null;
+}
+
+/** 发一个请求给「管这个文档」的会话。没人管 / 请求出错都返回 null */
+async function request(path: string, method: string, params: unknown): Promise<unknown> {
+  const session = sessionFor(path);
+  if (session === null) return null;
+  return session.requestFeature(method, params);
+}
+
+/** 补全。返回 null 表示「这个文档没人管」或「服务器出错」 */
+export async function requestCompletion(
+  path: string,
+  position: LspPosition,
+): Promise<LspCompletionItem[] | null> {
+  const result = await request(path, "textDocument/completion", {
+    textDocument: { uri: pathToUri(path) },
+    position,
+  });
+  if (result === null) return null;
+  // 服务器可以只回一个数组，也可以回 `{ isIncomplete, items }`
+  const items = Array.isArray(result) ? result : (result as { items?: unknown }).items;
+  return Array.isArray(items) ? (items as LspCompletionItem[]) : null;
+}
+
+/** 悬停提示 */
+export async function requestHover(path: string, position: LspPosition): Promise<LspHover | null> {
+  const result = await request(path, "textDocument/hover", {
+    textDocument: { uri: pathToUri(path) },
+    position,
+  });
+  return result === null ? null : (result as LspHover);
+}
+
+/** 跳到定义。服务器可以回单个、一串、或者一串 LocationLink */
+export async function requestDefinition(
+  path: string,
+  position: LspPosition,
+): Promise<Array<LspLocation | LspLocationLink> | null> {
+  const result = await request(path, "textDocument/definition", {
+    textDocument: { uri: pathToUri(path) },
+    position,
+  });
+  if (result === null) return null;
+  return Array.isArray(result)
+    ? (result as Array<LspLocation | LspLocationLink>)
+    : [result as LspLocation | LspLocationLink];
+}
+
 /**
  * 一个服务器会话。
  *
@@ -253,6 +389,8 @@ class LspSession {
   private versions = new Map<string, number>();
   private disposers: Array<() => void> = [];
   private stopped = false;
+  /** 服务器声明的补全触发字符。握手之后才有值 */
+  private triggers: string[] = [];
 
   constructor(
     private readonly server: LspServerInfo,
@@ -306,7 +444,7 @@ class LspSession {
     });
 
     // 握手。rootUri 给服务器用来找项目配置（tsconfig / Cargo.toml 之类）
-    await this.request("initialize", {
+    const handshake = await this.request("initialize", {
       processId: null,
       rootUri: this.root === null ? null : pathToUri(this.root),
       capabilities: {
@@ -326,6 +464,36 @@ class LspSession {
     // 通知（没有 id，不等回音）—— 告诉服务器「你的 initialize 回应我收到了，
     // 可以开始推诊断了」
     this.notify("initialized", {});
+
+    // ★ 从握手回应里把「补全触发字符」掏出来。
+    //   这份清单是服务器的私有知识（CSS 的 `.`、JSON 的 `"`），我们不可能内置一份
+    const capabilities = (
+      handshake.result as { capabilities?: { completionProvider?: { triggerCharacters?: string[] } } } | undefined
+    )?.capabilities;
+    this.triggers = capabilities?.completionProvider?.triggerCharacters ?? [];
+    log(`[LSP] ${this.server.label} 就绪（补全触发字符：${this.triggers.join(" ") || "无"}）`);
+    host?.onServerReady?.(this.server.languages, { triggerCharacters: this.triggers });
+  }
+
+  /** 这个会话管着这个文档吗（也就是它 didOpen 过） */
+  handles(path: string): boolean {
+    return this.versions.has(path);
+  }
+
+  /**
+   * 发一个语言特性请求（补全 / 悬停 / 定义）。
+   *
+   * ★ 出错、服务器不回、会话已经停了 —— 一律返回 null。
+   *   「问不出来」不是错误，是个常态：光标停在一个没有补全的地方而已
+   */
+  async requestFeature(method: string, params: unknown): Promise<unknown> {
+    if (this.stopped) return null;
+    const reply = await this.request(method, params);
+    if (reply.error !== undefined) {
+      log(`[LSP] ${method} 出错：${String(reply.error)}`);
+      return null;
+    }
+    return reply.result ?? null;
   }
 
   openDocument(path: string, languageId: string): void {
@@ -374,7 +542,16 @@ class LspSession {
   async stop(): Promise<void> {
     if (this.stopped) return;
     this.stopped = true;
-    for (const dispose of this.disposers) dispose();
+    // ⚠ 逐个 try 包住：退订失败不能把它后面的步骤带走。
+    //   （开发时 HMR 会走一遍卸载流程，那时事件插件可能已经不在了 ——
+    //    实测报 `unregisterListener` 读不到）
+    for (const dispose of this.disposers) {
+      try {
+        dispose();
+      } catch {
+        // 页面正在被拆，退订不上就算了
+      }
+    }
     this.disposers = [];
     try {
       await invoke("lsp_stop", { session: this.id });

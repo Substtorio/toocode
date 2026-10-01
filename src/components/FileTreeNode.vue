@@ -35,7 +35,7 @@ function handleClick() {
   if (canExpand.value) {
     expansion?.toggle(props.node.path);
   } else if (props.node.type === "file") {
-    selection?.openFile(props.node);
+    selection?.openFile(props.node.path);
   }
 }
 </script>

@@ -567,6 +567,7 @@
 | Vue 的更新到底触发了没有 | 浏览器里跑一段 `watchEffect` 小实验 | 数据是对的，只是**不更新** —— 肉眼看不出来 |
 | 诊断的位置对不对 | CDP 直连真窗口读 `getModelMarkers` | marker 字段名写错只是「泡泡线画到别处」，Monaco 不报错 |
 | 语言服务器到底回了什么 | `probe-json-lsp.mjs` 直连服务器 | 隔着 IPC + 映射两层，只看最终结果分不清是谁的错 |
+| 语言特性接对了没有 | **自己写一个假 LSP 服务器**（见 LSP 第二块那条） | 真服务器不产生定义结果 ⇒ 靠它们根本验不了；假服务器输出确定，能做精确断言 |
 
 两个提醒：
 
@@ -1284,9 +1285,131 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       （**只有 JSON 有这个开关**，html / css 那边 Monaco 没给）。
       留着的好处是「服务器挂了还有内置那份顶着」，取舍要自己定
 
+- [x] **LSP 第二块：补全 / 悬停 / 跳转到定义**（`src/lspFeatures.ts` 是新文件）：
+  ★ **为什么单独一个文件，而不是塞进 `lsp.ts`**：`lsp.ts` 只管协议
+    （分帧、会话、请求），拿到的都是路径 + 纯数据；这里管「Monaco 要什么形状」。
+    两边的失败方式完全不同 —— 协议那边错了是「什么都收不到」，
+    这里错了是「收到了但显示得不对」，混在一起就得同时怀疑两层
+  ★★ **注册时机由服务器决定**：`triggerCharacters` 是服务器的私有知识
+    （CSS 的 `.`、JSON 的 `"`），而它必须写在 `registerCompletionItemProvider`
+    那一行里 ⇒ 做不到「先注册好、以后再补」。所以 `configureLsp` 多了一个
+    `onServerReady(languageIds, capabilities)` 回调，握手一完成就按语言注册
+  ★ **按语言注册**（而不是一次注册 `*`）：没有服务器的语言压根不会被问到
+  ⚠ 实测：**html / css 服务器在握手里根本没声明 `completionProvider`**
+    ⇒ 它们的 `triggerCharacters` 我们拿不到（`CSS 就绪（补全触发字符：无）`）。
+    补全本身照样能用（Ctrl+Space、按字输入都会问），
+    只是**敲 `.` `<` `:` 不会自动弹**。要补的话得先查清它们是怎么声明的
+    （可能在 dynamic registration 里，而我们现在对 `client/registerCapability`
+    只是回个 null 就完了）
+
+  ★★ **补全类型：两边的编号完全不一样，而且从第 3 个开始错位**
+    LSP `Method=2, Function=3, Field=5, Variable=6, Class=7 …`
+    Monaco `Function=1, Field=3, Variable=4, Class=5 …`
+    ⇒ 不能「差不多减个 1」，必须查表。表里写 Monaco 的**枚举名字**
+      （`CompletionItemKind.Function`）而不是数字 —— 名字写错类型检查会报
+    ✅ 实测：LSP kind 3 → Monaco `Function`（图标 `symbol-function`）、
+      kind 15 → `Snippet`（`symbol-snippet`），两边都对上了
+  ⚠ ★★ **`monaco.languages.CompletionItem.range` 是必填项**。不给的话插入
+    会变成「追加」（敲 `col` 补出 `color` → `colcolor`）。
+    服务器给的 `textEdit` 优先（可以是 `range`，也可以是更准的
+    `insert`/`replace` 两份）；服务器没给时用「光标所在的词」兜底
+  ⚠ `getWordUntilPosition` 只按 `[a-zA-Z0-9_]` 圈词 —— `System.out.println`
+    这种会被截断（和 snippets 那边同一个坑），好在真服务器基本都会给 textEdit
+  ★ **`insertTextFormat === 2` ⇒ 必须设 `insertTextRules: InsertAsSnippet`**，
+    否则 `$1` / `${2:name}` 会被当**字面量**插进代码
+  ★ 一条都没有时返回 `undefined` 而**不是空数组** —— 空数组会把 Monaco 的列表
+    「接管」掉，它就再不去问别的 provider 了（snippets.ts 踩过同一个坑）
+
+  ★★ **悬停：LSP 的 `contents` 有四种写法**（纯字符串 / `{language,value}` /
+    `{kind,value}` / 数组），都要摊平；`{language,value}` 得包成代码块
+    ⚠ **不要给 `isTrusted` 赋 true**：服务器回的内容属于**不可信内容**
+      （它可能把某个文件里的注释原样搬过来，里面可以藏 HTML），
+      默认的 false 正好是我们要的
+    ✅ 实测：真 css 服务器回的 `{kind:"plaintext", value:"Sets the color of…"}`
+      正常显示；假服务器的 markdown 代码块也渲染对了
+
+  ★★★ **跳转到定义：Monaco 的 standalone 版本来**根本做不到跨文件**，
+    这一步是必答题**
+    · 它最后走的是 `ICodeEditorService.openCodeEditor()`，而默认实现的判据是
+      「目标和**当前** model 是同一个吗」—— 不是就 `return null`（放弃）。
+      实测源码：`findModel(editor, resource)` → `uri 不相等` → `return null`
+    · ★ 而 `openCodeEditor` 是**遍历**所有处理函数、谁先返回非 null 用谁，
+      而 `registerCodeEditorOpenHandler` 用的是 **`unshift`** ⇒
+      **后注册的排在前面**。所以我们在编辑器建好之后注册，就一定能抢在
+      默认实现之前拿到机会；我们返回 null 时它照旧兜底
+    ⚠ 代价：`ICodeEditorService` **没有公开的获取途径**（`monaco.editor.*` 里
+      没有这样的函数，公开类型里也没导出这个接口），只能从
+      `StandaloneServices` 这个内部容器里取。全项目就这一处碰内部 ——
+      两个深引路径 + 一个自制的最小接口，集中在 `monacoInternals.d.ts`
+      和 `lspFeatures.ts` 顶部（⚠ 路径**不能**带 `esm/vs/` 前缀）
+    ⚠ ★★ **「同一个文件里跳转」必须交回 `model.uri`**：我们的 model 是**匿名**的
+      （`createModel(content, language)` 没传 uri ⇒ `inmemory://model/3`），
+      拿真实的 `file:///c%3A/...` 去和当前 model 比**永远不相等** ⇒
+      连同文件跳转都会失效。⇒ 同文件交 `model.uri`（默认实现认得），
+      别的文件才给真实 uri（由我们的处理函数去开）
+    ⚠ ★★ **处理函数必须自己应用 `input.options.selection`** ——
+      默认实现之所以会挪光标，就是它在里面调了 `setSelection`；
+      我们一旦返回了编辑器，它就再也没机会跑了。
+      漏了这一步的症状极好认：**文件确实开了，但光标停在 1:1**
+      （一开始就是这么错的，实测才逼出来）
+    ⚠ 只接 `file://`：同文件跳转时 uri 是匿名的 `inmemory://model/N`，
+      `uriToPath` 会把 `inmemory://model/3` 当成一条路径，
+      然后真的去磁盘上找一个叫 inmemory 的文件 —— 症状是弹出一个打不开的标签
+    ⚠ `openLocation` 要**等到 model 真的挂上去**再返回：Monaco 拿到编辑器后
+      会立刻 `setSelection`，那一刻若还挂着上一个 model，目标行号可能越界，
+      而 Monaco 遇到越界是**抛异常**的
+
+  ★★ **`pathOfModel` 只能遍历着反查**，不能读 `model.uri`（见上面「model 是匿名的」）。
+    不建反向索引表的理由和 editorBridge 一样：索引得跟着 openFile / 另存为 /
+    关标签 / resetWorkspace 一起维护，总有漏的，而漏掉的表现是
+    「文件明明开着却读不到」，不报错
+  ★ 顺手把 `openFile(node: FileNode)` 改成 `openFile(path: string)` ——
+    函数体本来就只用到 `path`，而「跳到定义」那边手里只有一条路径
+    （甚至可能是工作区外面的文件），收 FileNode 就得先拼个假节点出来
+  ★ 顺手把路径归一化统一成 **`pathUtils.ts` 一份**（`normalizePath` / `samePath`）：
+    原来 pathUtils 里私有一份、editorBridge 导出一份，App 里还各写各的循环 ——
+    而分叉的表现是「有地方找不到文件」，不报错
+
+  ★★★ **验证：三个真服务器一个定义结果都不产生，所以自己写了个假服务器**
+    · 实测：html 的 `definition` 回**空数组**（连 `<link href>` 都是空的）、
+      css 回 `null`、json 直接 `Unhandled method` ⇒
+      **「跳转到定义」用真服务器根本验证不了**
+    · 于是写了个 40 行的假 LSP 服务器（`fake-lsp.mjs`）：
+      `didOpen` 后推一条诊断（证明会话真的通了）、补全回两条（一条纯文本、
+      一条**带 textEdit 的片段**）、悬停回 markdown、定义回**另一个文件**的位置。
+      **输出完全确定**，所以每条断言都能对上；这比在真服务器上碰运气可靠得多
+    · 怎么让应用找到它：`find_lsp_servers` 认 PATH 里的 `rust-analyzer`
+      ⇒ 在临时目录放一个 `rust-analyzer.cmd`，**把它加到 PATH 最前面**再启动应用，
+      打开一个 `.rs` 文件就会起我们的假服务器
+      ⚠ `.cmd` 里**不能写中文**（连 `rem` 注释都不行）：cmd 会按 GBK 解释
+        UTF-8 字节，把它当命令执行，报一句「不是内部或外部命令」
+    · ✅ 实测结果：诊断（severity 2 → Warning）✅、补全两条（kind 图标
+      `symbol-function` / `symbol-snippet` 都对）✅、接受片段后第 2 行变成
+      `    beta(value);let value = 1;` 且 `value` 被选中（`$1` 真的展开了）✅、
+      悬停出 markdown ✅、定义**打开了 other.rs 且光标落在 3:4**✅
+
+  ⚠ ★★ **验证补全时踩到一个陷阱**：光标停在 `value` **里面**，
+    Monaco 会拿前缀 `v` 去过滤建议 ⇒ `alpha` / `beta` 全被滤掉，
+    建议框显示「message」状态、0 行，看起来就像「补全没生效」。
+    要看事实：日志里 `收到 textDocument/completion` 明明在
+    ⇒ **先把「请求出没出去」确认掉，再去怀疑我们的转换**
+
+  ⚠ 顺手加固了一处：开发时 HMR 会走一遍 `onUnmounted`，那一刻
+    `window.__TAURI_EVENT_PLUGIN_INTERNALS__` 可能已经不在了（报
+    `Cannot read properties of undefined (reading 'unregisterListener')`）。
+    抛出去不只是报个错 —— 它是 unhandled rejection，而且**会把后面剩下的清理
+    全跳掉**（包括销毁编辑器、释放 model）。加了个 `safeUnlisten()` 兜住，
+    `LspSession.stop()` 里也逐个 try 包住
+
 ### 待办（按优先级）
 
-1. **LSP / 智能提示**。可以直接复用 `loadSyntaxExtensions()` 建好的那份「扩展名 → 语言 id」表
+1. **【已完成】LSP：诊断 + 补全 / 悬停 / 跳转定义**。下一步是：
+   · 「问题」面板（诊断已经有了，只差一个 UI）
+   · **重命名**（`textDocument/rename` → Monaco 的 `registerRenameProvider`，
+     要把 LSP 的 `WorkspaceEdit` 转成 Monaco 的）
+   · **自动导入**（补全项里的 `additionalTextEdits` 现在被丢掉了）
+   · html / css 的 `triggerCharacters`（见上面那条实测）
+   · `$/cancelRequest`：现在取消请求是忽略的（补全结果靠 Monaco 自己丢）
 2. **插件机制的其余贡献点**：`contributes.grammars`（语法）/ `themes`（主题）/
    `injectTo`（注入语法）/ `snippets`（代码片段）都接了。
    剩下可做的：`commands`（扩展注册的命令进命令面板）、`semanticTokenScopes`、

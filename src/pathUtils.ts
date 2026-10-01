@@ -7,6 +7,31 @@
  */
 
 /**
+ * 把路径归一化成「可以拿来比大小写 / 分隔符」的形式。
+ *
+ * 统一分隔符成 `/`、去掉末尾的斜杠、转小写（Windows 路径不区分大小写）。
+ *
+ * ★ 这个函数是**全项目唯一**的一份。以前 pathUtils 里私有一份、
+ *   editorBridge 里导出过一份 —— 两份实现迟早会不一致（一个把 `//` 折叠了、
+ *   另一个没有），而路径比较错了从来不会报错，只会「有地方找不到文件」。
+ */
+export function normalizePath(value: string): string {
+  return value.replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
+}
+
+/**
+ * 两个路径是不是同一个文件。
+ *
+ * ★ 抽出来是因为这个判断散落在好几处（App 找 model、editorBridge 找已打开的文档、
+ *   LSP 那边判断「这个定义是不是就在当前文件里」）——
+ *   每一处都自己写一遍的话，迟早会出现「有的地方忽略了大小写、有的没有」。
+ */
+export function samePath(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  return normalizePath(a) === normalizePath(b);
+}
+
+/**
  * target 是不是在 root 目录下（含 root 自身）。
  *
  * 用来判断「刚才另存为的那个文件要不要让它出现在工作区文件树里」——
@@ -15,19 +40,14 @@
 export function isInside(target: string, root: string): boolean {
   if (!target || !root) return false;
 
-  // 统一分隔符（用户从对话框拿到的路径可能是 / 也可能是 \）、
-  // 去掉末尾的斜杠、转小写（Windows 路径不区分大小写）
-  const normalize = (value: string) =>
-    value.replace(/[\\/]+/g, "\\").replace(/\\+$/, "").toLowerCase();
-
-  const inner = normalize(target);
-  const outer = normalize(root);
+  const inner = normalizePath(target);
+  const outer = normalizePath(root);
 
   if (!inner || !outer) return false;
 
   // ⚠ 比之前先补一个分隔符：直接 startsWith 的话，
   //   `D:\foobar` 会被当成在 `D:\foo` 里面 —— 这是个很容易漏的边界
-  return inner === outer || inner.startsWith(`${outer}\\`);
+  return inner === outer || inner.startsWith(`${outer}/`);
 }
 
 /**

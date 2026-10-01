@@ -653,12 +653,23 @@ function onChatLogClick(event: MouseEvent) {
            ★ 「配置」也挪上来：它和「发送」毫无关系，混在一排会让人以为
              那一排都是「发送相关的」 -->
       <div class="chat-toolbar">
-        <button class="chat-icon-button" type="button" title="配置" @click="editingConfig = true">
+        <!-- 入口不再是纯图标按钮，而是「图标 + 当前模型名」的框。
+             两个理由：
+             ① 模型名是「我现在在跟谁说话」的关键信息，藏在配置面板里等于没有
+             ② `title` 提示只有鼠标停下来才看得到 —— 而模型名经常需要瞄一眼确认
+             ★ 框宽**跟着名字走**（不设固定宽度）—— 模型名长短能差三倍
+             （`deepseek-chat` ↔ `deepseek-ai/DeepSeek-V3.2-Exp`） -->
+        <button
+          class="chat-model"
+          type="button"
+          :title="`配置 Topilot（当前模型：${config.model}）`"
+          @click="editingConfig = true"
+        >
           <!-- 调节滑块 —— 比齿轮更贴「调整参数」这个意思 -->
           <svg
             viewBox="0 0 16 16"
-            width="14"
-            height="14"
+            width="13"
+            height="13"
             fill="none"
             stroke="currentColor"
             stroke-width="1.4"
@@ -669,6 +680,7 @@ function onChatLogClick(event: MouseEvent) {
             <circle cx="9.2" cy="5" r="1.9" />
             <circle cx="6.8" cy="11" r="1.9" />
           </svg>
+          <span class="chat-model-name">{{ config.model }}</span>
         </button>
 
         <button
@@ -857,7 +869,7 @@ function onChatLogClick(event: MouseEvent) {
             v-model="input"
             class="chat-input"
             rows="1"
-            placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"
+            title="Enter 发送，Shift+Enter 换行"
             spellcheck="false"
             @keydown="onKeydown"
           />
@@ -1463,6 +1475,46 @@ function onChatLogClick(event: MouseEvent) {
 .chat-icon-button:disabled {
   opacity: 0.4;
   cursor: default;
+}
+
+/* 模型框。取代原来那个纯图标的「配置」按钮。
+   ★★ 「框的长度自动增长」靠的是**不写宽度**：
+     `display: flex` + 条目默认 `flex: 0 1 auto` ⇒ 宽度就是内容宽（图标 + 文字）
+     ⇒ 模型名换长了，框自己变长，不用改任何代码
+   ⚠ 但不能没有上限：面板最窄可以到 240px，一个特别长的模型名会把
+     旁边那个「清空」按钮挤出去。所以 `min-width: 0` 让它可收缩 +
+     文字那层用省略号 —— 这是个「先能缩，才敢长」的顺序问题 */
+.chat-model {
+  display: flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 4px;
+  background: none;
+  color: var(--color-text-dim);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chat-model:hover {
+  background: var(--color-hover);
+  color: var(--color-text);
+}
+
+/* 图标不会缩，缩的只能是文字 */
+.chat-model svg {
+  flex: 0 0 auto;
+}
+
+.chat-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chat-primary {

@@ -28,10 +28,12 @@
  *
  * ⚠ 只在「查找已打开的文档」这种宽松场景用它，不要拿它当通用的路径比较
  *（Linux 上路径是区分大小写的）
+ *
+ * ★ 实现搬到了 `pathUtils.ts` —— 同一个归一化规则现在被三处用到
+ *   （这里、App 找 model、LSP 判断「定义是不是就在当前文件里」），
+ *   各写一份迟早会分叉，而分叉的表现是「有地方找不到文件」，不报错
  */
-export function normalizePath(path: string): string {
-  return path.replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
-}
+import { normalizePath } from "./pathUtils";
 
 /**
  * 选中内容最多带多少字符进 prompt。
