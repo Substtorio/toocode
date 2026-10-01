@@ -112,14 +112,28 @@
   ⚠ 用 `repeat(auto-fit, minmax(240px, 1fr))` 而不是固定 `1fr 1fr` ——
   窗口窄时自动堆叠成一栏。定死两栏的话每栏只有 169px，快捷键行会溢出被裁
   ★ **快捷键表只列「真实生效」的**：写上去一条按了没反应的，比不写还糟。
-    现在 15 条，每一条都能在 `handleKeydown` / `handlePanelShortcut` / `handleSearchShortcut`
-    或 `handleSourceControlShortcut` 或 Monaco 内置 action 里找到出处 —— 分六组排（文件 / 侧栏视图 / 面板 / 导航 / 编辑器 / 字号），
-    加新快捷键就往数组里追一项
+    每一条都要能在 `handleKeydown` / `handlePanelShortcut` / `handleQuickOpenShortcut` /
+    `handleNavigateShortcut` / `handleSearchShortcut` / `handleSourceControlShortcut` /
+    `handleChatShortcut`，或 Monaco 内置 action 里找到出处
+  ★★ **约定：以后每加一个新功能，顺手给它配一个快捷键，并在这张表里加一条。**
+    快捷键、菜单项、说明三者要**一起出生** —— 事后补是补不齐的。
+    参考实现：源代码管理 `Ctrl+Shift+G`、Topilot `Ctrl+Alt+I`，
+    都是「一个 showXxxView / toggleXxx 函数 + 一个 handleXxxShortcut + 一行注册/注销」
+  ★★ **表分「常显」和「折叠」两档**（`primary: true` / 不写）。
+    为什么：这张表只会一直变长，全部铺开会变成一堵墙，**最关键的那几条反而找不到**。
+    常显只留 6 条（命令面板 / 转到文件 / 保存 / 在文件夹中搜索 / Topilot / 面板），
+    其余 12 条收在「更多快捷键（n）」按钮下面，默认收起。
+    ⚠ ★ **渲染上只有一个 `v-for`**：折叠开关改的是 `visibleShortcuts` 这份数据的**长度**
+      （收起 = 只有 primary 那几条），不是把 `<li>` 写两遍 ——
+      两份一模一样的行迟早会不一致
   ⚠ ★ **验证欢迎页的技巧**：它有 `v-if="!activeTabPath"`，而 hot exit 会在
     `beforeunload` 时把标签写回 localStorage，**未命名文档又永不为干净** ⇒
     浏览器里永远看不到欢迎页。
     绕过办法：先在页面里代理 `Object.getPrototypeOf(localStorage).setItem`，
     把 `new_vscode:hotExit` 的写入丢掉，清掉旧值，再 reload
+  ⚠ ★ **量欢迎页尺寸前先看视口**：Topilot 面板开着的时候编辑区会被压窄，
+    `.welcome` 也跟着变窄 —— 那样量出来的行宽/换行全是错的
+    （实测踩到过：截出来的图里快捷键说明全被裁掉，其实只是窗口太窄）
     （代理是当前页面 JS 里的，reload 后自动失效 —— 所以只影响这一次跳转）
 - [x] **「WELCOME_TEXT 那个 model」的定位**：它只是垫在 Monaco 下面的占位 model
   （Monaco 不能没有 model），**用户看不到**；真正显示的是 DOM 那层 `.welcome`
@@ -1362,6 +1376,11 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
       就变成「开着 Topilot 就没法同时看资源管理器」。
       而它和左侧栏是**两张互不相干的卡片**，本来就该能同时开着
     ★ 实现上 `chatVisible` 是**独立的布尔**，不复用 `sidebarVisible` / `activeView`
+    ★ **快捷键 `Ctrl+Alt+I`**（VS Code 的 Copilot Chat 就是这个键）——
+      加它的理由：Topilot 的入口只在标题栏那一个小按钮上，
+      不点开就完全想不到它存在，**快捷键是它的主要入口**。
+      ⚠ `Ctrl+Alt+<字母>` 在有些布局上是 AltGr（会把字母变成符号），
+        所以 `handleChatShortcut` 同时认 `event.key` 和 `event.code`
     ★ 拖宽度的 sash 复用 `startSashDrag`，但 **`invert: true`** ——
       它的 sash 在面板**左边**，往左拖才是变宽（侧栏是反的）
   - **思考过程默认展开**（`<details open>`）：流式期间那个 `<pre>` 会实时长出来，

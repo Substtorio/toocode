@@ -1316,22 +1316,48 @@ function restoreHotExit() {
 const WELCOME_KEY = ":welcome:";
 const WELCOME_TEXT = "// 点左侧文件树里的文件试试";
 
+/** 欢迎页快捷键表里的一行 */
+type WelcomeShortcut = {
+  /** 逐个渲染成键帽。★ 写成数组而不是 "Ctrl+P" 一整串 ——
+      这样才能把「+」画成普通文字、把每个键画成 <kbd> */
+  keys: readonly string[];
+  label: string;
+  /**
+   * ★ true = 常显；不写 = 折叠在「更多快捷键」下面。
+   *
+   * 为什么要有这个：这张表只会一直变长（每加一个功能就多一条），
+   * 全部铺开会变成一堵墙，**最关键的那几条反而找不到了**。
+   * ⇒ 常显的只留「最常用的关键操作」，其余全折叠。
+   *   加新快捷键时先想清楚：它够不够格进常显那一组
+   */
+  primary?: boolean;
+};
+
 // 欢迎页右栏的快捷键表。
-// 用数据 + v-for 生成，而不是手写五行 HTML ——
+// 用数据 + v-for 生成，而不是手写一堆 HTML ——
 // 以后加快捷键只要往数组里追一项，不用碰模板。
 //
 // ★ 只列**真实生效**的：写上去一条按了没反应的，比不写还糟。
-//   下面每一条都能在 handleKeydown / handlePanelShortcut 或 Monaco 内置 action 里找到出处
-const WELCOME_SHORTCUTS = [
-  // 文件。这三条是全局的 —— 焦点在侧栏或标签栏时也生效
+//   每一条都要能在 handleKeydown / handlePanelShortcut / handleQuickOpenShortcut /
+//   handleNavigateShortcut / handleSearchShortcut / handleSourceControlShortcut /
+//   handleChatShortcut，或 Monaco 内置 action 里找到出处
+//
+// ★★ **以后加新功能就顺手在这里加一条** —— 快捷键、菜单项、说明三者要一起出生
+const WELCOME_SHORTCUTS: readonly WelcomeShortcut[] = [
+  // ---- 常显：最常用的那几条 ----
+  { keys: ["Ctrl", "Shift", "P"], label: "命令面板", primary: true },
+  { keys: ["Ctrl", "P"], label: "转到文件", primary: true },
+  { keys: ["Ctrl", "S"], label: "保存当前文件", primary: true },
+  { keys: ["Ctrl", "Shift", "F"], label: "在文件夹中搜索", primary: true },
+  { keys: ["Ctrl", "Alt", "I"], label: "显示 / 隐藏 Topilot", primary: true },
+  { keys: ["Ctrl", "J"], label: "显示 / 隐藏面板", primary: true },
+
+  // ---- 折叠区：下面这些默认收起 ----
+  // 文件。这几条是全局的 —— 焦点在侧栏或标签栏时也生效
   { keys: ["Ctrl", "N"], label: "新建文件" },
-  { keys: ["Ctrl", "S"], label: "保存当前文件" },
   { keys: ["Ctrl", "Shift", "S"], label: "另存为…" },
   // 侧栏视图
-  { keys: ["Ctrl", "Shift", "F"], label: "在文件夹中搜索" },
   { keys: ["Ctrl", "Shift", "G"], label: "源代码管理" },
-  // 面板。另外 Ctrl+` 也认，和 VS Code 一致；这里只列更好按的那个
-  { keys: ["Ctrl", "J"], label: "显示 / 隐藏面板" },
   // 导航（在标题栏那对箭头上也有）
   { keys: ["Alt", "←"], label: "后退到上一个位置" },
   { keys: ["Alt", "→"], label: "前进到下一个位置" },
@@ -1344,7 +1370,27 @@ const WELCOME_SHORTCUTS = [
   { keys: ["Ctrl", "="], label: "放大字号" },
   { keys: ["Ctrl", "-"], label: "缩小字号" },
   { keys: ["Ctrl", "0"], label: "重置字号（回到默认值）" },
-] as const;
+];
+
+const PRIMARY_SHORTCUTS = WELCOME_SHORTCUTS.filter((item) => item.primary);
+const MORE_SHORTCUTS = WELCOME_SHORTCUTS.filter((item) => !item.primary);
+
+/**
+ * 「更多快捷键」展开没有。
+ *
+ * ★ 默认**收起** —— 这张表只会越来越长，默认展开等于把「一堵墙」当成默认状态
+ */
+const shortcutsExpanded = ref(false);
+
+/**
+ * 当前要显示的那几行。
+ *
+ * ★ 用「算出一份列表」而不是把 <li> 写两遍：一个 v-for 管所有情况，
+ *   折叠开关只影响这份数据的长度 —— 模板里不会出现第二份一模一样的行
+ */
+const visibleShortcuts = computed<readonly WelcomeShortcut[]>(() =>
+  shortcutsExpanded.value ? WELCOME_SHORTCUTS : PRIMARY_SHORTCUTS,
+);
 
 function createModelFor(key: string, content: string, language: string): monaco.editor.ITextModel {
   const existing = models.get(key);
@@ -2613,6 +2659,25 @@ function handleSourceControlShortcut(event: KeyboardEvent) {
 //   挨个去加调用必然漏掉一处，而漏掉的表现是「列表还是上一个仓库的改动」
 watch(workspaceRoot, () => void refreshGitStatus(), { immediate: true });
 
+/**
+ * Topilot 快捷键 **Ctrl+Alt+I**。
+ *
+ * ★ 选它是因为 **VS Code 的 Copilot Chat 就是这个键**
+ *   （`workbench.action.chat.toggle`）—— 用户的手感一致，将来接真 Copilot 也不会撞车。
+ * ★ 加它的理由：Topilot 的入口只在标题栏那一个小按钮上，
+ *   不开面板就完全想不到它存在。快捷键是它的主要入口
+ * ⚠ 和其他几个一样走**捕获阶段**：Monaco 和 WebView2 都可能有自己的绑定。
+ *   而且 `Ctrl+Alt+<字母>` 在某些布局上是 AltGr，所以这里同时认 `event.key`
+ *   和 `event.code` —— 只认 key 的话，AltGr 把 `i` 变成一个符号时就失配了
+ */
+function handleChatShortcut(event: KeyboardEvent) {
+  if (!event.ctrlKey || !event.altKey || event.shiftKey) return;
+  if (event.key.toLowerCase() !== "i" && event.code !== "KeyI") return;
+
+  event.preventDefault();
+  toggleChat();
+}
+
 // ---------- 可拖拽的分隔条 ----------
 //
 // VS Code 的布局是「嵌套的框 + 夹在相邻框之间的分隔条」（它把那缝叫 sash）：
@@ -3414,6 +3479,9 @@ onMounted(async () => {
   // 源代码管理（Ctrl+Shift+G）。同理
   window.addEventListener("keydown", handleSourceControlShortcut, true);
 
+  // Topilot（Ctrl+Alt+I）。同理
+  window.addEventListener("keydown", handleChatShortcut, true);
+
   // 拦窗口关闭：有未保存的改动就先问一句。
   //
   // ★ 这是官方文档给的范式：**只在需要拦住的时候才 preventDefault**。
@@ -3457,6 +3525,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleNavigateShortcut, true);
   window.removeEventListener("keydown", handleSearchShortcut, true);
   window.removeEventListener("keydown", handleSourceControlShortcut, true);
+  window.removeEventListener("keydown", handleChatShortcut, true);
   // 拆掉状态桥：它抓着编辑器实例和 model，留着就是泄漏
   provideEditorBridge(null);
   unlistenClose?.();
@@ -4287,7 +4356,7 @@ watch(activeTabPath, async (path) => {
               <section>
                 <h2 class="welcome-heading">键盘快捷键</h2>
                 <ul class="welcome-list">
-                  <li v-for="item in WELCOME_SHORTCUTS" :key="item.label" class="welcome-row">
+                  <li v-for="item in visibleShortcuts" :key="item.label" class="welcome-row">
                     <span class="welcome-keys">
                       <template v-for="(key, index) in item.keys" :key="key">
                         <span v-if="index > 0" class="welcome-plus">+</span>
@@ -4297,6 +4366,20 @@ watch(activeTabPath, async (path) => {
                     <span class="welcome-row-label">{{ item.label }}</span>
                   </li>
                 </ul>
+
+                <!-- 折叠开关。
+                     ★ 放在列表**下面**而不是上面：它管的是「下面还有多少」——
+                       放在上面会把「常显那几条」和开关的关系说反
+                     ★ 显示条数而不是只写「更多」：让人不用展开就知道里面有多少东西 -->
+                <button
+                  type="button"
+                  class="welcome-more"
+                  :aria-expanded="shortcutsExpanded"
+                  @click="shortcutsExpanded = !shortcutsExpanded"
+                >
+                  <span class="welcome-more-caret">{{ shortcutsExpanded ? "▾" : "▸" }}</span>
+                  {{ shortcutsExpanded ? "收起" : `更多快捷键（${MORE_SHORTCUTS.length}）` }}
+                </button>
               </section>
             </div>
           </div>
@@ -5644,6 +5727,36 @@ kbd {
 
 .welcome-row-label {
   color: var(--color-text-dim);
+}
+
+/* 「更多快捷键 / 收起」的折叠开关。
+   ★ 它是个 button，但长得像链接 —— 和上面那些 .welcome-link 视觉上同类。
+     不复用那个类：那是「跳转」，这是「切换」，语义不同 */
+.welcome-more {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 3px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  /* font: inherit 不能省 —— button 有自己的默认字体 */
+  font: inherit;
+  color: var(--color-text-dim);
+  cursor: pointer;
+}
+
+.welcome-more:hover {
+  background: var(--color-hover);
+  color: var(--color-text);
+}
+
+/* 箭头定宽：▸ 和 ▾ 不一样宽，不定宽的话切换时后面的字会左右跳一下 */
+.welcome-more-caret {
+  display: inline-block;
+  width: 10px;
+  font-size: 10px;
 }
 
 /* 最近打开的文件夹：一行里左边是名字、右边是路径。
