@@ -943,14 +943,19 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
    · **源代码管理**：最低限度得能列出改动文件（`git status`）+ 点开看 diff。
      这个能做成真东西，不需要任何新依赖 —— Rust 侧跑 `git` 命令就行
    · **运行和调试**：要接 DAP（调试适配器协议），和 LSP 是同一个量级，得单独排期
-7. **【待做】画 Toocode 自己的 logo / 应用图标**：
-   现在 `src-tauri/icons/` 里还是 **Tauri 默认那套图标**（模板自带的），
-   所以打包出来的安装包、任务栏、开始菜单里显示的都还是它的东西。
-   ★ 做法：画一张 1024×1024 的 PNG（正方形），跑 `npm run tauri icon <那个png>` ——
-     它会自动生成全套（`.ico` / `.icns` / 各种尺寸的 png / Android / iOS），
-     覆盖掉现在这些文件
+7. **【已完成】Toocode 自己的 logo / 应用图标**：
+   ✅ 图形是「圆角方形底 + 一个 `>` 加一条下划线」（终端提示符）——
+      两笔、单色、小尺寸下也认得出来。配色只用两个：底 `#1b1f24`、符号 `#e6edf3`。
+   - `logo.png` 是 1024×1024 的源图
+   - `scripts/make-logo.ps1` 能重新生成它（想改颜色 / 形状不用从头写）
+   - `npm run tauri icon logo.png` 展开成全套（`.ico` / `.icns` / 各尺寸 png / iOS / Android）
    ★ 应用内标题栏那个小图标（`import appIconUrl from "../src-tauri/icons/32x32.png"`）
-     会**自动跟着换**，一行代码都不用改
+     自动跟着换了，一行代码都没改
+   ⚠ **已经打包出去的安装包不会自动更新图标** —— 图标是编译时嵌进 exe 的，
+     换了图标必须重新 `npm run tauri build`
+   ⚠ 生成 PNG 别走「用浏览器渲染 SVG 再截图」那条路：Playwright 在这个环境里
+     截出来的图和实际尺寸对不上（截到的是放大的一角）。
+     用 `System.Drawing` 直接画完全可控，也不依赖任何外部工具
 8. **hot exit 备份改用文件**：localStorage 有容量上限且只能存字符串。
    真需要的话用 Tauri 的 `appDataDir` + 一个 `save_session` / `load_session` 命令
 9. **【主体完成】内置 AI 助手 Topilot**（四轮：对话循环 → 工具 → diff 审阅 → 看得见编辑器）。
