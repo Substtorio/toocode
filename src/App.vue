@@ -40,8 +40,14 @@ import MenuList from "./components/MenuList.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import TerminalPanel from "./components/TerminalPanel.vue";
 import { fileTreeExpansionKey, fileTreeSelectionKey } from "./injectionKeys";
-// 应用图标：直接拿 Tauri 打包用的那张 32x32 —— 不用再维护第二份图
-import appIconUrl from "../src-tauri/icons/32x32.png";
+// 应用图标：直接拿 Tauri 打包用的那张 128×128 —— 不用再维护第二份图。
+// ⚠ 以前用的是 32x32 那张，因为当时只显示 16px。logo 放大到 22px 之后，
+//   高分屏下 32px 的源会被拉大（2x 屏需要 44 物理像素）⇒ 发糊，所以换大的
+import appIconUrl from "../src-tauri/icons/128x128.png";
+// 应用版本号。★ 直接读 tauri.conf.json —— 它是**唯一权威**的那份：
+//   打包出来的安装包名、git tag 都是照着它来的。
+//   写死一个字符串就等于多了第二份真相，迟早对不上
+import appConf from "../src-tauri/tauri.conf.json";
 import type { FileNode, Menu, MenuItem, SearchMatch, SearchResponse } from "./types";
 
 /**
@@ -3779,8 +3785,14 @@ watch(activeTabPath, async (path) => {
          ★ 拖动区单独占中间那段空白（.titlebar-drag），不能盖住菜单或按钮：
            data-tauri-drag-region 会让里面的子元素也跟着变成拖动区，盖住就点不动了 -->
     <div class="titlebar">
-      <!-- 应用图标。alt 留空是有意的：旁边的菜单和标题已经说明了这是谁 -->
-      <img class="titlebar-icon" :src="appIconUrl" alt="" />
+      <!-- 应用图标。alt 留空是有意的：旁边的菜单和标题已经说明了这是谁。
+           title 显示版本号 —— 悬停就能看到装的是哪一版 -->
+      <img
+        class="titlebar-icon"
+        :src="appIconUrl"
+        :title="`${appConf.productName} ${appConf.version}`"
+        alt=""
+      />
 
       <!-- 菜单栏：应用内自绘的，不是系统菜单。
            @click.stop 让点菜单时不冒泡到 window —— 否则会被全局的关闭菜单监听器立刻收起来 -->
@@ -4451,13 +4463,15 @@ watch(activeTabPath, async (path) => {
   user-select: none;
 }
 
-/* 应用图标。32x32 的原图缩到 16px 显示 —— 不用再维护第二份小图 */
+/* 应用图标。128×128 的原图缩到 22px 显示 —— 不用再维护第二份小图。
+   ★ 22px 是标题栏（35px）里看着舒服的上限：上下各留 6.5px，再大就开始挤了 */
 .titlebar-icon {
   flex: 0 0 auto;
   align-self: center;
-  width: 16px;
-  height: 16px;
-  margin: 0 6px 0 10px;
+  width: 22px;
+  height: 22px;
+  /* 右边留得比左边多一点：旁边就是「文件」菜单，两个不能粘在一起 */
+  margin: 0 8px 0 10px;
 }
 
 /* 菜单栏现在只是标题栏里的一段，不再自己占一整行 */
