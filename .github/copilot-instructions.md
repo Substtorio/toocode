@@ -2099,6 +2099,13 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 
 ### 待办（按优先级）
 
+> **0.2.0 发布的收尾（2026-10-02 记下）**
+> - **Release 说明还是手写的那几条**（面板 / 活动栏 / 模型名称…）。可以换成整理过的那份：
+>   `gh release edit v0.2.0 --notes-file <md>`（草稿那份在 tag 消息里，也见上面「0.2.0 实测记录」）
+> - **安装器本身没双击验过**（验的是 `release\toocode.exe`）。它 per-user 安装、不要管理员权限：
+>   跑一遍 `bundle\nsis\Toocode_0.2.0_x64-setup.exe`，确认装完能起、开始菜单和卸载项都在、
+>   并且用户数据目录 `%APPDATA%\com.toocode.app`（含密钥和聊天记录）不受影响
+
 1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。
    下一步是：
    · html / css 的 `triggerCharacters`（见上面那条实测）
