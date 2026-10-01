@@ -89,7 +89,7 @@ function toggleSidebar() {
  *   有了搜索之后就不等价了 —— 搜索视图开着时，资源管理器那个图标应该是**不亮**的。
  *   用一个布尔去表达两件事，迟早会在加第二个视图时错位
  */
-type ViewId = "explorer" | "search";
+type ViewId = "explorer" | "search" | "scm";
 const activeView = ref<ViewId>("explorer");
 
 /**
@@ -113,6 +113,18 @@ const ACTIVITY_VIEWS: Array<{ id: ViewId; label: string; icon: string }> = [
     label: "搜索",
     // 放大镜 = 一个整圆（两段弧拼起来）+ 一根手柄，写在同一个 d 里
     icon: "M18 11a7 7 0 1 1-14 0 7 7 0 0 1 14 0M16 16l5 5",
+  },
+  {
+    id: "scm",
+    label: "源代码管理",
+    // git 那个「节点 + 分支」的图形：竖线串上下两个点，中间往右引出一根旁支。
+    // ★ 圆用**两段半圆弧**拼（和上面放大镜同一个技巧）——
+    //   弧只能画不满的一圈，收尾处会露出一个缺口
+    icon:
+      "M5.5 1.3a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4" +
+      "M5.5 10.3a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4" +
+      "M11.5 5.8a2.2 2.2 0 1 0 0 4.4a2.2 2.2 0 1 0 0-4.4" +
+      "M5.5 5.7v4.6M7.7 8h1.6",
   },
 ];
 
@@ -817,6 +829,24 @@ const editorContainer = ref<HTMLElement | null>(null);
 //
 // ★ 浮层只负责「显示」；真正写盘发生在 `acceptChange` 里（agentChanges.ts）。
 //   这里做两件事：把当前审阅的那条渲染成并排 diff、写完之后同步编辑器里的文档
+//
+// ★★ 这个浮层现在有两种**来源**，但只有一套渲染代码：
+//    · `review`   —— Topilot 提议的改动待审，底下有「保留 / 撤销」两个按钮
+//    · `readonly` —— 比如源代码管理里点一个文件看 diff，纯看，没有按钮
+//    ⇒ 所以 `viewingDiff` 是个 computed：**两个来源折算成同一种形状**
+//      （路径 + 原内容 + 新内容 + 模式），模板只认这个形状。
+//      不这么做的话，「显示 diff」这件事会被抄成两套，两边迟早不一致
+
+/** 浮层要显示的东西 —— 两种来源共用这一种形状 */
+interface ViewingDiff {
+  path: string;
+  original: string;
+  updated: string;
+  /** review = 待审（能保留/撤销）；readonly = 只是看 */
+  mode: "review" | "readonly";
+  /** 只在 review 模式下有：对应 agentChanges 里那条改动 */
+  changeId?: string;
+}
 
 const diffContainer = ref<HTMLElement | null>(null);
 
@@ -824,11 +854,29 @@ const diffContainer = ref<HTMLElement | null>(null);
 const reviewingId = reviewingChange();
 const pending = pendingChanges();
 
-/** 当前正在审阅的那条改动（没在审就是 null） */
-const reviewingDiff = computed(() => {
+/** 「只读 diff」的来源 —— 源代码管理点文件时填进来（不填就是 null） */
+const externalDiff = ref<{ path: string; original: string; updated: string } | null>(null);
+
+/** 当前浮层要显示什么（没在显示就是 null）。两个来源的优先级：审阅 > 只读 */
+const viewingDiff = computed<ViewingDiff | null>(() => {
   const id = reviewingId.value;
-  if (id === null) return null;
-  return pending.value.find((change) => change.id === id) ?? null;
+  if (id !== null) {
+    const change = pending.value.find((item) => item.id === id);
+    if (change) {
+      return {
+        path: change.path,
+        original: change.original,
+        updated: change.updated,
+        mode: "review",
+        changeId: id,
+      };
+    }
+  }
+
+  const external = externalDiff.value;
+  if (external) return { ...external, mode: "readonly" };
+
+  return null;
 });
 
 let diffEditor: monaco.editor.IStandaloneDiffEditor | null = null;
@@ -838,6 +886,12 @@ let diffUpdatedModel: monaco.editor.ITextModel | null = null;
 /**
  * Monaco 的 model **不会**跟着 editor 一起释放，得自己关。
  * 审阅下一个文件时旧的那两个就没人用了 —— 不释放会一直堆在全局注册表里
+ *
+ * ⚠ 调用**时机**有讲究：必须先让编辑器换成新 model，再回头销毁旧的。
+ *   反过来（先 dispose、再 setModel）Monaco 会当场报
+ *   `TextModel got disposed before DiffEditorWidget model got reset` ——
+ *   因为销毁的那一刻，编辑器还指着这两个 model。
+ *   只在「第一个 diff → 第二个 diff」时才会触发：第一个进来时旧的是 null，没事
  */
 function disposeDiffModels() {
   diffOriginalModel?.dispose();
@@ -846,8 +900,8 @@ function disposeDiffModels() {
   diffUpdatedModel = null;
 }
 
-watch(reviewingDiff, async (change) => {
-  if (change === null) return;
+watch(viewingDiff, async (diff) => {
+  if (diff === null) return;
 
   // 浮层是 v-if 的，刚渲染出来时 DOM 还没有 —— 必须等一拍
   await nextTick();
@@ -867,10 +921,17 @@ watch(reviewingDiff, async (change) => {
     });
   }
 
-  disposeDiffModels();
-  diffOriginalModel = monaco.editor.createModel(change.original, languageFromPath(change.path));
-  diffUpdatedModel = monaco.editor.createModel(change.updated, languageFromPath(change.path));
+  // ★ 顺序：先建新的、换上去，最后才销毁旧的。
+  //   中间不留「编辑器没有 model」的空档，也不会有「编辑器指着已销毁的 model」
+  const previousOriginal = diffOriginalModel;
+  const previousUpdated = diffUpdatedModel;
+
+  diffOriginalModel = monaco.editor.createModel(diff.original, languageFromPath(diff.path));
+  diffUpdatedModel = monaco.editor.createModel(diff.updated, languageFromPath(diff.path));
   diffEditor.setModel({ original: diffOriginalModel, modified: diffUpdatedModel });
+
+  previousOriginal?.dispose();
+  previousUpdated?.dispose();
 });
 
 /**
@@ -924,8 +985,20 @@ function rejectReview() {
   if (id !== null) rejectChange(id);
 }
 
+/** 关掉浮层 —— 两种来源都要清干净，不然关掉之后它会立刻又弹回来 */
 function closeReview() {
+  externalDiff.value = null;
   reviewChange(null);
+}
+
+/**
+ * 打开一个**只读** diff（源代码管理点文件时用）。
+ *
+ * ★ 不进 `openTabs`、也不碰 Monaco 主编辑器 —— 它只是一个浮层，
+ *   和图片预览同一套路。所以标签栏不会多出一个「diff 标签」
+ */
+function showReadonlyDiff(path: string, original: string, updated: string) {
+  externalDiff.value = { path, original, updated };
 }
 
 // 用 shallowRef 而不是 ref！这是关键。
@@ -1198,6 +1271,7 @@ const WELCOME_SHORTCUTS = [
   { keys: ["Ctrl", "Shift", "S"], label: "另存为…" },
   // 侧栏视图
   { keys: ["Ctrl", "Shift", "F"], label: "在文件夹中搜索" },
+  { keys: ["Ctrl", "Shift", "G"], label: "源代码管理" },
   // 面板。另外 Ctrl+` 也认，和 VS Code 一致；这里只列更好按的那个
   { keys: ["Ctrl", "J"], label: "显示 / 隐藏面板" },
   // 导航（在标题栏那对箭头上也有）
@@ -2308,6 +2382,179 @@ function handleSearchShortcut(event: KeyboardEvent) {
   showSearchView();
 }
 
+// ---------- 源代码管理 ----------
+//
+// 数据流：切到工作区 → 问 Rust `git_status` → 列表；
+//         点一条 → 问 Rust `git_show_head`（HEAD 版本）+ `read_file`（磁盘版本）
+//                → 塞进 `externalDiff` → 复用那个 diff 浮层
+//
+// ★ 全程**不引第三方 git 库**：Rust 侧就是跑 `git` 命令。
+//   VS Code 自己也是这么干的（它内部调 git 可执行文件）——
+//   引 libgit2 那类绑定要多背一个 C 库，还得处理证书 / 配置兼容，不值当
+
+/**
+ * ⚠ 这两个接口的字段名是 **snake_case**，和 `git_status` 的 Rust 结构体一一对应。
+ *
+ * Rust 侧没写 `#[serde(rename_all = "camelCase")]`，所以序列化出来的就是字段原名。
+ * 平时 Tauri 会自动把**命令参数**从 camelCase 转成 snake_case，
+ * 但**返回值**它不管 —— 那边序列化成什么，这边就得照着写。
+ * 写错了不会报错，只会拿到 `undefined`（列表一个文件都没有，看着像「没有改动」）
+ */
+interface GitChange {
+  path: string;
+  relative: string;
+  status: string;
+  label: string;
+}
+
+interface GitStatus {
+  is_repo: boolean;
+  root: string;
+  changes: GitChange[];
+}
+
+const gitChanges = ref<GitChange[]>([]);
+const gitRoot = ref("");
+const gitIsRepo = ref(false);
+const gitError = ref("");
+const gitBusy = ref(false);
+/**
+ * 有没有**问过** git。
+ *
+ * ★ 和 `gitIsRepo` 是两件事：刚开始也是 `isRepo: false`，
+ *   但那时的正确文案是「正在检查…」而不是「这个文件夹不是 git 仓库」。
+ *   用一个布尔表达两个状态，界面上就会先闪一句错的
+ */
+const gitChecked = ref(false);
+
+/** 问一遍 git。切工作区、点刷新按钮都走这一个入口 */
+async function refreshGitStatus() {
+  const root = workspaceRoot.value;
+  if (!root) {
+    gitChanges.value = [];
+    gitRoot.value = "";
+    gitIsRepo.value = false;
+    gitError.value = "";
+    gitChecked.value = false;
+    return;
+  }
+
+  gitBusy.value = true;
+  try {
+    const status = await invoke<GitStatus>("git_status", { path: root });
+    gitIsRepo.value = status.is_repo;
+    gitRoot.value = status.root;
+    gitChanges.value = status.changes;
+    gitError.value = "";
+  } catch (error) {
+    // 「不是仓库」不会走到这里（Rust 侧把它当成正常结果返回），
+    // 能走到这儿的是真失败：git 没装、命令报错、IPC 挂了
+    gitIsRepo.value = false;
+    gitRoot.value = "";
+    gitChanges.value = [];
+    gitError.value = String(error);
+  } finally {
+    gitBusy.value = false;
+    gitChecked.value = true;
+  }
+}
+
+/**
+ * 列表右边那个字母标记。VS Code 用的是**工作区那一列**的状态码。
+ *
+ * ★ `git status` 给的两位码分别是「暂存区」和「工作区」（` M` / `M ` / `MM`）——
+ *   VS Code 列表里显示的是第二列，因为那才是「用户眼前这份文件是什么状态」。
+ *   只有第二列是空格时才退回第一列（比如 `M ` 已经 `git add` 了，
+ *   VS Code 依然显示 M —— 因为它关心的是「相对 HEAD 有改动」）
+ */
+function gitBadge(status: string): string {
+  // 未跟踪是特例：`??` 两位都是问号，VS Code 显示成 U 而不是 ?
+  if (status === "??") return "U";
+
+  const worktree = status[1];
+  if (worktree && worktree !== " " && worktree !== "?") return worktree;
+
+  const staged = status[0];
+  return !staged || staged === "?" ? "M" : staged;
+}
+
+/** 字母标记的色调：新增 / 删除 / 其余（修改、重命名…）各一种颜色 */
+function gitTone(status: string): string {
+  const badge = gitBadge(status);
+  if (badge === "U" || badge === "A") return "is-new";
+  if (badge === "D") return "is-deleted";
+  return "is-modified";
+}
+
+/**
+ * 列表里每一行要显示的东西：文件名 + 所在目录 + 状态字母。
+ *
+ * ★ 名字和目录都从 `relative`（相对仓库根的路径）切，不用绝对路径 ——
+ *   绝对路径会把中间那一长串项目目录名也显示出来，全是噪音。
+ *   而且切出来的目录短了，右边才腾得出地方给状态字母
+ */
+const gitRows = computed(() =>
+  gitChanges.value.map((change) => {
+    const slash = change.relative.lastIndexOf("/");
+    return {
+      change,
+      name: slash < 0 ? change.relative : change.relative.slice(slash + 1),
+      dir: slash < 0 ? "" : change.relative.slice(0, slash),
+      badge: gitBadge(change.status),
+      tone: gitTone(change.status),
+    };
+  }),
+);
+
+/**
+ * 点一条改动 → 打开只读 diff。
+ *
+ * ★ `updated` 取的是**磁盘**上的内容，不是编辑器里那份。
+ *   这是刻意的：`git_status` 比较的就是「HEAD ↔ 磁盘」——
+ *   如果 diff 拿编辑器里没保存的内容，就会出现
+ *   「列表说这个文件没改，点进去却一堆差异」这种自相矛盾的画面
+ *   （和 Topilot 那边「model 优先」的规则不冲突 —— 那边问的是「用户现在屏幕上是什么」，
+ *     这边问的是「git 眼里改了什么」，两码事）
+ */
+async function openGitDiff(change: GitChange) {
+  if (!gitRoot.value) return;
+  try {
+    // 新文件在 HEAD 里不存在，Rust 侧会回一个空串（不是报错）
+    const original = await invoke<string>("git_show_head", {
+      path: gitRoot.value,
+      relative: change.relative,
+    });
+    const updated = await invoke<string>("read_file", { path: change.path });
+    showReadonlyDiff(change.path, original, updated);
+  } catch (error) {
+    // 二进制文件、超过大小上限的文件都会走到这儿 —— 直说，别静默
+    flashSaveNotice(`打不开 diff：${String(error)}`);
+  }
+}
+
+/** 打开源代码管理视图。快捷键和菜单共用这一个入口 */
+function showSourceControlView() {
+  activeView.value = "scm";
+  sidebarVisible.value = true;
+  // 每次打开都刷一遍：用户在别处 `git add` 过之后回来，看到的应该是最新的
+  void refreshGitStatus();
+}
+
+/** 源代码管理快捷键 Ctrl+Shift+G（VS Code 里就是它）。同样走捕获阶段 */
+function handleSourceControlShortcut(event: KeyboardEvent) {
+  if (!event.ctrlKey || event.altKey || !event.shiftKey) return;
+  if (event.key.toLowerCase() !== "g") return;
+
+  event.preventDefault();
+  showSourceControlView();
+}
+
+// 换工作区（打开 / 关闭 / 启动时恢复）就重新问一遍 git。
+// ★ 用 watch 而不是在 openFolder 里手动调 —— 设置 workspaceRoot 的地方有好几处
+//   （打开文件夹、恢复上次的、关闭置空、恢复失败时清掉），
+//   挨个去加调用必然漏掉一处，而漏掉的表现是「列表还是上一个仓库的改动」
+watch(workspaceRoot, () => void refreshGitStatus(), { immediate: true });
+
 // ---------- 可拖拽的分隔条 ----------
 //
 // VS Code 的布局是「嵌套的框 + 夹在相邻框之间的分隔条」（它把那缝叫 sash）：
@@ -2704,6 +2951,7 @@ const menus = computed<Menu[]>(() => {
       { label: "命令面板…", shortcut: "Ctrl+Shift+P", run: () => openQuickOpen("commands") },
       { label: "转到文件…", shortcut: "Ctrl+P", run: () => openQuickOpen("files") },
       { label: "在文件中查找", shortcut: "Ctrl+Shift+F", run: showSearchView },
+      { label: "源代码管理", shortcut: "Ctrl+Shift+G", run: showSourceControlView },
       { separator: true },
       {
         label: "后退",
@@ -3105,6 +3353,9 @@ onMounted(async () => {
   // 在文件中查找（Ctrl+Shift+F）。捕获阶段同样必要
   window.addEventListener("keydown", handleSearchShortcut, true);
 
+  // 源代码管理（Ctrl+Shift+G）。同理
+  window.addEventListener("keydown", handleSourceControlShortcut, true);
+
   // 拦窗口关闭：有未保存的改动就先问一句。
   //
   // ★ 这是官方文档给的范式：**只在需要拦住的时候才 preventDefault**。
@@ -3147,6 +3398,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleQuickOpenShortcut, true);
   window.removeEventListener("keydown", handleNavigateShortcut, true);
   window.removeEventListener("keydown", handleSearchShortcut, true);
+  window.removeEventListener("keydown", handleSourceControlShortcut, true);
   // 拆掉状态桥：它抓着编辑器实例和 model，留着就是泄漏
   provideEditorBridge(null);
   unlistenClose?.();
@@ -3163,6 +3415,12 @@ onUnmounted(() => {
   cursorSubscription?.dispose();
   fontSizeSubscription?.dispose();
   editorInstance.value?.dispose();
+
+  // diff 浮层的编辑器和它的两个 model 也要收 ——
+  // 它们不走 `models` 那张表（那是主编辑器用的），漏掉就是纯泄漏
+  diffEditor?.dispose();
+  diffEditor = null;
+  disposeDiffModels();
 
   // editor.dispose() 不会连带释放它用过的 model —— 必须自己关。
   // 否则这些 model 会一直留在 Monaco 的全局注册表里
@@ -3670,6 +3928,32 @@ watch(activeTabPath, async (path) => {
               <path d="M3 6a2 2 0 0 1 2-2h3.5l2 2.5H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
             </svg>
           </button>
+
+          <!-- 源代码管理：刷新按钮。
+               ★ 和文件树那个「打开文件夹」同一个位置、同一套 .sidebar-action ——
+                 视图不同、动作不同，但「标题右边那个操作」这个角色是一样的 -->
+          <button
+            v-else-if="activeView === 'scm'"
+            class="sidebar-action"
+            type="button"
+            :disabled="gitBusy || !workspaceRoot"
+            title="刷新"
+            @click="refreshGitStatus"
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="16"
+              height="16"
+              fill="none"
+              stroke="currentColor"
+              stroke-width="1.8"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            >
+              <path d="M20 12a8 8 0 1 1-2.34-5.66" />
+              <path d="M20 4v4h-4" />
+            </svg>
+          </button>
         </div>
 
         <!-- 树单独包一层滚动容器，否则标题栏会跟着一起滚走 -->
@@ -3746,6 +4030,36 @@ watch(activeTabPath, async (path) => {
           </div>
         </div>
 
+        <!-- 源代码管理视图。
+             ★ 五条分支的**顺序**有讲究：先排除「没打开文件夹」，
+               再排除「真出错」，最后才是三种「正常但没内容」的情况 ——
+               顺序反了会出现「没打开文件夹却提示不是 git 仓库」 -->
+        <div v-else-if="activeView === 'scm'" class="sidebar-scm">
+          <p v-if="!workspaceRoot" class="sidebar-empty">还没有打开文件夹</p>
+          <p v-else-if="gitError" class="tree-error">{{ gitError }}</p>
+          <!-- ★ gitChecked 是关键：没查过时 isRepo 也是 false，
+               不加这个判断就会先闪一句「不是 git 仓库」再变成文件列表 -->
+          <p v-else-if="!gitChecked" class="sidebar-empty">正在检查…</p>
+          <p v-else-if="!gitIsRepo" class="sidebar-empty">这个文件夹不是 git 仓库</p>
+          <p v-else-if="gitRows.length === 0" class="sidebar-empty">没有改动</p>
+
+          <div v-else class="scm-list">
+            <button
+              v-for="row in gitRows"
+              :key="row.change.relative"
+              class="scm-item"
+              type="button"
+              :title="`${row.change.relative} — ${row.change.label}`"
+              @click="openGitDiff(row.change)"
+            >
+              <span class="scm-name">{{ row.name }}</span>
+              <!-- 目录名要能收缩：长路径不能把右边的状态字母挤出侧栏 -->
+              <span class="scm-dir">{{ row.dir }}</span>
+              <span class="scm-badge" :class="row.tone">{{ row.badge }}</span>
+            </button>
+          </div>
+        </div>
+
       </aside>
 
       <!-- 侧栏和编辑区之间的分隔条：拖它改侧栏宽度。
@@ -3787,14 +4101,22 @@ watch(activeTabPath, async (path) => {
              ★ 和图片预览同一套路 —— 盖在 Monaco 上面，定位基准是 .editor-area。
              ★ 用 Monaco 自己的 `createDiffEditor` 而不是自己画 diff：
                它本来就是干这个的，而且看到的东西和 VS Code 里一致 -->
-        <div v-if="reviewingDiff" class="diff-review">
+        <div v-if="viewingDiff" class="diff-review">
           <div class="diff-review-bar">
-            <span class="diff-review-path" :title="reviewingDiff.path">
-              {{ reviewingDiff.path }}
+            <span class="diff-review-path" :title="viewingDiff.path">
+              {{ viewingDiff.path }}
             </span>
             <div class="diff-review-actions">
-              <button class="diff-review-accept" type="button" @click="acceptReview">保留</button>
-              <button class="diff-review-reject" type="button" @click="rejectReview">撤销</button>
+              <!-- 只有「待审」的改动才有保留 / 撤销；
+                   只读 diff（比如看某个文件的改动）纯看不带按钮 -->
+              <template v-if="viewingDiff.mode === 'review'">
+                <button class="diff-review-accept" type="button" @click="acceptReview">
+                  保留
+                </button>
+                <button class="diff-review-reject" type="button" @click="rejectReview">
+                  撤销
+                </button>
+              </template>
               <button class="diff-review-close" type="button" title="关闭" @click="closeReview">
                 ×
               </button>
@@ -4640,6 +4962,86 @@ watch(activeTabPath, async (path) => {
   font-size: 12px;
 }
 
+/* ---------- 源代码管理视图 ---------- */
+
+/* 和 .sidebar-tree / .sidebar-search 同一套职责：吃掉剩余高度，自己滚 */
+.sidebar-scm {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.scm-list {
+  padding: 0 4px 8px;
+}
+
+/* 一行：文件名 + 目录 + 状态字母。
+   ★ 结构上和 .search-file 几乎一样，但**不共用类名** ——
+     搜索那边整行是「标题」，这边整行是「可点的条目」，
+     将来改一边不该牵动另一边 */
+.scm-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 8px;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.scm-item:hover {
+  background: var(--color-hover);
+}
+
+/* 文件名不收缩也不截断？—— 要截断。超长文件名得让位给目录和状态字母 */
+.scm-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 目录能收缩，而且比文件名更愿意让位（flex-shrink 默认都是 1，
+   但文件名有 min-width: 0，谁先缩看谁的基础宽度大，不用额外设权重）*/
+.scm-dir {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 状态字母顶到最右边 —— margin-left: auto 比靠前面的元素撑开可靠 */
+.scm-badge {
+  flex: 0 0 auto;
+  margin-left: auto;
+  min-width: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-align: right;
+}
+
+.scm-badge.is-modified {
+  color: var(--color-git-modified);
+}
+
+.scm-badge.is-new {
+  color: var(--color-git-new);
+}
+
+.scm-badge.is-deleted {
+  color: var(--color-git-deleted);
+}
+
 /* 读目录失败时的提示（路径不存在、权限不足等） */
 .tree-error {
   margin: 8px;
@@ -4796,15 +5198,18 @@ watch(activeTabPath, async (path) => {
   z-index: 0;
 }
 
-/* ---------- 图片预览层 ---------- */
-
-/* inset 的四个值对应 上 / 右 / 下 / 左。
-   上边空出标签栏的高度，所以它正好盖住 Monaco 那一块 */
-/* 改动审阅浮层。和 .image-preview 同一套路：盖住标签栏以下的整个编辑区 */
+/* 改动审阅浮层。和 .image-preview 同一套路：盖住标签栏以下的整个编辑区。
+   ★★ z-index 是 **2**，比欢迎页 / 图片预览（都是 1）高一层。
+     为什么它非得更高：**它不依赖「有没有打开文件」** ——
+     源代码管理里点一条改动就要弹 diff，而那时可能一个标签都没开、欢迎页正盖着。
+     三层的 z-index 相同的话，按 CSS 绘制顺序**后面 DOM 里的赢**，
+     于是 diff 会被欢迎页整个盖住（症状：点了没反应，其实早就渲染好了）。
+     欢迎页和图片预览之间不会打架：图片预览要 `activeTabPath` 是张图，
+     那时候欢迎页（`!activeTabPath`）必然不在 */
 .diff-review {
   position: absolute;
   inset: var(--tabbar-offset, 0px) 0 0 0;
-  z-index: 1;
+  z-index: 2;
   display: flex;
   flex-direction: column;
   background: var(--color-editor-bg);
@@ -4866,11 +5271,16 @@ watch(activeTabPath, async (path) => {
   min-height: 0;
 }
 
+/* ---------- 图片预览层 ---------- */
+
+/* inset 的四个值对应 上 / 右 / 下 / 左。
+   上边空出标签栏的高度，所以它正好盖住 Monaco 那一块 */
 .image-preview {
   position: absolute;
   inset: var(--tabbar-offset) 0 0 0;
   /* 只要比 .editor 那个「盒子」（z-index: 0）大就行 ——
-     不用也没必要去追 Monaco 内部的 z-index 到底用了多少 */
+     不用也没必要去追 Monaco 内部的 z-index 到底用了多少。
+     和欢迎页同层：两者互斥（要有标签才有图，没标签才显示欢迎页），不会打架 */
   z-index: 1;
   /* 居中**不靠** justify-content，交给 img 的 margin: auto（见下面那条注释）。
      另外这层还能滚 —— 图放大到溢出之后靠它平移到看得见的部分 */
@@ -5510,6 +5920,14 @@ kbd {
        半透明能叠在上面而不把它盖掉 */
   --color-search-hit: rgba(120, 170, 255, 0.28);
 
+  /* 源代码管理里那个状态字母的颜色（M / U / D）。
+     ★ 主题文件里**没有** `gitDecoration.*` 这些键 —— 它们属于 VS Code
+       代码里的默认值，和 `terminal.ansi*` 是同一类情况。
+       所以这里是写死的两套，值照搬 VS Code 本身的默认值 */
+  --color-git-modified: #e2c08d;
+  --color-git-new: #73c991;
+  --color-git-deleted: #c74e39;
+
   /* 快捷键帽（kbd）。故意用**半透明灰**而不是实色 ——
      深浅两套主题可以共用同一组值（下面浅色主题不用再写一遍） */
   --color-kbd-bg: rgba(128, 128, 128, 0.17);
@@ -5586,6 +6004,12 @@ kbd {
   --color-link: #0066bf;
 
   --color-search-hit: rgba(0, 100, 200, 0.22);
+
+  /* 浅色下这三个色必须换 —— 深色那套是给深底挑的：
+     #e2c08d（淡黄）和 #73c991（亮绿）铺在白底上直接发糊 */
+  --color-git-modified: #895503;
+  --color-git-new: #007100;
+  --color-git-deleted: #ad0707;
   --color-menubar-bg: #dddddd;
   --color-menubar-hover: #c4c4c4;
   --color-menu-bg: #ffffff;

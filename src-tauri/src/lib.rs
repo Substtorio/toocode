@@ -634,9 +634,256 @@ fn scan_theme_extensions() -> Result<Vec<ThemeEntry>, String> {
     Ok(entries)
 }
 
+// ---------- 源代码管理（git）----------
+//
+// ★ 为什么直接调 `git` 命令，而不是引一个 git 库（git2 / gix）：
+//   · git2 要拖一个 libgit2 的 C 依赖 —— 编译慢、体积大，
+//     而体积小正是 Tauri 相对 Electron 的主要卖点
+//   · 我们只要「看一眼 status」和「拿 HEAD 版本」，命令行完全够用
+//   · 用户机器上本来就装着 git（他一直在用它管这个项目）
+//
+// ⚠ 唯一要防的是 **PATH 里没有 git** —— GUI 应用启动时拿到的环境变量
+//   可能和终端里不一样（找 VS Code 安装目录那次已经踩过同一个坑）。
+//   所以找不到时要给一句人能看懂的话，而不是一个裸的 os error
+
+#[derive(Serialize)]
+struct GitChange {
+    /// 绝对路径。前端拿它去读文件、开 diff
+    path: String,
+    /// 相对仓库根的路径。列表里显示这个 —— 同名文件只能靠它区分
+    relative: String,
+    /// 两列状态码，比如 "M " / " M" / "??" / "R "
+    status: String,
+    /// 翻译成人话（「已修改」「未跟踪」…）
+    label: String,
+}
+
+#[derive(Serialize)]
+struct GitStatus {
+    /// 这个文件夹是不是 git 仓库。不是的话前端显示一句说明，而不是报错
+    is_repo: bool,
+    /// 仓库根的绝对路径
+    root: String,
+    changes: Vec<GitChange>,
+}
+
+/// 跑一条 git 命令，拿 stdout
+fn run_git(dir: &str, args: &[&str]) -> Result<String, String> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(dir).args(args);
+
+    // ★ 不让 Windows 给这个子进程单独开一个控制台窗口。
+    //   Tauri 的 exe 是 GUI 子系统、自己**没有**控制台 ——
+    //   这种进程启动「控制台程序」（git.exe 就是）时，Windows 会新分配一个，
+    //   屏幕上就是黑框闪一下。git_status 每次开文件夹 / 点刷新都要跑一遍，
+    //   不关的话会一直闪
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = command
+        .output()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "找不到 git 命令。确认一下 git 装在系统 PATH 里 —— \
+                 Tauri 应用启动时的 PATH 可能和终端里不一样"
+                    .to_string()
+            } else {
+                format!("执行 git 失败：{error}")
+            }
+        })?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// 解析 `git status --porcelain=v1 -z` 的输出
+///
+/// ★ 为什么用 `-z` 而不是默认格式：默认格式会把**含空格或中文的文件名**
+///   用引号包起来、还要转义，解析时得处理一堆特殊情况。
+///   `-z` 用 NUL 分隔、不做任何转义 —— 名字长什么样就长什么样
+///
+/// ⚠ 重命名（R）会**多一个字段**：格式是 `XY <新名>\0<旧名>\0`。
+///   不把多出来那个吃掉，后面的条目就会**全部错位**
+fn parse_git_status(raw: &str, root: &str) -> Vec<GitChange> {
+    let mut out = Vec::new();
+    let mut parts = raw.split('\0');
+
+    while let Some(entry) = parts.next() {
+        // "XY <路径>" 最短也要 4 个字节（两个状态码 + 一个空格 + 一个字符）
+        if entry.len() < 4 {
+            continue;
+        }
+
+        // ★ 按字节切在这里是安全的：前两个字节一定是 ASCII 状态码，
+        //   第 3 个字节是空格，所以下标 3 一定落在「文件名的开头」这个字符边界上
+        let status = &entry[..2];
+        let relative = entry[3..].to_string();
+
+        // 重命名 / 复制：后面还跟着一个「旧路径」字段
+        if status.starts_with('R') || status.starts_with('C') {
+            parts.next();
+        }
+
+        out.push(GitChange {
+            path: format!("{root}/{relative}"),
+            relative,
+            status: status.to_string(),
+            label: git_status_label(status),
+        });
+    }
+
+    out
+}
+
+/// 把两列状态码翻译成一句人话
+fn git_status_label(status: &str) -> String {
+    if status == "??" {
+        return "未跟踪".to_string();
+    }
+
+    let mut chars = status.chars();
+    let staged = chars.next().unwrap_or(' ');
+    let worktree = chars.next().unwrap_or(' ');
+
+    let mut parts: Vec<&str> = Vec::new();
+
+    // 第一列 = 暂存区（和 HEAD 比）
+    match staged {
+        'M' => parts.push("已暂存：修改"),
+        'A' => parts.push("已暂存：新增"),
+        'D' => parts.push("已暂存：删除"),
+        'R' => parts.push("已暂存：重命名"),
+        'C' => parts.push("已暂存：复制"),
+        _ => {}
+    }
+
+    // 第二列 = 工作区（和暂存区比）
+    match worktree {
+        'M' => parts.push("已修改"),
+        'D' => parts.push("已删除"),
+        'T' => parts.push("类型变了"),
+        _ => {}
+    }
+
+    if parts.is_empty() {
+        status.to_string()
+    } else {
+        parts.join("，")
+    }
+}
+
+/// 列出工作区里所有改动（含未跟踪文件）
+#[tauri::command]
+async fn git_status(path: String) -> Result<GitStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        // 先问仓库根在哪 —— status 输出里的路径都是**相对仓库根**的，
+        // 而前端要的是绝对路径
+        let root = match run_git(&path, &["rev-parse", "--show-toplevel"]) {
+            Ok(text) => text.trim().replace('\\', "/"),
+            // ★ 「不是 git 仓库」是一种**正常状态**，不是错误 ——
+            //   用户完全可能随手打开一个普通文件夹
+            Err(_) => {
+                return Ok(GitStatus {
+                    is_repo: false,
+                    root: String::new(),
+                    changes: Vec::new(),
+                })
+            }
+        };
+
+        let raw = run_git(&path, &["status", "--porcelain=v1", "-z"])?;
+
+        // ★ 必须先把 changes 算出来，再建结构体 —— 上面那个字段会把 `root`
+        //   **move** 进去，写在同一行里就成了「先 move、再借用」
+        let changes = parse_git_status(&raw, &root);
+
+        Ok(GitStatus {
+            is_repo: true,
+            root,
+            changes,
+        })
+    })
+    .await
+    .map_err(|error| format!("查询 git 状态失败：{error}"))?
+}
+
+/// 拿一个文件在 HEAD（上一次提交）时的内容 —— 给 diff 当「左边那一份」
+///
+/// ⚠ 新文件（还没提交过）在 HEAD 里根本不存在。这不是错误：
+///   返回空串就行，diff 左边空着，看起来正是「新加了一个文件」
+#[tauri::command]
+async fn git_show_head(path: String, relative: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let spec = format!("HEAD:{relative}");
+        match run_git(&path, &["show", &spec]) {
+            Ok(text) => Ok(text),
+            Err(_) => Ok(String::new()),
+        }
+    })
+    .await
+    .map_err(|error| format!("读取 HEAD 版本失败：{error}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- 源代码管理（git status 的解析）----------
+
+    /// 常规条目：工作区改动 / 暂存区改动 / 未跟踪
+    #[test]
+    fn parses_git_status_output() {
+        let raw = " M src/App.vue\0A  new.ts\0?? 没跟踪的文件.txt\0";
+        let changes = parse_git_status(raw, "D:/demo");
+
+        assert_eq!(changes.len(), 3);
+
+        assert_eq!(changes[0].path, "D:/demo/src/App.vue");
+        assert_eq!(changes[0].relative, "src/App.vue");
+        assert_eq!(changes[0].label, "已修改");
+
+        assert_eq!(changes[1].label, "已暂存：新增");
+
+        // ★ 空格和中文都原样保留 —— 这正是用 `-z` 的理由：
+        //   默认格式会把这种文件名加引号加转义，解析要写一堆特例
+        assert_eq!(changes[2].relative, "没跟踪的文件.txt");
+        assert_eq!(changes[2].path, "D:/demo/没跟踪的文件.txt");
+        assert_eq!(changes[2].label, "未跟踪");
+    }
+
+    /// ★ 重命名会多一个字段，不跳过的话后面的条目会**全部错位**
+    #[test]
+    fn handles_rename_entries() {
+        let raw = "R  new-name.ts\0old-name.ts\0 M other.ts\0";
+        let changes = parse_git_status(raw, "D:/demo");
+
+        assert_eq!(changes.len(), 2, "重命名的旧路径不该被当成一条改动");
+        assert_eq!(changes[0].relative, "new-name.ts");
+        assert_eq!(changes[0].label, "已暂存：重命名");
+        assert_eq!(changes[1].relative, "other.ts");
+        assert_eq!(changes[1].label, "已修改");
+    }
+
+    /// 两列都有值时要把两边都说清楚
+    #[test]
+    fn labels_both_columns() {
+        assert_eq!(git_status_label("MM"), "已暂存：修改，已修改");
+        assert_eq!(git_status_label(" M"), "已修改");
+        assert_eq!(git_status_label("M "), "已暂存：修改");
+        assert_eq!(git_status_label("??"), "未跟踪");
+    }
+
+    #[test]
+    fn handles_empty_git_status() {
+        assert!(parse_git_status("", "D:/demo").is_empty());
+    }
 
     // ---------- 全文搜索 ----------
 
@@ -1793,7 +2040,9 @@ pub fn run() {
             save_secret,
             has_secret,
             clear_secret,
-            chat_stream
+            chat_stream,
+            git_status,
+            git_show_head
         ])
         // 终端会话表。放在 State 里而不是全局变量 —— Tauri 会管它的生命周期
         .manage(PtyState::default())

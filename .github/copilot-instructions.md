@@ -112,8 +112,8 @@
   ⚠ 用 `repeat(auto-fit, minmax(240px, 1fr))` 而不是固定 `1fr 1fr` ——
   窗口窄时自动堆叠成一栏。定死两栏的话每栏只有 169px，快捷键行会溢出被裁
   ★ **快捷键表只列「真实生效」的**：写上去一条按了没反应的，比不写还糟。
-    现在 12 条，每一条都能在 `handleKeydown` / `handlePanelShortcut` / `handleSearchShortcut`
-    或 Monaco 内置 action 里找到出处 —— 分六组排（文件 / 侧栏视图 / 面板 / 导航 / 编辑器 / 字号），
+    现在 15 条，每一条都能在 `handleKeydown` / `handlePanelShortcut` / `handleSearchShortcut`
+    或 `handleSourceControlShortcut` 或 Monaco 内置 action 里找到出处 —— 分六组排（文件 / 侧栏视图 / 面板 / 导航 / 编辑器 / 字号），
     加新快捷键就往数组里追一项
   ⚠ ★ **验证欢迎页的技巧**：它有 `v-if="!activeTabPath"`，而 hot exit 会在
     `beforeunload` 时把标签写回 localStorage，**未命名文档又永不为干净** ⇒
@@ -921,6 +921,70 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
     - 不支持片段变量（`$TM_FILENAME` / `$CURRENT_YEAR`），会原样插进去
     - 没写 `language` 的「全局片段」跳过
 
+- [x] **源代码管理（git 状态 + 看 diff）—— 插件机制之后的第一块「工作台」能力**：
+  数据流：切工作区 → `invoke("git_status")` → 列表；
+         点一条 → `invoke("git_show_head")`（HEAD 版本）+ `invoke("read_file")`（磁盘版本）
+                → 复用 diff 浮层
+  ★★ **不引任何 git 库**：Rust 侧就是 `Command::new("git")`。VS Code 自己也这么干 ——
+    引 libgit2 那类绑定要多背一个 C 库，还得处理证书 / 配置兼容，不值当
+  ★ **两列状态码是两件事**：`git status` 给的两位分别是「暂存区」和「工作区」
+    （` M` / `M ` / `MM`）。VS Code 列表里显示的是**第二列** ——
+    那才是「用户眼前这份文件是什么状态」；只有第二列是空格才退回第一列。
+    未跟踪 `??` 要显示成 `U`（不是 `?`）
+  ★★ **`--porcelain=v1 -z` 而不是默认格式**：默认格式会把含空格或中文的文件名
+    加引号 + 转义，解析时一堆特殊情况；`-z` 用 NUL 分隔、不做任何转义。
+    ⚠ 重命名（`R`）会**多一个字段**（`XY <新名>\0<旧名>\0`）——
+      不把多出来那个吃掉，**后面的条目会全部错位**，而且看起来像「文件状态全是乱的」
+  ★ 「不是 git 仓库」是**正常状态**，不是错误：`rev-parse --show-toplevel` 失败时
+    返回 `is_repo: false`，前端显示一句说明。用户完全可能随手打开一个普通文件夹
+  ★★ **`Command` 在 Windows 上会闪一个黑框** —— Tauri 的 exe 是 GUI 子系统、
+    自己**没有**控制台，这种进程启动「控制台程序」（git.exe 就是）时
+    Windows 会**新分配一个**。加 `#[cfg(windows)] creation_flags(CREATE_NO_WINDOW)`
+    （`0x0800_0000`）关掉。每次刷新都跑一遍，不关会一直闪
+  ★★ **字段名是 snake_case**：Rust 侧没写 `rename_all = "camelCase"`，
+    所以序列化出来就是 `is_repo` / `relative` 这些**字段原名**。
+    Tauri 只会自动把**命令参数**从 camelCase 转 snake_case，**返回值它不管** ——
+    写错了不报错，只会拿到 `undefined`（列表一个文件都没有，看着像「没有改动」）
+  ★★ **diff 浮层抽成了「一种形状、两个来源」**：`viewingDiff` 是个 computed，
+    把「Topilot 待审的改动」和「git 只读 diff」**折算成同一个形状**
+    （路径 + 原内容 + 新内容 + 模式），模板只认这个形状。
+    不这么做的话「显示 diff」会被抄成两套，两边迟早不一致
+    - `review`   —— 有「保留 / 撤销」两个按钮（写盘走 `acceptChange`）
+    - `readonly` —— 纯看，一个按钮都没有
+    ★ `closeReview()` 要**两个来源都清**（`externalDiff` + `reviewChange(null)`），
+      只清一个的话浮层会立刻又弹回来
+  ★★ **`disposeDiffModels` 的调用时机踩到了**（只在「第一个 diff → 第二个 diff」时暴露）：
+    先 `dispose` 再 `setModel` 会当场报
+    `TextModel got disposed before DiffEditorWidget model got reset` ——
+    因为销毁那一刻编辑器还指着那两个 model。
+    正确顺序是「**先建新的、换上去，最后才销毁旧的**」，中间不留空档。
+    ★ 通用教训：**换掉一个被别处引用着的东西，顺序永远是「先接上新的，再拆旧的」**
+  ★★ **z-index 三层不够用**（浮层被欢迎页整个盖住）：
+    `.editor` 是盒子（0），`.welcome` / `.image-preview` / `.diff-review` 都是 1 ——
+    而按 CSS 绘制顺序**后面 DOM 里的赢**，`.welcome` 在最后 ⇒
+    源代码管理点一条改动时（一个标签都没开、欢迎页正盖着）**diff 根本看不见**，
+    症状是「点了没反应」，其实早就渲染好了。
+    ⇒ `.diff-review` 提到 **2**：它和另外两个浮层的区别是
+      **它不依赖「有没有打开文件」**，所以必须能盖住欢迎页。
+      欢迎页和图片预览之间不会打架（图片预览要 `activeTabPath` 是张图，
+      那时欢迎页必然不在）
+    ⚠ 查这类问题的利器还是 `document.elementFromPoint(x, y)` ——
+      直接问浏览器「那一点上是谁」，比看 z-index 猜快得多
+  ★ **`gitChecked` 和 `gitIsRepo` 是两个状态**：刚开始也是 `isRepo: false`，
+    但那时的正确文案是「正在检查…」。用一个布尔表达两个状态，界面会先闪一句错的
+  ★ **刷新触发用 `watch(workspaceRoot, ..., { immediate: true })`**，不在
+    `openFolder` 里手动调 —— 设置 `workspaceRoot` 的地方有好几处
+    （打开 / 恢复上次的 / 关闭置空 / 恢复失败时清掉），挨个加必然漏，
+    而漏掉的表现是「列表还是上一个仓库的改动」
+  ★ **diff 的 `updated` 取磁盘、不取编辑器**（和 Topilot 那边「model 优先」的规则不冲突）：
+    `git_status` 比较的就是「HEAD ↔ 磁盘」，拿编辑器里没保存的内容会出现
+    「列表说这个文件没改，点进去却一堆差异」。两边问的是不同问题 ——
+    一边是「用户现在屏幕上是什么」，一边是「git 眼里改了什么」
+  ★ 状态字母的颜色**写死两套**（`--color-git-modified` / `-new` / `-deleted`）：
+    主题文件里**没有** `gitDecoration.*` 这些键，它们属于 VS Code 代码里的默认值
+    （和 `terminal.ansi*` 同一类情况）。浅色必须换 ——
+    深色那套 `#e2c08d`（淡黄）/ `#73c991`（亮绿）铺在白底上直接发糊
+
 ### 待办（按优先级）
 
 1. **LSP / 智能提示**。可以直接复用 `loadSyntaxExtensions()` 建好的那份「扩展名 → 语言 id」表
@@ -937,12 +1001,14 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
 5. **【已定方向，后期再做】文件/符号索引引入数据库**：用于全项目搜索加速，届时才选型（倾向 SQLite）。
    这是真需求驱动才引入，不要为凑简历硬加。
 6. **【进行中】活动栏加更多视图图标**：搜索视图已加（见上面「全项目搜索」那条，
-   `activeView` 已经和 `sidebarVisible` 拆开了）。
-   **🔜 待加：源代码管理 / 运行和调试**（「扩展」暂不做）。
+   `activeView` 已经和 `sidebarVisible` 拆开了）；**源代码管理已加**（见上面那条）。
+   **🔜 只剩「运行和调试」**（「扩展」暂不做）。
    ⚠ 加之前先想清楚「它背后有没有真东西」—— 一个点不动的空图标比不放更糟：
-   · **源代码管理**：最低限度得能列出改动文件（`git status`）+ 点开看 diff。
-     这个能做成真东西，不需要任何新依赖 —— Rust 侧跑 `git` 命令就行
+   · ~~**源代码管理**~~：✅ 已完成 —— 列出改动文件（`git status`）+ 点开看 diff，
+     Rust 侧跑 `git` 命令，没引任何新依赖
    · **运行和调试**：要接 DAP（调试适配器协议），和 LSP 是同一个量级，得单独排期
+   ★ 顺带记一笔：活动栏图标天生是**单选**的（`activeView` 只能有一个值），
+     所以「能同时开着」的东西不能塞进来（Topilot 就因此挪去了右侧）
 7. **【已完成】Toocode 自己的 logo / 应用图标**：
    ✅ 图形是「圆角方形底 + 一个 `>` 加一条下划线」（终端提示符）——
       两笔、单色、小尺寸下也认得出来。配色只用两个：底 `#1b1f24`、符号 `#e6edf3`。
