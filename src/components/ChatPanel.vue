@@ -61,6 +61,69 @@ function loadConfig(): StoredConfig {
 
 const config = ref<StoredConfig>(loadConfig());
 
+/**
+ * 已知模型：**调用名 → 版本名**的对照表。
+ *
+ * ★★ 为什么要这张表：`deepseek-chat` 这种是**给接口看的 slug** ——
+ *   它既不说明是哪个版本、也不说明有多大。而配置界面那一栏是给**人**看的，
+ *   人想知道的是「我在跟哪个模型说话」。
+ *   所以界面显示**版本名**，请求里照旧发**调用名**（少了任何一个都不行）
+ *
+ * ★ 表里没有的调用名照旧原样显示：兼容接口太多
+ *   （通义 / Ollama / LM Studio 的模型名五花八门），
+ *   硬要穷举只会得到一个永远不全的列表 —— 想加一个模型就往这里追一行
+ */
+const MODEL_PRESETS: ReadonlyArray<{ id: string; label: string }> = [
+  { id: "deepseek-chat", label: "DeepSeek V4.1 Flash" },
+  { id: "deepseek-reasoner", label: "DeepSeek V4.1 Thinking" },
+];
+
+/** 下拉里那个「自定义…」的哨兵值。用一个真实 id 不可能是的字符串 */
+const CUSTOM_MODEL = "\u0000custom";
+
+/**
+ * 调用名 → 版本名；表里没有就返回 null。
+ *
+ * ⚠ 刻意**不**在查不到时返回调用名 ——「这是个已知模型的版本名」和
+ *   「这是个我们不认识的 id」是两件事，混在一起就没法判断
+ *   「该不该显示自定义输入框」了
+ */
+function modelLabel(id: string): string | null {
+  return MODEL_PRESETS.find((preset) => preset.id === id)?.label ?? null;
+}
+
+/** 工具栏 / 下拉框上显示的那个名字：认识的显示版本名，不认识的照原样 */
+function modelDisplayName(id: string): string {
+  return modelLabel(id) ?? id;
+}
+
+/**
+ * 现在是不是「自己填调用名」的状态。
+ *
+ * ⚠ 它**不是** `config.model` 的第二份拷贝 —— `config.model` 依旧是唯一的真相，
+ *   这里记的是「模型那一栏现在用哪种方式编辑」。
+ *   之所以要单独一个开关（而不是普通的「查不到版本名 = 自定义」那种反推）：
+ *   切到「自定义」时我们**要保留原来的调用名当草稿**，
+ *   否则用户想把 `deepseek-chat` 改成 `deepseek-chat-v2` 就得整个重打一遍；
+ *   而只要保留着取值，「是不是已知模型」这个反推判据就失效了
+ */
+const customModel = ref(modelLabel(config.value.model) === null);
+
+/**
+ * 下拉框绑的值。
+ *
+ * ★ 用**计算属性 + setter**，不给模板里挂一串 `@change` 处理器 ——
+ *   「选了什么」和「存了什么」的对应关系只写在这一处
+ */
+const modelChoice = computed({
+  get: () => (customModel.value ? CUSTOM_MODEL : config.value.model),
+  set: (value: string) => {
+    customModel.value = value === CUSTOM_MODEL;
+    // 选「自定义」时**不**动 config.model（那是留给用户改的草稿）
+    if (value !== CUSTOM_MODEL) config.value.model = value;
+  },
+});
+
 /** 密钥配了没有。null = 还没问过 */
 const hasKey = ref<boolean | null>(null);
 const keyInput = ref("");
@@ -82,6 +145,10 @@ const showSetup = computed(() => hasKey.value !== true || editingConfig.value);
 /** 没配过密钥时才必须填；已有密钥时留空表示「只改地址 / 模型，不动密钥」 */
 const canSaveConfig = computed(() => {
   if (savingKey.value) return false;
+  // ★ 模型名不能空：空字符串发出去接口必然报错，
+  //   而且报的是一句「model is required」这种指不到我们这一行的错。
+  //   它同时也管住了「选了自定义但还没填完」那一瞬间
+  if (config.value.model.trim() === "") return false;
   if (keyInput.value.trim() !== "") return true;
   // 留空：只有「已经配过」才允许保存
   return hasKey.value === true;
@@ -606,10 +673,36 @@ function onChatLogClick(event: MouseEvent) {
         <input v-model="config.baseUrl" type="text" spellcheck="false" />
       </label>
 
+      <!-- 模型：**显示版本名、存调用名**，两者的区别见上面 MODEL_PRESETS 的说明。
+           ★ 用下拉框而不是文本框：常用模型就那么几个，手填 slug 纯属浪费
+           ★ 但保留了「自定义」—— 兼容接口太多，穷举不完 -->
       <label class="chat-field">
         <span>模型</span>
-        <input v-model="config.model" type="text" spellcheck="false" />
+        <select v-model="modelChoice">
+          <option v-for="preset in MODEL_PRESETS" :key="preset.id" :value="preset.id">
+            {{ preset.label }}
+          </option>
+          <option :value="CUSTOM_MODEL">自定义…</option>
+        </select>
       </label>
+
+      <!-- 自定义时才出来填调用名的地方。
+           默认值就是原来的调用名，改一个字符就行，不用重打 -->
+      <label v-if="customModel" class="chat-field">
+        <span>模型调用名</span>
+        <input
+          v-model="config.model"
+          type="text"
+          spellcheck="false"
+          placeholder="接口那边认的模型 id，如 deepseek-chat"
+        />
+      </label>
+
+      <!-- ★ 调用名**始终**露一行：真发出去的就是它，
+           排错（比如 404）看的就是它。把它藏起来 = 出问题时无从下手 -->
+      <p class="chat-model-note">
+        接口收到的模型名：<code>{{ config.model || "（还没填）" }}</code>
+      </p>
 
       <label class="chat-field">
         <span>API 密钥</span>
@@ -653,16 +746,17 @@ function onChatLogClick(event: MouseEvent) {
            ★ 「配置」也挪上来：它和「发送」毫无关系，混在一排会让人以为
              那一排都是「发送相关的」 -->
       <div class="chat-toolbar">
-        <!-- 入口不再是纯图标按钮，而是「图标 + 当前模型名」的框。
+        <!-- 入口不再是纯图标按钮，而是「图标 + 当前模型」的框。
              两个理由：
              ① 模型名是「我现在在跟谁说话」的关键信息，藏在配置面板里等于没有
              ② `title` 提示只有鼠标停下来才看得到 —— 而模型名经常需要瞄一眼确认
-             ★ 框宽**跟着名字走**（不设固定宽度）—— 模型名长短能差三倍
-             （`deepseek-chat` ↔ `deepseek-ai/DeepSeek-V3.2-Exp`） -->
+             ★ 显示的是**版本名**（`DeepSeek V4.1 Flash`），不是调用名 ——
+               和配置里那一栏保持同一套叫法，否则两边会对不上
+             ★ 框宽**跟着名字走**（不设固定宽度）—— 模型名长短能差三倍 -->
         <button
           class="chat-model"
           type="button"
-          :title="`配置 Topilot（当前模型：${config.model}）`"
+          :title="`配置 Topilot（当前模型：${modelDisplayName(config.model)}）`"
           @click="editingConfig = true"
         >
           <!-- 调节滑块 —— 比齿轮更贴「调整参数」这个意思 -->
@@ -680,7 +774,7 @@ function onChatLogClick(event: MouseEvent) {
             <circle cx="9.2" cy="5" r="1.9" />
             <circle cx="6.8" cy="11" r="1.9" />
           </svg>
-          <span class="chat-model-name">{{ config.model }}</span>
+          <span class="chat-model-name">{{ modelDisplayName(config.model) }}</span>
         </button>
 
         <button
@@ -971,8 +1065,14 @@ function onChatLogClick(event: MouseEvent) {
   color: var(--color-text-dim);
 }
 
-.chat-field input {
+.chat-field input,
+.chat-field select {
   height: 26px;
+  /* ⚠ `box-sizing` 必须显式写。Chrome 的 UA 样式给 `<select>` 设了
+     `box-sizing: border-box`，而 `<input>` 是默认的 content-box ——
+     于是同样写 `height: 26px`，输入框量出来是 **28px**（26 + 上下两条边框）、
+     下拉框是 26px，并排放着差 2px。实测量出来才发现的 */
+  box-sizing: border-box;
   padding: 0 8px;
   border: 1px solid var(--color-menu-border);
   background: var(--color-editor-bg);
@@ -983,8 +1083,25 @@ function onChatLogClick(event: MouseEvent) {
   border-radius: 3px;
 }
 
-.chat-field input:focus {
+/* ⚠ input 和 select 用**同一条规则**：它俩是同一栏里的控件，
+   分开写两份迟早会不一致 —— 而那种不一致只是「看着有点怪」，不报错 */
+.chat-field input:focus,
+.chat-field select:focus {
   border-color: var(--color-link);
+}
+
+/* 「接口收到的模型名」那一行 ——
+   它是**说明**不是输入，所以压暗、用等宽字体把那个 id 凸出来 */
+.chat-model-note {
+  margin: -2px 0 0;
+  color: var(--color-text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.chat-model-note code {
+  font-family: Consolas, "Courier New", monospace;
+  color: var(--color-text);
 }
 
 .chat-setup-actions {

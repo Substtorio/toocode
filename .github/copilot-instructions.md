@@ -592,6 +592,20 @@
   ⇒ 两条出路：含中文的表达式**写成独立脚本交给 node 跑**（node 自己读文件），
     或者干脆把中文换成 ASCII（比如把属性名写成英文）
   ★ 同理：只要输出里有中文，`> file` / `Out-File` 之后的文件都要**显式 `-Encoding utf8`**
+- ★★ **CDP 那层自己踩的三个坑（都表现为「报的错指不到原因」）**：
+  · **`Page.enable` 要显式调**：没有它时 `Page.addScriptToEvaluateOnNewDocument`
+    静默地没生效（实测）⇒ 桩没装上 ⇒ `has_secret` 抛异常 ⇒ 面板停在配置界面，
+    症状是「顶栏标签不在」。★ 桩装没装上**要断言**（`typeof …invoke === "function"`），
+    否则整轮验证都是白测
+  · **`send` 必须看 `error` 字段**：`Page.captureScreenshot` 失败时返回的是 error，
+    我却只取了 `result` ⇒ `shot.data` 是 undefined，报的是
+    「Cannot read properties of undefined (reading 'data')」。
+    把 error 直接抛出来之后，一眼就看到真正的原因：
+    「**Cannot take screenshot with 0 width**」
+  · **判「面板开着吗」要看「可见」而不是「在 DOM 里」**：
+    它是 `v-show` 控的，关着的时候元素照样在、只是 `display: none`，
+    量出来全是 0 ⇒ 截图报 0 width。判据用 `offsetParent !== null`
+
 
 这两个 `scripts/*.mjs` 的共同思路：**在 Node 里直接跑 `vscode-textmate`**。
 它在浏览器和 Node 里是同一份代码，但应用里要改文件 → 重启 → 开窗口 → 拿眼睛看颜色；
@@ -1855,6 +1869,51 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     浅色 fill `#3b3b3b`、深色 fill `#cccccc`（都是 currentColor），
     形状 / 粗细 / 对齐都对；`.github` `.vscode` 展开、其余四个收起，两种箭头同框
     ⚠ 验证时把主题切成了深色，**验完记得切回去**（主题是存 localStorage 的）
+
+- [x] **Topilot 配置里的模型：界面显示版本名、请求里发调用名**：
+  起因是用户说「模型名称改为显示模型版本（如 DeepSeek V4.1 Flash），
+  原来的显示的是模型的调用名」。
+  ★★ **两者不能只留一个**：`deepseek-chat` 这种是给接口看的 slug，
+    它既不说明是哪个版本、也不说明有多大；而配置界面那一栏是给**人**看的，
+    人想知道的是「我在跟哪个模型说话」。
+    直接改成版本名的话请求就废了（接口不认），所以得要一张对照表
+  ★ `MODEL_PRESETS` 就两行（`deepseek-chat` → `DeepSeek V4.1 Flash`、
+    `deepseek-reasoner` → `DeepSeek V4.1 Thinking`），想加就追一行
+  ★ 「模型」改成**下拉框**（值 = 调用名、显示 = 版本名）+ 一个「自定义…」：
+    兼容接口太多（通义 / Ollama / LM Studio 的名字五花八门），硬要穷举只会
+    得到一个永远不全的列表
+  ★★ **调用名始终露一行**（`接口收到的模型名：deepseek-chat`）——
+    真发出去的就是它，排错（比如 404）看的就是它。把它藏起来 = 出问题时无从下手
+  ★ 顶栏那个模型标签也跟着显示版本名：不然「配置里说 Flash、顶栏说 deepseek-chat」
+    两边对不上（那张标签的存在意义就是「我现在在跟谁说话」）
+  ★★ **保留草稿：切到「自定义」时不动 `config.model`** ——
+    否则用户想把 `deepseek-chat` 改成 `deepseek-chat-v2` 就要整个重打一遍。
+    而正因为保留了取值，「是不是已知模型」这个**反推判据就失效了**
+    ⇒ 所以多了一个 `customModel` 开关。它不是 `config.model` 的第二份拷贝，
+      记的是「那一栏现在用哪种方式编辑」，和 `editingConfig` 同一类东西
+  ★ `canSaveConfig` 顺带加了一条「模型名不能空」：空字符串发出去接口必然报错，
+    报的还是一句「model is required」这种指不到我们这一行的错
+
+  ⚠ ★★ **`box-sizing` 必须显式写，不然 input 和 select 差 2px**：
+    Chrome 的 UA 样式给 `<select>` 设了 `box-sizing: border-box`，
+    而 `<input>` 是默认的 `content-box` —— 于是同样写 `height: 26px`，
+    输入框量出来是 **28px**（26 + 上下两条边框）、下拉框是 26px。
+    并排放着差 2px 属于「看着有点怪、说不上哪不对」，只能量出来
+    ⇒ 两者共用一条规则 + `box-sizing: border-box`。
+      实测：select 和 input 都是 26px 高、376px 宽
+
+  ✅ 验证（**浏览器 + 桩**，不是真窗口）：
+    ⚠ 这一步要 `has_secret` 返回 true 才能看到对话框那边的顶栏标签 ——
+      在真窗口里造这个状态就得往 appDataDir 写一个假密钥，
+      会给用户留下一个「已经配过了」的错状态。桩里返回 true 既干净又不留痕
+    · 顶栏标签：`DeepSeek V4.1 Flash`（不是 `deepseek-chat`），title 也对
+    · 下拉框：选项 = `DeepSeek V4.1 Flash` / `DeepSeek V4.1 Thinking` / `自定义…`，
+      选中项与存的值对得上；下面那一行写着 `接口收到的模型名：deepseek-chat`
+    · 选「自定义…」→ 输入框出现且**预填了原调用名**；改成 `qwen-max-latest` 后
+      那一行跟着变、顶栏标签也跟着变、localStorage 里存的就是它
+    · 换回另一个预设 → localStorage 里存的是 `deepseek-reasoner`（真正发出去的那个）
+    · 深浅两套截图核对过（select 的**弹出列表**是系统画的，
+      它只认 `color-scheme`，而 App.vue 已经按主题设了）
 
 ### 待办（按优先级）
 
