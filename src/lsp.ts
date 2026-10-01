@@ -92,6 +92,18 @@ export interface LspCompletionItem {
     insert?: LspRange;
     replace?: LspRange;
   };
+  /**
+   * 选中这一条时要**顺便**做的编辑 —— 自动导入（auto import）就靠它。
+   *
+   * ★ 按 LSP 规定，这些编辑**和主编辑在同一个文档里**（不带 uri）。
+   *   所以能直接映射成 Monaco 那个同文档的 `ISingleEditOperation[]`。
+   *   （LSP 3.17 想改这个设计，于是有了跨文档的 `textEditText` / `itemDefaults`，
+   *    但真服务器基本还在用这一版）
+   *
+   * ⚠ 规定还要求它们**不和主编辑重叠** —— Monaco 也这么要求。
+   *   TS 那种「在文件顶部插一行 import」天然不重叠，所以照搬即可
+   */
+  additionalTextEdits?: Array<{ range: LspRange; newText: string }>;
 }
 
 /** `textDocument/hover` 的内容有四种写法，都得摊平 */
@@ -257,6 +269,18 @@ export interface LspHost {
    *   只能等到服务器真的起来了，再按它的声明注册一遍
    */
   onServerReady?: (languageIds: string[], capabilities: LspServerCapabilities) => void;
+
+  /**
+   * 某个语言的服务器**起不来了**（进程拉不起来 / 握手失败）。
+   *
+   * ★★ 为什么需要它：App 那边会在「还没有任何文件」的时候就把这些语言的
+   *   **内置语言服务**关掉（因为那个开关只能在第一个文件之前生效 ——
+   *   见 App 里 handLanguageToServer 的说明）。万一服务器真起不来，
+   *   不把这个消息告诉 App，那个语言就**什么都没有**了：既没有服务器，
+   *   内置的又被提前关了。
+   * ⇒ App 收到之后会把内置那套装回去
+   */
+  onServerUnavailable?: (languageIds: string[]) => void;
 }
 
 let host: LspHost | null = null;
@@ -291,6 +315,29 @@ export async function disposeLsp(): Promise<void> {
 }
 
 /**
+ * 这台机器上**有服务器可用**的语言 id。
+ *
+ * ★★ 为什么要在打开任何文件**之前**就问：
+ *   Monaco 内置的 json / css / html 服务是在 `onLanguage` 那一次调用里
+ *   **一次性注册好所有 provider** 的，而且之后再改 `modeConfiguration`
+ *   **没有任何效果**（实测：那个开关在 setupMode 跑完之后就是空操作）。
+ *   ⇒ 想避免「内置和真服务器同时应答」，只能在**第一个该语言的文件
+ *     被创建之前**就把内置服务关掉。所以 App 要提前知道该关哪几个
+ *
+ * ★ 用「扫出来的服务器」而不是自己写一张表：机器上有没有那些服务器
+ *   （VS Code 自带的 json / css / html，PATH 里的 rust-analyzer ……）
+ *   是**环境事实**，只有扫描知道
+ */
+export async function availableServerLanguages(): Promise<string[]> {
+  serverCache ??= await invoke<LspServerInfo[]>("lsp_servers");
+  const all = new Set<string>();
+  for (const server of serverCache) {
+    for (const language of server.languages) all.add(language);
+  }
+  return [...all];
+}
+
+/**
  * 文件打开 / 切换语言时调它。
  *
  * ★ 按需起服务器：只有真的有文件用这个语言、且机器上确实有对应服务器时才起。
@@ -313,6 +360,9 @@ export async function openDocument(path: string, languageId: string): Promise<vo
     } catch (error) {
       sessions.delete(info.id);
       log(`[LSP] ${info.label} 启动失败：${String(error)}`);
+      // ★ 告诉 App：这个语言的服务器没了。App 那边会把内置语言服务装回去，
+      //   不然这个语言就彻底没有语言特性了（见 LspHost.onServerUnavailable）
+      host.onServerUnavailable?.(info.languages);
       return;
     }
   }

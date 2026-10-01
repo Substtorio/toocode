@@ -180,6 +180,16 @@ export function toCompletionItem(
         ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
         : undefined,
     range,
+    // ★★ 自动导入就是靠这一条：服务器回「插入 c，同时在文件顶部加一行 import」。
+    //   不接的话表现是「补出来一个不认识的名字」—— 代码看着补全成功了，
+    //   但那个名字根本没定义，而且不报任何错（下一轮编译才炸）
+    //
+    // ★ Monaco 要的是 `ISingleEditOperation[]`（`{ range, text }`），
+    //   和 LSP 的 `TextEdit[]` 一一对应，只要换一下行号口径
+    additionalTextEdits: item.additionalTextEdits?.map((edit) => ({
+      range: toRange(edit.range),
+      text: edit.newText,
+    })),
   };
 }
 
@@ -356,6 +366,15 @@ export function registerLspLanguage(
       //   空数组会把 Monaco 的列表「接管」掉，它就再不去问别的 provider 了
       //   （snippets.ts 那边踩过同一个坑）
       if (items === null || items.length === 0) return undefined;
+
+      // ★ 只在「这一批里有带自动导入的」时候记一笔。
+      //   补全每个按键都会被问一次，无条件记日志会把输出面板刷爆 ——
+      //   而刷屏的日志等于没有日志。非 0 才是信号：它说明服务器**确实**
+      //   给了额外编辑，后面要是导入没生效，就能确定问题不在「服务器没给」
+      const autoImports = items.filter((item) => (item.additionalTextEdits?.length ?? 0) > 0).length;
+      if (autoImports > 0) {
+        host.log(`[LSP] 补全 ${path}：${items.length} 条，其中 ${autoImports} 条带自动导入`);
+      }
 
       // 服务器没给 textEdit 时的兜底范围：光标所在的这个词
       // ⚠ `getWordUntilPosition` 只按 `[a-zA-Z0-9_]` 圈词，所以

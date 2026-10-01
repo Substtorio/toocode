@@ -42,6 +42,7 @@ import { fileTreeExpansionKey, fileTreeSelectionKey } from "./injectionKeys";
 // 语言服务器客户端。★ 它不知道 `models` 表长什么样 —— 以两个函数的
 // 形式把口子开给它（和 editorBridge 一个套路）
 import {
+  availableServerLanguages,
   changeDocument,
   closeDocument,
   configureLsp,
@@ -1189,9 +1190,17 @@ function builtinDefaultsFor(languageId: string) {
  *   VS Code 自己**不带**内置语言服务，只用真服务器那一套 ——
  *   所以「有真服务器就把它关掉」是往 VS Code 靠，不是特例
  *
+ * ⚠ ★★ **必须在第一个该语言的文件被创建之前调用**（见 prepareLanguageHandover）。
+ *   这一条是实测出来的：内置服务的 provider 是在 `languages.onLanguage`
+ *   那一次调用里由 `setupMode(defaults)` 一次性注册完的，而
+ *   `setModeConfiguration` 在那个 defaults 上**没有 onDidChange 订阅** ——
+ *   事后再改是个空操作。以前那版就是「等服务器握完手再关」，
+ *   实际上一直没关掉；诊断之所以看着正常，是因为 `dropForeignMarkers`
+ *   一直在替它擦屁股，而补全没有这层兜底，所以每项都是两遍
+ *
  * ⚠ 反过来说：**没有**真服务器的语言（这台机器上的 TypeScript）绝不能动 ——
  *   内置那份是唯一的语言特性来源，关掉就什么都没有了。
- *   这正是这件事要挂在 `onServerReady` 上、而不是启动时无脑关一遍的原因
+ *   所以判据是「这台机器上扫到没扫到这个语言的服务器」，而不是写死一张表
  */
 function handLanguageToServer(languageId: string) {
   const defaults = builtinDefaultsFor(languageId);
@@ -1216,9 +1225,139 @@ function handLanguageToServer(languageId: string) {
     documentRangeFormattingEdits: false,
   });
 
-  console.info(`[LSP] ${languageId}：内置语言服务已交出（只由真服务器负责，避免同一件事做两遍）`);
   handedOverLanguages.add(languageId);
   dropForeignMarkers();
+
+  // ★★ 这一次交出到底**管不管用**，只看一件事：关掉的时候，
+  //   这个语言是不是**已经被用过了**（有 model）。
+  //   原因（实测源码 + 实测行为）：内置服务是在 `onLanguage` 那一次调用里
+  //   由 `setupMode(defaults)` 一次性注册好所有 provider 的，
+  //   而 `setModeConfiguration` 在它跑完之后**没有任何效果** ——
+  //   那个 defaults 上根本没有 onDidChange 订阅（实测：反复切 true/false，
+  //   补全条数纹丝不动）。
+  //   ⇒ 所以只有「在第一个该语言的文件之前」关掉才真的生效
+  if (decidedHandovers.has(languageId)) return; // 只判第一次
+  decidedHandovers.add(languageId);
+
+  const used = monaco.editor.getModels().some((model) => model.getLanguageId() === languageId);
+  if (used) {
+    // ⚠ 关晚了：内置那套已经注册上，而且卸不掉（它的 disposable 在 Monaco 内部）。
+    //   后果不是报错，而是「同一项在补全列表里出现两遍」——
+    //   必须主动说出来，否则没人会知道为什么
+    console.warn(
+      `[LSP] ${languageId}：内置语言服务关得太晚了（这个语言已经有文件被打开）——` +
+        `补全 / 悬停可能仍会重复。正常启动时不应该出现这条`,
+    );
+    return;
+  }
+  earlyHandovers.add(languageId);
+  console.info(`[LSP] ${languageId}：内置语言服务已交出（在第一个文件之前就关掉了）`);
+}
+
+/** 已经做过「早 / 晚」判断的语言 */
+const decidedHandovers = new Set<string>();
+
+/**
+ * 关得**够早**的语言（内置那套根本没注册过）。
+ *
+ * ★ 为什么要单独记：只有这些语言的「装回来」才是安全的 ——
+ *   内置服务根本没注册过，此时重新 `setupMode` 只会注册一套；
+ *   而关晚了的那些已经有一套了，再 `setupMode` 就是**两套**（越修越乱）
+ */
+const earlyHandovers = new Set<string>();
+
+/**
+ * 在**打开任何文件之前**，先把会冲突的那几个语言的内置服务交出去。
+ *
+ * ★★ 为什么必须这么早（这是本轮踩到的最深的一个坑）：
+ *   Monaco 内置的 json / css / html 服务是在某个语言**第一次被用到**时
+ *   （`languages.onLanguage`）一次性注册好所有 provider 的，
+ *   而事后再改 `modeConfiguration` 是**空操作**。
+ *   所以以前那种「等服务器握完手再关」的做法**根本关不掉**：
+ *   文件一打开 → 内置那套注册上了 → 服务器才握手 → 关已经来不及了。
+ *   ⚠ 诊断之所以看起来没事，是因为 `dropForeignMarkers` 一直在替它兜底；
+ *     而补全没有这层兜底，于是**每一项都出现两遍**。
+ *
+ * ★ 判据用「这台机器上扫到的服务器」，而不是写死一张表：
+ *   机器上有没有那些服务器是环境事实（VS Code 自带的 json / css / html、
+ *   PATH 里的 rust-analyzer……），只有扫描知道。
+ * ★ 服务器真起不来时会把内置装回去（见 restoreBuiltinLanguageService）
+ */
+async function prepareLanguageHandover(): Promise<void> {
+  let languages: string[];
+  try {
+    languages = await availableServerLanguages();
+  } catch (error) {
+    // 扫不到服务器清单不是错 —— 没有服务器时内置那套正是唯一可用的一份
+    console.warn(`[LSP] 取语言服务器清单失败，内置语言服务保持开启：${String(error)}`);
+    return;
+  }
+
+  for (const languageId of languages) handLanguageToServer(languageId);
+}
+
+/**
+ * 把内置语言服务**装回去**。
+ *
+ * ★★ 什么时候会走到：我们提前把内置关掉了（因为扫到了服务器），
+ *   结果那个服务器**起不来**（进程拉不起来 / 握手失败）。
+ *   不装回去的话，那个语言就两头落空：没有服务器，内置的又被提前关了。
+ *
+ * ★ 另一条路是自己调 Monaco 的 `setupMode(defaults)`：
+ *   它的注册发生在「语言第一次被用到」那一次，而那时我们已经把开关关了，
+ *   所以**一次都没有注册过** —— 此时把开关打开再 `setupMode` 一次，
+ *   正好注册一套，不多不少。
+ *   ⚠ 所以只对 `earlyHandovers` 里的语言做：关晚了的那些已经有一套了，
+ *     再来一次就是两套（越修越乱）
+ *   ⚠ 深引路径不能带 `esm/vs/` 前缀（包的 exports 映射会自己接上）
+ */
+const BUILTIN_MODE_LOADERS: Record<string, () => Promise<{ setupMode: (defaults: unknown) => void }>> = {
+  json: () => import("monaco-editor/languages/features/json/jsonMode"),
+  jsonc: () => import("monaco-editor/languages/features/json/jsonMode"),
+  css: () => import("monaco-editor/languages/features/css/cssMode"),
+  scss: () => import("monaco-editor/languages/features/css/cssMode"),
+  less: () => import("monaco-editor/languages/features/css/cssMode"),
+  html: () => import("monaco-editor/languages/features/html/htmlMode"),
+};
+
+const BUILTIN_MODE_ALL_ON = {
+  completionItems: true,
+  hovers: true,
+  documentSymbols: true,
+  definitions: true,
+  references: true,
+  documentHighlights: true,
+  rename: true,
+  colors: true,
+  foldingRanges: true,
+  diagnostics: true,
+  selectionRanges: true,
+  documentFormattingEdits: true,
+  documentRangeFormattingEdits: true,
+};
+
+async function restoreBuiltinLanguageService(languageIds: string[]): Promise<void> {
+  for (const languageId of languageIds) {
+    if (!earlyHandovers.has(languageId)) continue;
+    const defaults = builtinDefaultsFor(languageId);
+    const loader = BUILTIN_MODE_LOADERS[languageId];
+    if (defaults === null || loader === undefined) continue;
+
+    earlyHandovers.delete(languageId);
+    // 交出去的名单里也去掉 —— 否则 `dropForeignMarkers` 会一直把
+    // 内置服务刚写好的诊断当成「不该存在的」清掉
+    handedOverLanguages.delete(languageId);
+    defaults.setModeConfiguration({ ...BUILTIN_MODE_ALL_ON });
+
+    try {
+      const mode = await loader();
+      mode.setupMode(defaults);
+      console.info(`[LSP] ${languageId}：服务器起不来，已把内置语言服务装回去`);
+    } catch (error) {
+      // 装不回来只是「少一层兑底」，不该把别的都拖下水
+      console.warn(`[LSP] ${languageId}：装回内置语言服务失败：${String(error)}`);
+    }
+  }
 }
 
 /**
@@ -4031,8 +4170,10 @@ onMounted(async () => {
       //   而它必须写在注册那一行里
       onServerReady: (languageIds, capabilities) => {
         for (const languageId of languageIds) {
-          // ★ 顺序：先把内置那套交出去（否则两套一起应答，
-          //   补全列表里同一项出现两遍），再注册我们自己的
+          // ★ 这里再调一次是**兜底**：正常情况下 `prepareLanguageHandover()`
+          //   已经在「还没有任何文件」的时候把它交出去了（那时才真的生效，
+          //   见那个函数里的说明）。这里这次只在「启动时没扫到这个服务器」
+          //   之类的边角情况下起作用
           handLanguageToServer(languageId);
           registerLspLanguage(
             languageId,
@@ -4044,9 +4185,21 @@ onMounted(async () => {
         // 内置服务可能已经校验过当前打开的文件，顺手清一下它的存货
         dropForeignMarkers();
       },
+
+      // ★ 服务器起不来时把内置那份装回去 ——
+      //   不然这个语言两头落空（服务器没起来 + 内置被我们提前关了）
+      onServerUnavailable: (languageIds) => {
+        void restoreBuiltinLanguageService(languageIds);
+      },
     },
     (line) => console.info(line),
   );
+
+  // ★★ 在**打开任何文件之前**，把会冲突的那几个语言的内置服务交出去。
+  //   这是唯一能真的关掉它的时机 —— 内置服务是在某个语言第一次被用到时
+  //   一次性注册好的，事后再关是空操作（见 handLanguageToServer 的说明）。
+  //   ⚠ 位置很讲究：下面 restoreHotExit() 会建 model，那时就已经晚了
+  await prepareLanguageHandover();
 
   // 「跳到别的文件」也得有人接手 —— 见 registerLspOpenHandler 里的说明。
   // ★ 放在编辑器创建**之后**：它靠「后注册的先跑」抢在 Monaco 默认实现前面

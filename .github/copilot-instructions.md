@@ -570,6 +570,8 @@
 | 语言特性接对了没有 | **自己写一个假 LSP 服务器**（见 LSP 第二块那条） | 真服务器不产生定义结果 ⇒ 靠它们根本验不了；假服务器输出确定，能做精确断言 |
 | 跨文件重命名到底改了哪些文件 | 同上（这个假服务器改成回**两个文件**） | 真服务器的重命名都是**单文件**的 ⇒ `ensureModel` 那段永远走不到；而且少的编辑是「静默少改一处」 |
 | 按键到底落到谁身上 | 页内派发合成事件 + 读 `document.activeElement` | CDP 的 `Input.dispatchKeyEvent` 在这个 WebView 里会落到别处（整篇文档被替换过） |
+| 补全到底有几个 provider 在答 | suggest 内部模型：`getContribution("editor.contrib.suggestController").model.onDidSuggest` → `items[].provider` | 列表里只看到「多了一倍的行」，看不出来是两个来源 —— 而症状又长得像「就是重复了」 |
+| 改 `modeConfiguration` 到底生效没有 | 看补全条数会不会变 + 直接数 provider | 它**不报错也不生效**（那份 defaults 上根本没有订阅），只看代码会以为它管用 |
 
 两个提醒：
 
@@ -1471,8 +1473,65 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
         把「已交出语言」的非 `lsp` marker 清掉（`dropForeignMarkers`）。
         按 owner 筛而不是按名字写死 —— owner 叫什么名字是 Monaco 内部的事
     ⚠ 反过来说：**没有**真服务器的语言（这台机器上的 TypeScript）绝不能动 ——
-      内置那份是唯一的语言特性来源。这正是这件事要挂在 `onServerReady` 上、
-      而不是启动时无脑关一遍的原因（服务器起不来时内置那套还是完整可用的）
+      内置那份是唯一的语言特性来源
+
+  ⚠ ★★★ **事后更正（隔了一轮才查清）：上面这套「交出」当时根本没生效。**
+    重复现象一直都在，只是被掩盖了 —— 诊断看着正常，是因为 `dropForeignMarkers`
+    一直在替它把内置 worker 写的 marker 清掉；而**补全没有这层兜底**，
+    所以建议列表里每一项都出现两遍（实测：`color` / `column-gap` … 6 项 × 2）。
+    · 怎么发现的：**从 suggest 的内部模型里把 provider 挖出来** ——
+      `editor.getContribution("editor.contrib.suggestController").model.onDidSuggest(...)`
+      → `e.completionModel.items.map(i => i.provider)`。
+      实测拿到**两个** provider：`CompletionAdapter`（内置的 106 条）和
+      `Object`（我们的 116 条）。光盯着补全列表是看不出来的
+    · **根因**：内置服务的 provider 是在「某个语言第一次被用到」时
+      （`languages.onLanguage` → `getMode().then(m => m.setupMode(defaults))`）
+      **一次性全部注册**的，而那份 defaults 上**没有 `onDidChange` 订阅**
+      ⇒ `setModeConfiguration` 在 `setupMode` 跑完之后是**空操作**。
+      实测：反复切 `completionItems` true / false，补全条数纹丝不动。
+      而我们的顺序天生是「先开文件（内置注册上）→ 服务器才握手（才去关）」，
+      所以永远关不掉
+    · **修法**：只能在**第一个该语言的文件被创建之前**关掉。
+      于是启动时先问一遍「这台机器上扫到哪些语言的服务器」
+      （`availableServerLanguages()` ← 就是 `lsp_servers` 那次扫描，有缓存），
+      把会和内置冲突的那几个（json / jsonc / css / scss / less / html）提前交出去。
+      ⚠ 位置很讲究：**必须在 `restoreHotExit()` 之前**（它会建 model，那时就已经晚了）
+      ✅ 实测：`providers: { Object: 116 }` —— `CompletionAdapter` 一条都没有了，
+        12 行建议**全部唯一**；诊断 2 条、owner 全是 `lsp`
+    · ★ **兜底**：服务器真起不来时把内置装回去
+      （`onServerUnavailable` → `restoreBuiltinLanguageService`）——
+      自己调一次 Monaco 的 `setupMode(defaults)`；因为开关从没让它注册过，
+      所以此时正好注册一套，不多不少。
+      ⚠ 只对「关得早」的语言做（关晚了的已经有一套，再来一次就是两套）
+      ⚠ ★★ 深引那三个 mode 模块时，**必须走到 Vite 的那份 chunk**
+        （`monaco-editor/languages/features/css/cssMode` → `/node_modules/.vite/deps/...`）。
+        我一开始在页面里用绝对路径 `/node_modules/monaco-editor/esm/...` 试，
+        `setupMode` 里的 `languages` 是**另一份对象**，注册了个寂寞
+        ⇒ 排查这类问题时**先确认自己引的是应用内部那一份模块**
+    · ★ 顺带把「关晚了」变成一条**看得见**的警告：调用时如果这个语言已经有 model，
+      说明内置那套已经注册上、卸不掉了（它的 disposable 在 Monaco 内部），
+      那就 `console.warn` 明说「补全可能仍会重复」，而不是静默失效
+
+- [x] **自动导入（补全项里的 `additionalTextEdits`）**：
+  ★ LSP 的 `CompletionItem.additionalTextEdits` 规定是**和主编辑同一个文档**里的编辑，
+    所以正好能映射成 Monaco 那个同文档的 `ISingleEditOperation[]`（`{ range, text }`）——
+    只要换一下行号口径（`toRange`），连 uri 都不用管。
+    ★★ **不接的后果很隐蔽**：补全出来一个不认识的名字，代码看着是补好的，
+      但那个名字根本没定义，**而且不报任何错** —— 要等下一轮编译才炸
+  ★ 加了一条**只在非 0 时才记**的日志：
+    `[LSP] 补全 <path>：n 条，其中 m 条带自动导入`。
+    ⚠ 不能无条件记：补全每个按键都会被问一次，无条件记会把输出面板刷爆 ——
+      而刷屏的日志等于没有日志。非 0 才是信号
+  ★★★ **验证：真服务器一个 `additionalTextEdits` 都不产生**
+    （CSS 补个属性哪来的 import）⇒ 又用假服务器：补全回两条 ——
+    `beta`（片段 + 在文件顶部插一行 `use lib::beta;`）、`alpha`（普通）。
+    ✅ 实测：接受 `beta` → `use lib::beta;\nfn main() {\n    beta(value);\n}`
+      （导入行和片段都到位，`$1` 占位符也正常选中）
+    ✅ **撤销一次两处一起回退** —— Monaco 把「主编辑 + additionalTextEdits」
+      放在同一个 undo stop 里
+    ✅ 对照组 `alpha` 只插了 `alpha()`，没有多余东西
+  ⚠ 接受补全用 `editor.trigger("test", "acceptSelectedSuggestion", null)`（Monaco
+    自己的命令）比合成键盘事件可靠得多
 
 - [x] **LSP 第三块：重命名（F2）**（`src/lspFeatures.ts` 里的 rename provider）：
   ★★★ **真正的门槛不在 `textDocument/rename`，而在「给 model 一个真正的 uri」** ——
@@ -1562,11 +1621,8 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 
 ### 待办（按优先级）
 
-1. **【重命名已完成】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 「问题」面板**。
+1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。
    下一步是：
-   · **自动导入**（补全项里的 `additionalTextEdits` 现在被丢掉了）——
-     ⚠ 它和重命名是同一类东西（都是「一批编辑交给 Monaco 应用」），
-       所以 uri 那一关已经过了，剩下的只是转换
    · html / css 的 `triggerCharacters`（见上面那条实测）
    · `$/cancelRequest`：现在取消请求是忽略的（补全结果靠 Monaco 自己丢）
 2. **插件机制的其余贡献点**：`contributes.grammars`（语法）/ `themes`（主题）/
