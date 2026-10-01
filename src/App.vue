@@ -340,17 +340,19 @@ const CSS_VAR_BY_COLOR: Array<[cssVar: string, vscodeKey: string]> = [
   /* 悬停时的图标颜色。★ 原来叫 --color-icon-active，改名了 ——
      那个名字现在留给「当前视图那个蓝色图标」（见本表最后两行） */
   ["--color-icon-hover", "activityBar.foreground"],
-  /* ★★ 图标背后那两个圆角方块 + 当前视图的图标颜色。
-     这几个都是 VS Code 「modern UI」的键，**主题文件里真有**（深浅都有）：
-       hoverBackground  深 #FFFFFF11 / 浅 #F2F2F2
-       activeBackground 深 #FFFFFF22 / 浅 #e4e6f1（就是 hover 那档的加重版）
-     所以能走正常映射，不用像 terminal.ansi* 那样写死两套
-     ★ activeBorder（深 #0078D4 / 浅 #005FB8）就是那条强调蓝。
-       它以前是给「激活项左侧那条竖线」用的（那个变量叫
+  /* ★★ 悬停方块 + 当前视图的图标颜色。
+     · hoverBackground（深 #FFFFFF11 / 浅 #F2F2F2）和 activeBorder
+       （深 #0078D4 / 浅 #005FB8）主题文件里真有，所以能正常映射
+     · activeBorder 以前是给「激活项左侧那条竖线」用的（那个变量叫
        --color-activitybar-active-border）—— 竖线改成方块之后，
-       **同一个键换了个去处**：从画线转去给图标上色 */
+       **同一个键换了个去处**：从画线转去给图标上色
+     ⚠ ★ `modernActivityBarItem.activeBackground` **故意不映射**：
+       它在深色下是 `#FFFFFF22`，也就是**比活动栏底更亮** —— 而我们要的恰恰相反，
+       选中项要**压得更深**。方向不对，所以接不上。
+       而且主题里也**没有**比 `activityBar.background`(#181818) 更深的键
+       （和 `--color-shell-bg` 是同一个处境），只能写死两套兜底。
+       见下面 `--color-icon-active-bg` */
   ["--color-icon-hover-bg", "modernActivityBarItem.hoverBackground"],
-  ["--color-icon-active-bg", "modernActivityBarItem.activeBackground"],
   ["--color-icon-active", "activityBar.activeBorder"],
   ["--color-link", "textLink.foreground"],
 ];
@@ -366,7 +368,17 @@ const CSS_VAR_BY_COLOR: Array<[cssVar: string, vscodeKey: string]> = [
  *   但经典的 `#007acc` 蓝辨识度高得多。想让它跟随主题的话，
  *   把上面那两行的映射加回来、并从这个数组里删掉即可。
  */
-const THEME_VARS_CLEAR_ONLY = ["--color-statusbar-bg", "--color-statusbar-fg"];
+const THEME_VARS_CLEAR_ONLY = [
+  "--color-statusbar-bg",
+  "--color-statusbar-fg",
+  // ★── 它**曾经**映射过 `modernActivityBarItem.activeBackground`，后来改成了写死的兜底值
+  //     （因为那个键在深色下是「更亮」，而我们要「更深」）。
+  //     从映射表里删掉之后，**上一次设过的内联值会永远赖着不走** ——
+  //     内联 style 优先级最高，换什么主题都盖不掉它，
+  //     于是活动栏里那个方框的颜色会一直卡在 #FFFFFF22，而且不报错。
+  //     所以必须靠这个数组把它清掉
+  "--color-icon-active-bg",
+];
 
 /** 每个主题从 VS Code 主题文件里读到的颜色表（读不到就是空的，用 CSS 里的默认值兜底） */
 const VSCODE_COLORS_BY_THEME: Record<string, Record<string, string>> = {};
@@ -5971,7 +5983,10 @@ kbd {
   --color-icon-hover: #d7d7d7;      /* activityBar.foreground */
   --color-icon-active: #0078d4;     /* activityBar.activeBorder，强调蓝 */
   --color-icon-hover-bg: #ffffff11; /* modernActivityBarItem.hoverBackground */
-  --color-icon-active-bg: #ffffff22;/* modernActivityBarItem.activeBackground */
+  /* ★ 选中项的方框：**比活动栏底（#181818）更深一层**，表达「陷下去 / 被按住」。
+     不能用 modernActivityBarItem.activeBackground（它是 #FFFFFF22，更亮），
+     主题里也没有更深的键 —— 和 --color-shell-bg 同一个处境，只能写死 */
+  --color-icon-active-bg: #0d0d0d;
   /* ★ 「浮起」风格的底：活动栏 / 侧栏 / 编辑器 / 面板都是浮在它上面的卡片，
      卡片之间的缝隙里露出来的就是它。必须比**所有**卡片都深，否则缝隙看不出来。
      注意它不是任何主题键 —— 主题里没有比 activityBar.background(#181818) 更深的值了，
@@ -6094,11 +6109,13 @@ kbd {
   --color-icon: #616161;
   --color-icon-hover: #1f1f1f;
   --color-icon-active: #005fb8;
-  /* ★ 浅色下这两个方块都**不能用深色那套半透明白** —— 白铺在白底上等于没画。
-     浅色主题给的是实色：hover #F2F2F2、active #e4e6f1（后者略深一点，
-     而且带一点点蓝调，和蓝色的选中图标配得上）*/
+  /* ★ 浅色下这两个方块**都不能用深色那套半透明白** —— 白铺在白底上等于没画。
+     hover 用主题给的实色 #F2F2F2；
+     active 要「比活动栏底更深」，所以自己定一个。
+     ⚠ 它必须比**活动栏的兜底色 #dddddd 还深** —— 否则主题没加载时
+       方框会反过来比活动栏亮（而「主题没加载」正好是我们调样式时会遇到的场合）*/
   --color-icon-hover-bg: #f2f2f2;
-  --color-icon-active-bg: #e4e6f1;
+  --color-icon-active-bg: #c8c8c8;
 
   --color-hover: #e8e8e8;
   --color-selection: #0060c0;

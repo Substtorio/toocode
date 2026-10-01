@@ -1045,20 +1045,31 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
       （只给 svg 加 `position: relative` 是没用的，auto 还是同一档）
       ★ 验证办法：临时把方块改成不透明红 `#c0392b !important` 截图 ——
         图标还能看见就说明层级对了；顺便也能看出四角有没有被活动栏的圆角切掉
-  ★★ **活动栏选中态：方块 + 蓝色图标（不再用左侧那根蓝竖线）**：
+  ★★ **活动栏选中态：深色方块 + 蓝色图标（不再用左侧那根蓝竖线）**：
     原来是「激活项在活动栏最左边画一条 2px 蓝竖线」（用 `activityBar.activeBorder`）。
-    改成：**同一个圆角方块，但底色深一档** + **图标变成强调蓝**。
-    · 方块色 `modernActivityBarItem.activeBackground`（深 `#FFFFFF22` / 浅 `#e4e6f1`）——
-      它正好是 `hoverBackground` 那档的加重版，所以「悬停 / 选中」是同一个视觉语言，
-      只是深浅不同
+    改成：**同一个圆角方块，但底色比活动栏底更深** + **图标变成强调蓝**。
     · 图标色 `activityBar.activeBorder`（深 `#0078D4` / 浅 `#005FB8`）——
       **同一个主题键换了个去处**，从画线改成上色
+    · 方块色**写死两套**（深 `#0d0d0d` / 浅 `#c8c8c8`）
+    ⚠ ★★ **`modernActivityBarItem.activeBackground` 故意不映射** ——
+      它深色下的值是 `#FFFFFF22`，也就是**比活动栏底更亮**；
+      而这里要的是「选中项压得更深」，**方向正好相反**。
+      而且主题里**也没有**比 `activityBar.background`(#181818) 更深的键
+      （和 `--color-shell-bg` 是同一个处境），只能写死兜底。
+      ⇒ 通用教训：**接一个主题键之前，先确认它的方向和你要的一致** ——
+        名字里带 active / hover 不代表明暗方向也对
+    ⚠ ★★ **从映射表里删掉一个变量时，必须把它加进 `THEME_VARS_CLEAR_ONLY`**：
+      `applyTheme` 是靠**遍历 `CSS_VAR_BY_COLOR`** 来清内联变量的。
+      只从映射表删、不加进这个数组的话，**上一次设过的内联值会永远赖在 `<html>` 上**
+      （内联 style 优先级最高），于是方框颜色会一直卡在旧的 `#FFFFFF22`，而且不报错。
+      ★ 验证办法：手动 `style.setProperty("--color-icon-active-bg", "#ffffff22")`
+        造一个「上次留下的脏值」，再切一次主题，看内联值有没有被清空
     ⚠ ★ 变量名做过一次重命名，很容易看漏：
       · `--color-icon-active`（旧）= `activityBar.foreground` → 改名成 **`--color-icon-hover`**
         （它本来就是悬停色，旧名字误导）
       · `--color-activitybar-active-border` → 删掉，键改名为 **`--color-icon-active`**
       · 新增 `--color-icon-active-bg`
-      新增变量时**一定 grep 一遍旧名字**：深色块里同时留着旧的
+      新增/改名变量时**一定 grep 一遍旧名字**：深色块里同时留着旧的
       `--color-icon-active: #ffffff` 和新加的 `#0078d4`，同名两条谁后写谁赢，
       于是蓝色根本不生效（而且不报错）
     ⚠ ★ **`.activity-item.active` 必须写在 `.activity-item:hover` 后面**：
