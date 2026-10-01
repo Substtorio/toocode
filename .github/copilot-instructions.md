@@ -1433,6 +1433,16 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     再拿那个变量名去搜定义就能看到色值（`ES=se("editorError.foreground",{dark:…})`）
   ★ 快捷键 `Ctrl+Shift+M`（VS Code 的「问题」就是这个键）+ 查看菜单一项 +
     欢迎页快捷键表一条（按约定三者一起出生）
+  ★★ **状态栏上的「错误 / 警告」指示器**（和面板是一套东西，所以同一轮做）：
+    · 放在状态栏**左半部分**（VS Code 也在这里），点它打开问题面板
+    · 计数直接从 `problemRows` 算（computed），**不另开一份计数状态** ——
+      那样就得跟着 marker 变化再维护一遍，而两份东西迟早会不一致
+    · 颜色用的就是面板那两个变量（`--color-problem-error` / `-warning`）；
+      **计数为 0 时压暗**（`#ffffff99`）—— 有错的时候才该跳出来，
+      不然「一直很显眼」就等于没有重点
+    · ⚠ 布局上要包一层 `.status-left`：路径 `flex: 1 + min-width: 0`（可截断），
+      指示器 `flex: 0 0 auto`（不被挤走）。实测压到 320px 时路径出省略号、
+      指示器仍在状态栏内；还原后路径恢复完整
   ★ 顺手修了一个旧坑：`revealAt()` 把「打开 + 把光标放过去」包成了一个入口。
     ⚠ 原写法（登记 pendingReveal 再 openFile）在**目标文件已经就是当前标签**时
       会静默失效 —— `activeTabPath` 没变，那个 watch 不会跑。
@@ -1470,8 +1480,6 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
    · **自动导入**（补全项里的 `additionalTextEdits` 现在被丢掉了）
    · html / css 的 `triggerCharacters`（见上面那条实测）
    · `$/cancelRequest`：现在取消请求是忽略的（补全结果靠 Monaco 自己丢）
-   · **状态栏那个「错误 / 警告个数」指示器**：数据已经有了，只差一个 UI ——
-     VS Code 点它是跳去问题面板
 2. **插件机制的其余贡献点**：`contributes.grammars`（语法）/ `themes`（主题）/
    `injectTo`（注入语法）/ `snippets`（代码片段）都接了。
    剩下可做的：`commands`（扩展注册的命令进命令面板）、`semanticTokenScopes`、

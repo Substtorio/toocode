@@ -2726,6 +2726,35 @@ function openProblem(row: ProblemRow) {
   });
 }
 
+/**
+ * 错误 / 警告各几个 —— 状态栏那个指示器用。
+ *
+ * ★ 直接从 `problemRows` 数，不另开一份计数状态：
+ *   那样就得跟着 marker 变化再维护一遍，而两份东西迟早会不一致
+ */
+const problemCounts = computed(() => {
+  let errors = 0;
+  let warnings = 0;
+
+  for (const row of problemRows.value) {
+    if (row.severity === monaco.MarkerSeverity.Error) errors += 1;
+    else if (row.severity === monaco.MarkerSeverity.Warning) warnings += 1;
+  }
+
+  return { errors, warnings };
+});
+
+/** 指示器的悬停说明。0 也说清楚，别让人以为它坏了 */
+const problemSummary = computed(() => {
+  const { errors, warnings } = problemCounts.value;
+  if (errors === 0 && warnings === 0) return "没有发现问题（点击打开问题面板）";
+
+  const parts: string[] = [];
+  if (errors > 0) parts.push(`${errors} 个错误`);
+  if (warnings > 0) parts.push(`${warnings} 个警告`);
+  return `${parts.join("，")}（点击打开问题面板）`;
+});
+
 /** 打开「问题」面板 —— 快捷键和菜单共用这一个入口 */
 function showProblemsPanel() {
   activePanelTab.value = "problems";
@@ -5074,8 +5103,42 @@ watch(activeTabPath, async (path) => {
       </aside>
     </div>
     <footer class="statusbar"> <!--底部状态栏-->
-      <!-- 左侧：当前文件路径 -->
-      <span class="status-path">{{ activeTabPath ? shortPath(activeTabPath) : "就绪" }}</span>
+      <!-- 左侧：当前文件路径 + 「错误 / 警告」个数。
+           ★ 包一层容器是为了让「路径可以截断、指示器不被挤走」这两件事同时成立 ——
+             路径 flex: 1 + min-width: 0，指示器 flex: 0 0 auto
+           ★ 放左边是跟 VS Code 学的：它的「问题」指示器也在状态栏左半部分 -->
+      <span class="status-left">
+        <span class="status-path">{{ activeTabPath ? shortPath(activeTabPath) : "就绪" }}</span>
+
+        <!-- 点它打开问题面板（VS Code 也是这个行为）。
+             图标是**填充**图形（见 PROBLEM_ICON），不写 fill / stroke，由 CSS 给颜色 -->
+        <button class="status-problems" type="button" :title="problemSummary" @click="showProblemsPanel">
+          <svg
+            class="status-problems-icon"
+            :class="problemCounts.errors === 0 ? 'idle' : 'error'"
+            viewBox="0 0 16 16"
+            width="13"
+            height="13"
+            aria-hidden="true"
+          >
+            <path :d="PROBLEM_ICON.error" />
+          </svg>
+          <span :class="{ idle: problemCounts.errors === 0 }">{{ problemCounts.errors }}</span>
+
+          <svg
+            class="status-problems-icon"
+            :class="problemCounts.warnings === 0 ? 'idle' : 'warning'"
+            viewBox="0 0 16 16"
+            width="13"
+            height="13"
+            aria-hidden="true"
+          >
+            <path :d="PROBLEM_ICON.warning" />
+          </svg>
+          <span :class="{ idle: problemCounts.warnings === 0 }">{{ problemCounts.warnings }}</span>
+        </button>
+      </span>
+
       <!-- 右侧：光标位置 / 语言 / 编码 / 缩进 -->
       <span class="status-items">
         <span v-if="saveNotice" class="status-notice">{{ saveNotice }}</span>
@@ -6698,6 +6761,16 @@ kbd {
   user-select: none;
 }
 
+/* 左边这一组：长路径要能截断，但右边那个指示器不能被挤走。
+   所以这层只管排版，截断交给里面的 .status-path */
+.status-left {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
 /* min-width: 0 让这个 flex item 允许被压缩到比内容更小，路径过长时才会出现省略号。
    这和之前 .main 上的 min-height: 0 是同一个道理，只是一个管纵向、一个管横向。 */
 .status-path {
@@ -6706,6 +6779,47 @@ kbd {
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+}
+
+/* 「错误 / 警告」指示器。
+   ★ 计数为 0 时压暗（idle）—— 有错的时候才该跳出来，
+     不然「一直很显眼」就等于没有重点 */
+.status-problems {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  color: #ffffff;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.status-problems:hover {
+  background: #ffffff33;
+}
+
+/* 图标是**填充**图形，颜色只给 color，不写 fill —— 见 PROBLEM_ICON 的说明 */
+.status-problems-icon {
+  fill: currentColor;
+}
+
+.status-problems-icon.error {
+  color: var(--color-problem-error);
+}
+
+.status-problems-icon.warning {
+  color: var(--color-problem-warning);
+}
+
+/* 计数为 0 时的压暗色。放在最后 —— 和上面两条优先级一样，后写的赢。
+   ⚠ 图标和数字都吃这一条，所以是「后代 + 类名」而不是只盯图标 */
+.status-problems .idle {
+  color: #ffffff99;
 }
 
 /* 右边这一组保持自身宽度，不被左边的长路径挤压 */
