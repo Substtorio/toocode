@@ -403,6 +403,30 @@ function monacoThemeFor(id: ThemeId): string {
   return MONACO_THEME_BY_THEME[id] ?? THEMES.find((t) => t.id === id)?.monaco ?? "vs-dark";
 }
 
+/**
+ * Monaco 的滚动条尺寸。主编辑器和 diff 浮层共用这一份 —— 两处写两套迟早会不一致。
+ *
+ * ★★ 为什么必须自己给：Monaco 的滚动条**不归 `::-webkit-scrollbar` 管**，
+ *   它是拿 div 自己画的。默认是 **14px 满宽、方角**，
+ *   而侧栏 / 面板 / 欢迎页那些走全局 CSS（10px 轨道 + 2px 内缩 ⇒ 6px 视觉宽），
+ *   两者并排放着就是两个应用的样子。
+ *
+ * ⚠ ★★ **这是命名空间选项，必须挂在 `scrollbar: {}` 下面**。
+ *   写成顶层的 `verticalScrollbarSize: 10` 会被 **静默忽略** ——
+ *   不报错、不警告，轨道就是不变（我第一版就是这么写的，还量了半天才反应过来）。
+ *   它在源码里长这样：`super(EditorOption.scrollbar, 'scrollbar', defaults, …)`
+ *
+ * ★ `…ScrollbarSize` 是**轨道**宽，`…SliderSize` 是**滑块**宽 —— 是两个选项。
+ *   我们只写前者的话，滑块会被撑满整个轨道（10px 实心条），
+ *   和 CSS 那套「10px 轨道里一条 6px 的滑块」还是不一样（10 - 2×2 = 6）。
+ */
+const MONACO_SCROLLBAR = {
+  verticalScrollbarSize: 10,
+  verticalSliderSize: 6,
+  horizontalScrollbarSize: 10,
+  horizontalSliderSize: 6,
+};
+
 function applyTheme(id: ThemeId) {
   const theme = THEMES.find((t) => t.id === id);
   if (!theme) return;
@@ -976,6 +1000,7 @@ watch(viewingDiff, async (diff) => {
       originalEditable: false,
       renderSideBySide: true,
       automaticLayout: true,
+      scrollbar: MONACO_SCROLLBAR,
     });
   }
 
@@ -3410,6 +3435,9 @@ onMounted(async () => {
     //   它会自己监听 wheel、自己算新字号、自己 preventDefault
     //   挡掉 WebView 的页面缩放，我们不用插手
     mouseWheelZoom: true,
+
+    // 滚动条：和侧栏 / 面板那套 `::-webkit-scrollbar` 对齐（见 MONACO_SCROLLBAR）
+    scrollbar: MONACO_SCROLLBAR,
   });
 
   // 订阅「光标位置变化」，同步给状态栏
@@ -6334,5 +6362,22 @@ body {
 /* 两端的箭头顶，Windows 上默认会显示 */
 ::-webkit-scrollbar-button {
   display: none;
+}
+
+/* ---------- 把 Monaco 的滚动条拉回来和上面这套对齐 ----------
+
+   ★★ 为什么非要单独写：Monaco 的滚动条**不归 `::-webkit-scrollbar` 管** ——
+     它是拿 div 自己画的（`.scrollbar > .slider`），所以上面那套全局规则碰不到它。
+     默认形态是 **14px 满宽、方角**，和侧栏那套「10px 轨道 + 2px 内缩 + 圆角」
+     并排放着就是两个应用的样子。
+
+   ★ 尺寸在 JS 里给（见 `MONACO_SCROLLBAR`），这里只管**圆角** ——
+     Monaco 没有「圆角」这个选项，只能 CSS 补。
+     3px 配 6px 宽的滑块 = 两端全圆，和 `::-webkit-scrollbar-thumb` 的 5px 配 6px 一致。
+
+   ⚠ `.scrollbar` 同时包含横向和纵向两个，不用各写一遍；
+     而且它不止覆盖主编辑器 —— diff 浮层、内部可滚动的小控件都走同一个类 */
+.monaco-editor .scrollbar .slider {
+  border-radius: 3px;
 }
 </style>
