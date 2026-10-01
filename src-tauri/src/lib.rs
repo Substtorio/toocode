@@ -2046,6 +2046,67 @@ mod tests {
             println!("★ 一个内置扩展都没找到：父语法拿不到，好多种语言会降级");
         }
     }
+
+    /// ★ 同一份片段被两个「VS Code 版本目录」各扫一遍时，只该登记一次。
+    ///
+    /// 为什么值得测：这个 bug 的**表现是「重复」而不是「报错」** ——
+    ///   补全列表里每条片段出现两次，看起来就像「本来就长这样」。
+    ///   而它只在「新旧两个版本目录同时存在」时出现（VS Code 刚更新完那一阵），
+    ///   等旧目录被清掉就自己消失了 —— 所以**不主动测就永远碰不到**
+    #[test]
+    fn dedups_snippets_across_duplicate_install_roots() {
+        let base = std::env::temp_dir().join("toocode-snippet-dedup");
+        std::fs::remove_dir_all(&base).ok();
+
+        // 两个「安装目录」，结构照抄 VS Code：
+        //   <安装根>\<版本哈希>\resources\app\extensions\<扩展名>\
+        let mut roots = Vec::new();
+        for install in ["install-a", "install-b"] {
+            let root = base
+                .join(install)
+                .join("resources")
+                .join("app")
+                .join("extensions");
+            for ext in ["markdown-basics", "other-ext"] {
+                let dir = root.join(ext);
+                std::fs::create_dir_all(dir.join("snippets")).unwrap();
+                std::fs::write(
+                    dir.join("package.json"),
+                    r#"{ "contributes": { "snippets": [
+                        { "language": "markdown", "path": "./snippets/markdown.json" } ] } }"#,
+                )
+                .unwrap();
+                std::fs::write(dir.join("snippets").join("markdown.json"), "{}").unwrap();
+            }
+            roots.push(root);
+        }
+
+        let entries = scan_snippets_in(&roots);
+        println!("\n扫到 {} 条片段：", entries.len());
+        for entry in &entries {
+            println!("  {} -> {:?}", entry.source, entry.languages);
+        }
+
+        // markdown-basics 在两个版本目录里都有，只能剩一条；
+        // 而 other-ext 是**另一个扩展**（虽然相对路径一模一样）—— 那是两回事，不该被合并
+        assert_eq!(entries.len(), 2, "同一扩展只该留一条，不同扩展不该被合并");
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.source == "markdown-basics")
+                .count(),
+            1
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.source == "other-ext")
+                .count(),
+            1
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
 }
 
 // ============================ 代码片段（snippets）============================
@@ -2102,16 +2163,24 @@ struct SnippetEntry {
 ///   启动时全读进来解析一遍纯属浪费，用到哪个读哪个
 #[tauri::command]
 fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
-    let roots = extension_roots();
+    Ok(scan_snippets_in(&extension_roots()))
+}
+
+/// 真正干活的那一层。
+///
+/// ★ 为什么把 `roots` 做成参数、而不是在这里自己调 `extension_roots()`：
+///   「两个版本目录里的同一份片段只登记一次」这条规则**没法靠眼睛验** ——
+///   它只在「新旧两个版本目录同时存在」时才会起作用，而那种状态
+///   VS Code 更新完过一阵子就自己没了。参数化之后测试能自己搭两个假安装
+///   目录把它钉住（见 `dedups_snippets_across_duplicate_install_roots`）
+fn scan_snippets_in(roots: &[PathBuf]) -> Vec<SnippetEntry> {
     let mut entries: Vec<SnippetEntry> = Vec::new();
 
     // ★ 先到先得（和语法那套一致）：扫描顺序 = 目录优先级（用户扩展 > 内置），
-    //   所以用户装的扩展能盖住内置的。
-    //   判重的 key 是「语言 + 文件路径」—— 同一份文件可以服务多个语言，
-    //   但同一个语言的同一份文件只登记一次
+    //   所以用户装的扩展能盖住内置的
     let mut seen = HashSet::new();
 
-    for_each_manifest(&roots, |dir, manifest| {
+    for_each_manifest(roots, |dir, manifest| {
         let Some(contributes) = manifest.contributes else {
             return;
         };
@@ -2129,14 +2198,36 @@ fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
                 continue;
             };
 
+            let extension_name = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+
             // ⚠ 判重的 key 用**元组**，不要拿一个字符拼字符串 ——
             //   拼的话就得挑一个「路径里绝不会出现」的分隔符，
             //   而那种魔术字符正是以后会被忘掉、然后出 bug 的东西
+            //
+            // ★★ key 是「语言 + **扩展目录名** + **扩展内的相对路径**」，
+            //   而不是绝对路径。这一条是被现实逼出来的：
+            //   · VS Code 把自己的扩展放在 `<安装根>\<版本哈希>\resources\app\extensions`
+            //   · 而**更新之后新旧两个版本目录会同时存在**（旧的要留一阵子好回滚）
+            //   ⇒ 按绝对路径判重的话，同一份 `snippets/xxx.json` 会被两个版本
+            //     各登记一次。实测：本机 VS Code 刚更新过，片段文件数从 17 变成 **34**，
+            //     界面上就是「补全列表里每条片段出现两次」
+            //   ⇒ 而「这份片段是谁贡献的」本来就和它在哪个盘上无关，
+            //     真正的身份是「哪个扩展 + 扩展里的哪个文件」
+            //   ⚠ 用扩展目录名而不是绝对路径，同时也意味着：**不同**的扩展
+            //     哪怕相对路径一模一样，也还是两条（那是两回事）
             let normalized = path.to_string_lossy().replace('\\', "/");
+            let relative = snippet.path.replace('\\', "/");
+            let relative = relative.trim_start_matches("./").to_string();
+
             let wanted: Vec<String> = languages
                 .into_vec()
                 .into_iter()
-                .filter(|id| seen.insert((id.clone(), normalized.clone())))
+                .filter(|id| {
+                    seen.insert((id.clone(), extension_name.clone(), relative.clone()))
+                })
                 .collect();
 
             if wanted.is_empty() {
@@ -2146,10 +2237,7 @@ fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
             entries.push(SnippetEntry {
                 languages: wanted,
                 path: normalized,
-                source: dir
-                    .file_name()
-                    .map(|name| name.to_string_lossy().to_string())
-                    .unwrap_or_default(),
+                source: extension_name,
             });
         }
     });
@@ -2164,7 +2252,7 @@ fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
             .len()
     );
 
-    Ok(entries)
+    entries
 }
 
 // ============================ AI 对话 ============================
