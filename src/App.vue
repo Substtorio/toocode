@@ -52,6 +52,19 @@ import {
 } from "./lsp";
 // 语言服务器 → Monaco 的三个 provider（补全 / 悬停 / 跳转定义）
 import { registerLspLanguage, registerLspOpenHandler } from "./lspFeatures";
+// 调试适配器客户端（DAP）。★ 传输层和 LSP **共用同一份 Rust 代码**，
+// 前端分开是因为两个协议的语义完全不同（一个管代码长什么样，一个管程序跑到哪儿了）
+import {
+  adapterFor,
+  availableAdapters,
+  configureDap,
+  currentSession,
+  disposeDap,
+  startDebugging,
+  type DapAdapterInfo,
+  type DapStackFrame,
+  type DapVariable,
+} from "./dap";
 // 应用图标：直接拿 Tauri 打包用的那张 128×128 —— 不用再维护第二份图。
 // ⚠ 以前用的是 32x32 那张，因为当时只显示 16px。logo 放大到 22px 之后，
 //   高分屏下 32px 的源会被拉大（2x 屏需要 44 物理像素）⇒ 发糊，所以换大的
@@ -107,7 +120,7 @@ function toggleSidebar() {
  *   有了搜索之后就不等价了 —— 搜索视图开着时，资源管理器那个图标应该是**不亮**的。
  *   用一个布尔去表达两件事，迟早会在加第二个视图时错位
  */
-type ViewId = "explorer" | "search" | "scm";
+type ViewId = "explorer" | "search" | "scm" | "debug";
 const activeView = ref<ViewId>("explorer");
 
 /**
@@ -173,9 +186,14 @@ const ACTIVITY_VIEWS: Array<{ id: ViewId; label: string; icon: string }> = [
     icon:
       "M21 8.25C21 6.1815 19.3185 4.5 17.25 4.5C15.1815 4.5 13.5 6.1815 13.5 8.25C13.5 10.023 14.739 11.5035 16.395 11.892C16.116 12.819 15.2655 13.5 14.25 13.5H9.75C8.9025 13.5 8.1285 13.7925 7.5 14.268V7.4235C9.21 7.0755 10.5 5.5605 10.5 3.75C10.5 1.6815 8.8185 0 6.75 0C4.6815 0 3 1.6815 3 3.75C3 5.562 4.29 7.0755 6 7.4235V16.575C4.29 16.923 3 18.438 3 20.2485C3 22.317 4.6815 23.9985 6.75 23.9985C8.8185 23.9985 10.5 22.317 10.5 20.2485C10.5 18.4755 9.261 16.995 7.605 16.6065C7.884 15.6795 8.7345 14.9985 9.75 14.9985H14.25C16.0845 14.9985 17.61 13.6725 17.931 11.9295C19.674 11.607 21 10.0845 21 8.25ZM4.5 3.75C4.5 2.5095 5.5095 1.5 6.75 1.5C7.9905 1.5 9 2.5095 9 3.75C9 4.9905 7.9905 6 6.75 6C5.5095 6 4.5 4.9905 4.5 3.75ZM9 20.25C9 21.4905 7.9905 22.5 6.75 22.5C5.5095 22.5 4.5 21.4905 4.5 20.25C4.5 19.0095 5.5095 18 6.75 18C7.9905 18 9 19.0095 9 20.25ZM17.25 10.5C16.0095 10.5 15 9.4905 15 8.25C15 7.0095 16.0095 6 17.25 6C18.4905 6 19.5 7.0095 19.5 8.25C19.5 9.4905 18.4905 10.5 17.25 10.5Z",
   },
+  {
+    id: "debug",
+    label: "运行和调试",
+    // codicon: debug-alt —— 左边一个播放三角，右下角一只小虫（虫子是圆 + 四条腿）
+    icon:
+      "M19.854 13.9605L13.2105 17.697C12.954 17.22 12.5505 16.8345 12.039 16.641L12.054 16.626L19.1175 12.6525C19.6275 12.366 19.6275 11.6325 19.1175 11.3445L7.11751 4.59599C6.61801 4.31399 6.00001 4.67549 6.00001 5.24999V10.5C5.46901 10.5 4.97401 10.6215 4.50001 10.791V5.24999C4.50001 3.52949 6.35251 2.44499 7.85251 3.28949L19.8525 10.0395C21.381 10.899 21.381 13.101 19.8525 13.962L19.854 13.9605ZM10.5 16.0605V18H11.25C11.664 18 12 18.336 12 18.75C12 19.164 11.664 19.5 11.25 19.5H10.5C10.5 20.076 10.3905 20.625 10.1925 21.132L11.781 22.7205C12.0735 23.013 12.0735 23.4885 11.781 23.781C11.634 23.928 11.442 24 11.25 24C11.058 24 10.866 23.9265 10.719 23.781L9.39151 22.4535C8.56651 23.4 7.35151 24.0015 6.00001 24.0015C4.64851 24.0015 3.43351 23.4015 2.60851 22.4535L1.28101 23.781C1.13401 23.928 0.942009 24 0.750009 24C0.558009 24 0.366009 23.9265 0.219009 23.781C-0.0734912 23.4885 -0.0734912 23.013 0.219009 22.7205L1.80751 21.132C1.60951 20.625 1.50001 20.076 1.50001 19.5H0.750009C0.336009 19.5 8.78423e-06 19.164 8.78423e-06 18.75C8.78423e-06 18.336 0.336009 18 0.750009 18H1.50001V16.0605L0.219009 14.7795C-0.0734912 14.487 -0.0734912 14.0115 0.219009 13.719C0.511509 13.4265 0.987009 13.4265 1.27951 13.719L2.56051 15H3.00001C3.00001 13.3455 4.34551 12 6.00001 12C7.65451 12 9.00001 13.3455 9.00001 15H9.43951L10.7205 13.719C11.013 13.4265 11.4885 13.4265 11.781 13.719C12.0735 14.0115 12.0735 14.487 11.781 14.7795L10.5 16.0605ZM4.50001 15H7.50001C7.50001 14.172 6.82801 13.5 6.00001 13.5C5.17201 13.5 4.50001 14.172 4.50001 15ZM9.00001 16.5H3.00001V19.5C3.00001 21.1545 4.34551 22.5 6.00001 22.5C7.65451 22.5 9.00001 21.1545 9.00001 19.5V16.5Z",
+  },
 ];
-
-/** Topilot 那个气泡图标。标题栏的入口按钮也用它，所以提出来共用 */
 const CHAT_ICON =
   "M4 5a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2h-8l-4 4v-4a2 2 0 0 1-2-2z";
 
@@ -1118,6 +1136,10 @@ const currentLanguage = computed(() => {
 
 // Monaco 的事件订阅会返回一个 IDisposable，组件卸载时要手动释放，否则会内存泄漏
 let cursorSubscription: monaco.IDisposable | null = null;
+/** 点行号左边那条窄缝 = 切换断点 */
+let glyphSubscription: monaco.IDisposable | null = null;
+/** 切标签时重画调试装饰（装饰挂在「当前 model」上，不重画就看不见） */
+let debugDecorationsWatch: (() => void) | null = null;
 let fontSizeSubscription: monaco.IDisposable | null = null;
 /** marker 变化的订阅（「问题」面板用） */
 let markersSubscription: monaco.IDisposable | null = null;
@@ -1753,6 +1775,12 @@ const WELCOME_SHORTCUTS: readonly WelcomeShortcut[] = [
   { keys: ["Ctrl", "/"], label: "切换行注释" },
   // 重命名走 Monaco 内置的 F2，输入框也是它自带的
   { keys: ["F2"], label: "重命名符号（语言服务器支持时）" },
+  // 调试。★ 这几条都是 VS Code 的键，含义也一致
+  { keys: ["F5"], label: "启动调试 / 继续（跑着时是暂停）" },
+  { keys: ["Shift", "F5"], label: "停止调试" },
+  { keys: ["F9"], label: "在光标这一行切换断点" },
+  { keys: ["F10"], label: "单步跳过" },
+  { keys: ["F11"], label: "单步进入" },
   // 字号
   { keys: ["Ctrl", "滚轮"], label: "缩放编辑器字号" },
   { keys: ["Ctrl", "="], label: "放大字号" },
@@ -2681,6 +2709,447 @@ function runEditorAction(actionId: string) {
 }
 
 // 菜单用 computed：有的标题要跟着状态变（比如主题名、侧栏当前是显示还是隐藏）
+
+// ---------- 调试（DAP）----------
+//
+// 三块状态：
+//   · breakpoints  —— 断点。**真相在这里**：编辑器的红点、侧栏列表、
+//                     发给适配器的那一份，全从它推
+//   · frames/scopes —— 停下来那一刻的现场（调用栈 + 变量）
+//   · debugConsole —— 调试控制台的内容（程序输出 + 适配器日志 + 求值结果）
+//
+// ★ 为什么断点的真相放 UI 这边、而不是 dap.ts 里：
+//   编辑器装饰要实时跟着它变，而 dap.ts 只管协议 ——
+//   它是在「要发给适配器」的时候**回头问** UI「这个文件现在有哪些断点」。
+//   两边各存一份的话迟早不一致，而那种不一致的表现是
+//   「界面上有红点、程序却不停」—— 最难查的一类
+const debugAdapters = ref<DapAdapterInfo[]>([]);
+
+/** 正在调试哪个程序（null = 没在调试） */
+const debugTarget = ref<string | null>(null);
+
+/** idle = 没跑；starting = 正在起；running = 跑着；stopped = 停在断点上 */
+const debugState = ref<"idle" | "starting" | "running" | "stopped">("idle");
+
+/** 断点：路径（正斜杠）→ 行号数组（**保持升序**，见下面的说明） */
+const breakpoints = ref(new Map<string, number[]>());
+
+/** 适配器回报的「这个断点没验上」（比如打在了空行上）——只影响侧栏里的显示 */
+const unverifiedBreakpoints = ref(new Map<string, number[]>());
+
+const debugFrames = ref<DapStackFrame[]>([]);
+/** 当前选中第几帧。变量是「帧相对」的，选另一帧就得重新取一遍 */
+const debugFrameId = ref(0);
+const debugScopes = ref<Array<{ name: string; variables: DapVariable[] }>>([]);
+
+const debugConsole = ref<string[]>([]);
+const debugInput = ref("");
+const debugConsoleRef = ref<HTMLElement | null>(null);
+
+/** 调试控制台最多留这么多字符。一次会话的输出可能有几十万 —— 不封顶会吃掉内存 */
+const MAX_DEBUG_TEXT = 100_000;
+
+const debugConsoleText = computed(() => debugConsole.value.join(""));
+
+/** 启动 / 停止这些动作进行中，按钮置灰 */
+const debugBusy = ref(false);
+
+const debugStateLabel = computed(() => {
+  switch (debugState.value) {
+    case "starting":
+      return "正在启动";
+    case "running":
+      return "运行中";
+    case "stopped":
+      return "已暂停";
+    default:
+      return "未启动";
+  }
+});
+
+/** 当前活动文件能不能调试（能的话返回它的路径） */
+function debuggableFile(): string | null {
+  const path = activeTabPath.value;
+  if (path === null || path.startsWith(UNTITLED_PREFIX)) return null;
+  return anchorForPath(path) === null ? null : path;
+}
+
+/** 一个路径对应的「适配器认的那种路径」 */
+function anchorForPath(path: string): DapAdapterInfo | null {
+  return adapterFor(debugAdapters.value, path);
+}
+
+const debugAdapter = computed<DapAdapterInfo | null>(() => {
+  const path = debuggableFile();
+  return path === null ? null : anchorForPath(path);
+});
+
+/** 能不能点「启动调试」，以及不能点的时候是为什么 */
+const debugHint = computed(() => {
+  if (debugAdapters.value.length === 0) return "本机没找到调试适配器（需要 Python + debugpy）";
+  const path = activeTabPath.value;
+  if (path === null) return "先打开一个要调试的文件";
+  if (debugAdapter.value === null) return `${fileNameOf(path)} 没有对应的调试适配器`;
+  return "启动调试（F5）";
+});
+
+/** 侧栏里的断点列表：一行一个断点 */
+const breakpointRows = computed(() => {
+  const rows: Array<{ path: string; name: string; line: number; verified: boolean }> = [];
+  for (const [path, lines] of breakpoints.value) {
+    const bad = unverifiedBreakpoints.value.get(path) ?? [];
+    for (const line of lines) {
+      rows.push({ path, name: fileNameOf(path), line, verified: !bad.includes(line) });
+    }
+  }
+  return rows;
+});
+
+function breakpointLines(path: string): number[] {
+  return breakpoints.value.get(normalizePath(path)) ?? [];
+}
+
+/**
+ * 切换某一行的断点。
+ *
+ * ★ 行号数组保持**升序**：DAP 回 `setBreakpoints` 的结果时，
+ *   数组顺序**和请求一致** —— 不排序的话「第几个断点验上了」会对错行
+ */
+function toggleBreakpoint(path: string, line: number): void {
+  const key = normalizePath(path);
+  // ★ 换一个新 Map 再赋值：Vue 对 Map 的「深层改动」不敏感，
+  //   直接 get 出来 push 的话界面上不会有任何反应
+  const next = new Map(breakpoints.value);
+  const lines = [...(next.get(key) ?? [])];
+  const at = lines.indexOf(line);
+  if (at === -1) lines.push(line);
+  else lines.splice(at, 1);
+
+  if (lines.length === 0) next.delete(key);
+  else next.set(key, lines.sort((a, b) => a - b));
+  breakpoints.value = next;
+
+  refreshBreakpointDecorations();
+
+  // 会话活着就直接告诉适配器 —— 调试中也能加/删断点（VS Code 就是这样）
+  const session = currentSession();
+  if (session !== null) void session.pushBreakpoints(key);
+}
+
+/** 侧栏里点「×」删一个断点 */
+function removeBreakpoint(path: string, line: number): void {
+  toggleBreakpoint(path, line);
+}
+
+// ---------- 调试：编辑器装饰 ----------
+
+let breakpointDecorations: monaco.editor.IEditorDecorationsCollection | null = null;
+let debugLineDecorations: monaco.editor.IEditorDecorationsCollection | null = null;
+
+/**
+ * 重画当前文件的断点红点。
+ *
+ * ⚠ 装饰是挂在**编辑器当前的 model** 上的，所以切标签后必须重画一次 ——
+ *   不重画的话新文件没有任何红点，看起来像「断点丢了」（其实还在）
+ */
+function refreshBreakpointDecorations(): void {
+  const editor = editorInstance.value;
+  if (editor === null) return;
+
+  const path = activeTabPath.value;
+  const lines = path === null ? [] : breakpointLines(path);
+  const bad = path === null ? [] : (unverifiedBreakpoints.value.get(normalizePath(path)) ?? []);
+
+  const decorations: monaco.editor.IModelDeltaDecoration[] = lines.map((line) => ({
+    range: new monaco.Range(line, 1, line, 1),
+    options: {
+      // ★ `isWholeLine` 必须去掉：glyph margin 那块是跟着**位置**画的，
+      //   整行范围会让红点跑到行中间去
+      isWholeLine: false,
+      glyphMarginClassName: bad.includes(line) ? "debug-bp-hollow" : "debug-bp",
+      glyphMarginHoverMessage: { value: `断点：第 ${line} 行（F9 取消）` },
+    },
+  }));
+
+  if (breakpointDecorations === null) {
+    breakpointDecorations = editor.createDecorationsCollection(decorations);
+  } else {
+    breakpointDecorations.set(decorations);
+  }
+}
+
+/** 重画「当前执行到哪一行」的那条高亮 */
+function refreshDebugLineDecoration(): void {
+  const editor = editorInstance.value;
+  if (editor === null) return;
+
+  const target = debugLine.value;
+  const current = activeTabPath.value;
+  const show = target !== null && current !== null && normalizePath(current) === target.path;
+
+  const decorations: monaco.editor.IModelDeltaDecoration[] = show
+    ? [
+        {
+          range: new monaco.Range(target.line, 1, target.line, 1),
+          options: {
+            isWholeLine: true,
+            className: "debug-current-line",
+            glyphMarginClassName: "debug-current-arrow",
+          },
+        },
+      ]
+    : [];
+
+  if (debugLineDecorations === null) {
+    debugLineDecorations = editor.createDecorationsCollection(decorations);
+  } else {
+    debugLineDecorations.set(decorations);
+  }
+}
+
+/** 当前停在哪一行（null = 没停） */
+const debugLine = ref<{ path: string; line: number } | null>(null);
+
+// ---------- 调试：控制台 ----------
+
+function appendDebugConsole(text: string): void {
+  const joined = debugConsoleText.value + text;
+  // ★ 按**字符数**封顶，不是按行数：DAP 的 output 事件是按块来的，
+  //   一块可能只有几个字符，也可能是一整段
+  debugConsole.value =
+    joined.length > MAX_DEBUG_TEXT ? [joined.slice(-MAX_DEBUG_TEXT)] : [...debugConsole.value, text];
+}
+
+/** 清掉上一次会话留下的现场 */
+function clearDebugScene(): void {
+  debugFrames.value = [];
+  debugFrameId.value = 0;
+  debugScopes.value = [];
+  debugLine.value = null;
+  refreshDebugLineDecoration();
+}
+
+/** 调试控制台自动滚到底 —— 不然新输出永远在看不见的地方 */
+function scrollDebugConsole(): void {
+  void nextTick(() => {
+    const element = debugConsoleRef.value;
+    if (element !== null) element.scrollTop = element.scrollHeight;
+  });
+}
+
+// ---------- 调试：动作 ----------
+
+async function loadDebugAdapters(): Promise<void> {
+  try {
+    debugAdapters.value = await availableAdapters();
+    console.info(
+      debugAdapters.value.length === 0
+        ? "[DAP] 本机没扫到可用的调试适配器"
+        : `[DAP] 可用调试适配器：${debugAdapters.value.map((adapter) => adapter.label).join("、")}`,
+    );
+  } catch (error) {
+    console.warn(`[DAP] 扫描调试适配器失败：${String(error)}`);
+  }
+}
+
+/** 切到「运行和调试」视图（菜单 / Ctrl+Shift+D 共用一个入口） */
+function showDebugView(): void {
+  activeView.value = "debug";
+  sidebarVisible.value = true;
+}
+
+/**
+ * F5：没在调试就启动，跑着就暂停，停着就继续。
+ *
+ * ★ 一个键管三件事是 VS Code 的行为（不是偷懒）——
+ *   用户脑子里的模型是「F5 = 往下走」，而不是「F5 = 继续」
+ */
+function debugPrimaryAction(): void {
+  const session = currentSession();
+  if (session === null) {
+    void startDebug();
+    return;
+  }
+  if (debugState.value === "stopped") session.continue_();
+  else session.pause();
+}
+
+async function startDebug(): Promise<void> {
+  const program = debuggableFile();
+  const adapter = debugAdapter.value;
+  if (program === null || adapter === null || debugBusy.value) return;
+
+  debugBusy.value = true;
+  debugState.value = "starting";
+  debugTarget.value = program;
+  clearDebugScene();
+  appendDebugConsole(`[启动] ${program}\n`);
+  scrollDebugConsole();
+
+  // ★ 把**所有**打过断点的文件都准备好 —— 包括没打开的那些。
+  //   只发当前文件的话，「我在另一个文件里打了断点」就不生效，
+  //   而那种失败完全无声（程序就是不停）
+  const ok = await startDebugging(adapter, program, workspaceRoot.value, [...breakpoints.value.keys()]);
+
+  debugBusy.value = false;
+  if (!ok) {
+    debugState.value = "idle";
+    debugTarget.value = null;
+    appendDebugConsole("[启动失败]\n");
+    scrollDebugConsole();
+  }
+}
+
+async function stopDebug(): Promise<void> {
+  const session = currentSession();
+  if (session !== null) await session.stop(true);
+  // 会话已经结束了的话 onEnded 不会再来，这里自己收一次
+  if (debugState.value !== "idle") finishDebugView("已停止");
+}
+
+/** 会话结束（自己停 / 程序跑完 / 进程没了）时把界面收回来 */
+function finishDebugView(reason: string): void {
+  appendDebugConsole(`[${reason}]\n`);
+  scrollDebugConsole();
+  debugState.value = "idle";
+  debugTarget.value = null;
+  clearDebugScene();
+}
+
+/** 停在断点上：取调用栈、高亮那一行、把变量读出来 */
+async function handleDebugStopped(): Promise<void> {
+  debugState.value = "stopped";
+  const session = currentSession();
+  if (session === null) return;
+
+  const frames = await session.stackTrace(session.currentThreadId);
+  debugFrames.value = frames;
+
+  const top = frames[0];
+  if (top === undefined) return;
+  debugFrameId.value = top.id;
+
+  // ⚠ line 可能是 0（适配器对「框架内部代码」不给行号），
+  //   直接拿去 openFile 会得到一个越界的位置
+  if (top.path !== null && top.line > 0) {
+    debugLine.value = { path: normalizePath(top.path), line: top.line };
+    // ★ 用 revealAt 而不是 openFile：它兼顾了「目标文件已经是当前标签」
+    //   那种情况（那时 openFile 的 watch 不会跑，跳转会静默失效）
+    revealAt({ path: top.path, line: top.line, column: Math.max(1, top.column) });
+    refreshDebugLineDecoration();
+  }
+
+  await loadScopes(top.id);
+  scrollDebugConsole();
+}
+
+/** 读某一帧的变量。★ 变量是「帧相对」的，换帧就得重新读一遍 */
+async function loadScopes(frameId: number): Promise<void> {
+  const session = currentSession();
+  if (session === null) return;
+
+  const scopes = await session.scopes(frameId);
+  const result: Array<{ name: string; variables: DapVariable[] }> = [];
+  for (const scope of scopes) {
+    // variablesReference 为 0 = 这个作用域没有变量可列（比如空的全局）
+    if (scope.variablesReference === 0) continue;
+    result.push({ name: scope.name, variables: await session.variables(scope.variablesReference) });
+  }
+  debugScopes.value = result;
+}
+
+/** 侧栏里点调用栈的某一帧 */
+function selectDebugFrame(frame: DapStackFrame): void {
+  debugFrameId.value = frame.id;
+  if (frame.path !== null && frame.line > 0) {
+    debugLine.value = { path: normalizePath(frame.path), line: frame.line };
+    revealAt({ path: frame.path, line: frame.line, column: Math.max(1, frame.column) });
+    refreshDebugLineDecoration();
+  }
+  void loadScopes(frame.id);
+}
+
+/** 调试控制台里回车：求值 */
+async function submitDebugInput(): Promise<void> {
+  const text = debugInput.value.trim();
+  if (text === "") return;
+  debugInput.value = "";
+  appendDebugConsole(`${text}\n`);
+  scrollDebugConsole();
+
+  const session = currentSession();
+  if (session === null) {
+    appendDebugConsole("（没有活动的调试会话）\n");
+    scrollDebugConsole();
+    return;
+  }
+
+  // ★ 带 frameId 才能读到局部变量（`a + b` 这种）
+  const result = await session.evaluate(text, debugFrameId.value === 0 ? undefined : debugFrameId.value);
+  appendDebugConsole(`${result ?? "（求值失败）"}\n`);
+  scrollDebugConsole();
+}
+
+/**
+ * 调试快捷键。
+ *
+ * ⚠ ★★ `F5` 在 WebView 里是**刷新页面** —— 不 `preventDefault` 的话，
+ *   用户一按整个界面就重新加载了（未保存的内容还在，但会话、断点全重置）。
+ *   这条比「能不能启动调试」重要得多，属于保命
+ * ⚠ 这些键都是 VS Code 的默认绑定：
+ *   F5 启动/继续（跑着时暂停）、Shift+F5 停止、F9 切换断点、
+ *   F10 单步跳过、F11 单步进入、Shift+F11 单步跳出
+ */
+function handleDebugShortcut(event: KeyboardEvent) {
+  // Ctrl+Shift+D = 打开「运行和调试」视图（VS Code 的键）。
+  // ⚠ 要和普通字母键区分，不能只判 key
+  if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === "d") {
+    event.preventDefault();
+    showDebugView();
+    return;
+  }
+
+  if (event.key === "F5") {
+    event.preventDefault();
+    if (event.shiftKey) void stopDebug();
+    else debugPrimaryAction();
+    return;
+  }
+
+  // ★ F9 不需要会话 —— 断点是编辑器自己的状态
+  if (event.key === "F9") {
+    event.preventDefault();
+    toggleBreakpointAtCursor();
+    return;
+  }
+
+  // 单步要有会话才谈得上。没有会话就不拦（免得把浏览器 / 系统的默认行为吃掉）
+  const session = currentSession();
+  if (session === null) return;
+
+  if (event.key === "F10") {
+    event.preventDefault();
+    session.stepOver();
+    return;
+  }
+  if (event.key === "F11") {
+    event.preventDefault();
+    if (event.shiftKey) session.stepOut();
+    else session.stepInto();
+  }
+}
+
+/** 在光标所在行切换断点（F9） */
+function toggleBreakpointAtCursor(): void {
+  const editor = editorInstance.value;
+  const path = activeTabPath.value;
+  const line = editor?.getPosition()?.lineNumber;
+  if (editor === null || line === undefined || path === null) return;
+  // 未命名文档没有磁盘路径，适配器也没法给它设断点
+  if (path.startsWith(UNTITLED_PREFIX)) return;
+  toggleBreakpoint(path, line);
+}
+
 // ---------- 底部面板 ----------
 //
 // 就是 VS Code 底部那块：终端 / 输出 / 调试控制台。
@@ -3761,6 +4230,7 @@ const menus = computed<Menu[]>(() => {
       { label: "转到文件…", shortcut: "Ctrl+P", run: () => openQuickOpen("files") },
       { label: "在文件中查找", shortcut: "Ctrl+Shift+F", run: showSearchView },
       { label: "源代码管理", shortcut: "Ctrl+Shift+G", run: showSourceControlView },
+      { label: "运行和调试", shortcut: "Ctrl+Shift+D", run: showDebugView },
       { separator: true },
       {
         label: "后退",
@@ -3776,6 +4246,44 @@ const menus = computed<Menu[]>(() => {
       },
       { separator: true },
       { label: `重置编辑器字号（当前 ${currentFontSize.value}px）`, run: resetFontSize },
+    ],
+  },
+  {
+    label: "运行",
+    items: [
+      {
+        label: debugState.value === "idle" ? "启动调试" : "继续 / 暂停",
+        shortcut: "F5",
+        disabled: debugState.value === "idle" && debugAdapter.value === null,
+        run: debugPrimaryAction,
+      },
+      {
+        label: "停止调试",
+        shortcut: "Shift+F5",
+        disabled: debugState.value === "idle",
+        run: () => void stopDebug(),
+      },
+      { separator: true },
+      { label: "切换断点", shortcut: "F9", disabled: noFile, run: toggleBreakpointAtCursor },
+      { separator: true },
+      {
+        label: "单步跳过",
+        shortcut: "F10",
+        disabled: debugState.value !== "stopped",
+        run: () => currentSession()?.stepOver(),
+      },
+      {
+        label: "单步进入",
+        shortcut: "F11",
+        disabled: debugState.value !== "stopped",
+        run: () => currentSession()?.stepInto(),
+      },
+      {
+        label: "单步跳出",
+        shortcut: "Shift+F11",
+        disabled: debugState.value !== "stopped",
+        run: () => currentSession()?.stepOut(),
+      },
     ],
   },
   {
@@ -4099,6 +4607,10 @@ onMounted(async () => {
 
     // 滚动条：和侧栏 / 面板那套 `::-webkit-scrollbar` 对齐（见 MONACO_SCROLLBAR）
     scrollbar: MONACO_SCROLLBAR,
+
+    // ★ 行号左边那条窄缝（glyph margin）——断点就打在它上面。
+    //   默认是关的，不打开的话根本没地方画红点
+    glyphMargin: true,
   });
 
   // 订阅「光标位置变化」，同步给状态栏
@@ -4201,6 +4713,63 @@ onMounted(async () => {
   //   ⚠ 位置很讲究：下面 restoreHotExit() 会建 model，那时就已经晚了
   await prepareLanguageHandover();
 
+  // 调试：把口子接上。
+  // ★ 和 LSP 一样，先把回调挂好再谈启动 —— `onEnded` 是异步来的，
+  //   挂晚了会漏掉「进程一起就挂」这种情况（那会在界面上永远停在「正在启动」）
+  configureDap({
+    log: (line) => console.info(line),
+    breakpointsFor: (path) => breakpointLines(path),
+    onBreakpoints: (path, list) => {
+      // 适配器会告诉我们「哪个断点没验上」（比如打在空行上）——
+      // 只在侧栏列表和红点样式上体现，不影响断点本身
+      const key = normalizePath(path);
+      const bad = list.filter((item) => !item.verified).map((item) => item.line);
+      const next = new Map(unverifiedBreakpoints.value);
+      if (bad.length === 0) next.delete(key);
+      else next.set(key, bad);
+      unverifiedBreakpoints.value = next;
+      refreshBreakpointDecorations();
+    },
+    onStopped: () => void handleDebugStopped(),
+    onContinued: () => {
+      debugState.value = "running";
+      // 一继续，上一次停下来的现场就过期了 —— 调用栈 / 变量 / 那一行高亮都要收掉
+      clearDebugScene();
+    },
+    onTerminated: () => finishDebugView("程序已退出"),
+    onOutput: (text) => {
+      appendDebugConsole(text);
+      scrollDebugConsole();
+    },
+    onEnded: () => {
+      if (debugState.value !== "idle") finishDebugView("调试会话已结束");
+    },
+  });
+  void loadDebugAdapters();
+
+  // 行号左边那条窄缝：点一下切换断点。
+  // ★ 只认 GUTTER_GLYPH_MARGIN 那一种目标 —— 点行号（GUTTER_LINE_NUMBERS）
+  //   是选中整行，两个不能混
+  const debugEditor = editorInstance.value;
+  if (debugEditor !== null) {
+    glyphSubscription = debugEditor.onMouseDown((event) => {
+      if (event.target.type !== monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN) return;
+      const line = event.target.position?.lineNumber;
+      const path = activeTabPath.value;
+      if (line === undefined || path === null) return;
+      if (path.startsWith(UNTITLED_PREFIX)) return;
+      toggleBreakpoint(path, line);
+    });
+  }
+  refreshBreakpointDecorations();
+
+  // ★ 装饰是挂在编辑器**当时的 model** 上的，所以切标签必须重画
+  //   （不重画的表现是「切过去就看不到红点了」，而断点其实还在）
+  debugDecorationsWatch = watch(activeTabPath, () => {
+    refreshBreakpointDecorations();
+    refreshDebugLineDecoration();
+  });
+
   // 「跳到别的文件」也得有人接手 —— 见 registerLspOpenHandler 里的说明。
   // ★ 放在编辑器创建**之后**：它靠「后注册的先跑」抢在 Monaco 默认实现前面
   registerLspOpenHandler(lspFeatureHost);
@@ -4239,6 +4808,10 @@ onMounted(async () => {
 
   // 源代码管理（Ctrl+Shift+G）。同理
   window.addEventListener("keydown", handleSourceControlShortcut, true);
+
+  // 调试（F5 / F9 / F10 / F11）。★ 捕获阶段同样必要 ——
+  //   F5 在 WebView 里是刷新页面，冒泡阶段才拦就晚了
+  window.addEventListener("keydown", handleDebugShortcut, true);
 
   // Topilot（Ctrl+Alt+I）。同理
   window.addEventListener("keydown", handleChatShortcut, true);
@@ -4309,10 +4882,15 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleSearchShortcut, true);
   window.removeEventListener("keydown", handleSourceControlShortcut, true);
   window.removeEventListener("keydown", handleChatShortcut, true);
+  window.removeEventListener("keydown", handleDebugShortcut, true);
   // 拆掉状态桥：它抓着编辑器实例和 model，留着就是泄漏
   provideEditorBridge(null);
   // 关掉所有语言服务器进程。不关的话它们会活到系统重启
   void disposeLsp();
+  // 调试适配器同理（它会拉起一个被调试的进程，留着更糟）
+  disposeDap();
+  debugDecorationsWatch?.();
+  debugDecorationsWatch = null;
   safeUnlisten(unlistenClose);
   safeUnlisten(unlistenResize);
   // 定时器也是需要释放的外部资源，否则回调可能在组件销毁后才触发
@@ -4325,6 +4903,8 @@ onUnmounted(() => {
   // 顺序不能反：先退订事件，再销毁编辑器
   cursorSubscription?.dispose();
   fontSizeSubscription?.dispose();
+  glyphSubscription?.dispose();
+  glyphSubscription = null;
   markersSubscription?.dispose();
   editorInstance.value?.dispose();
 
@@ -4964,6 +5544,98 @@ watch(activeTabPath, async (path) => {
           </div>
         </div>
 
+        <!-- 运行和调试视图。
+             ★ 四段：启动 / 停止、调用栈、变量、断点 ——
+               和 VS Code 调试侧栏是同一个结构 -->
+        <div v-else-if="activeView === 'debug'" class="sidebar-debug">
+          <button
+            class="debug-start"
+            type="button"
+            :disabled="debugBusy || debugAdapter === null"
+            :title="debugHint"
+            @click="debugPrimaryAction()"
+          >
+            <span class="debug-start-glyph">{{ debugState === "running" ? "❙❙" : "▶" }}</span>
+            <span class="debug-start-label">
+              {{ debugState === "idle" ? "启动调试（F5）" : `${debugStateLabel}（F5）` }}
+            </span>
+          </button>
+
+          <!-- 适配器找不到 / 当前文件不能调试时，把原因说出来 ——
+               一个点了没反应的按钮比一句话更让人困惑 -->
+          <p v-if="debugAdapter === null" class="sidebar-empty">{{ debugHint }}</p>
+
+          <div v-if="debugTarget !== null" class="debug-target" :title="debugTarget">
+            {{ fileNameOf(debugTarget) }}
+          </div>
+
+          <button
+            v-if="debugTarget !== null"
+            class="debug-stop"
+            type="button"
+            title="停止调试（Shift+F5）"
+            @click="stopDebug()"
+          >
+            停止调试
+          </button>
+
+          <!-- 调用栈 -->
+          <div v-if="debugFrames.length > 0" class="debug-section">
+            <div class="debug-section-title">调用栈</div>
+            <button
+              v-for="frame in debugFrames"
+              :key="frame.id"
+              class="debug-frame"
+              type="button"
+              :class="{ active: frame.id === debugFrameId }"
+              :title="`${frame.path ?? ''} 第 ${frame.line} 行`"
+              @click="selectDebugFrame(frame)"
+            >
+              <span class="debug-frame-name">{{ frame.name }}</span>
+              <span class="debug-frame-at">{{ fileNameOf(frame.path ?? "") }}:{{ frame.line }}</span>
+            </button>
+          </div>
+
+          <!-- 变量。★ 它是「帧相对」的：上面换一帧，这里就得重新读一遍 -->
+          <div v-if="debugScopes.length > 0" class="debug-section">
+            <div class="debug-section-title">变量</div>
+            <template v-for="scope in debugScopes" :key="scope.name">
+              <div class="debug-scope">{{ scope.name }}</div>
+              <div
+                v-for="variable in scope.variables"
+                :key="`${scope.name}:${variable.name}`"
+                class="debug-variable"
+              >
+                <span class="debug-variable-name">{{ variable.name }}</span>
+                <span class="debug-variable-value" :title="variable.value">{{ variable.value }}</span>
+              </div>
+            </template>
+          </div>
+
+          <!-- 断点 -->
+          <div class="debug-section">
+            <div class="debug-section-title">
+              断点<span class="debug-section-count">{{ breakpointRows.length }}</span>
+            </div>
+            <p v-if="breakpointRows.length === 0" class="sidebar-empty">
+              在行号左边那条窄缝上点一下就能打断点（F9）
+            </p>
+            <div v-for="row in breakpointRows" :key="`${row.path}:${row.line}`" class="debug-bp-row">
+              <span class="debug-bp-dot" :class="{ unverified: !row.verified }" />
+              <span class="debug-bp-name" :title="row.path">{{ row.name }}</span>
+              <span class="debug-bp-line">{{ row.line }}</span>
+              <button
+                class="debug-bp-remove"
+                type="button"
+                title="移除断点"
+                @click="removeBreakpoint(row.path, row.line)"
+              >
+                ×
+              </button>
+            </div>
+          </div>
+        </div>
+
       </aside>
 
       <!-- 侧栏和编辑区之间的分隔条：拖它改侧栏宽度。
@@ -5284,7 +5956,23 @@ watch(activeTabPath, async (path) => {
             </template>
           </div>
 
-          <p v-if="activePanelTab === 'debug'" class="panel-empty">调试控制台还没接上</p>
+          <!-- 调试控制台：程序输出 + 适配器日志 + 求值结果都在这里。
+               ★ 用 v-show 而不是 v-if：切到别的标签再切回来，
+                 滚动位置还在（内容本身在 debugConsole 里，不会丢） -->
+          <div v-show="activePanelTab === 'debug'" class="panel-debug">
+            <pre ref="debugConsoleRef" class="debug-console">{{ debugConsoleText }}</pre>
+            <div class="debug-console-input">
+              <span class="debug-prompt">&gt;</span>
+              <input
+                v-model="debugInput"
+                class="debug-input"
+                type="text"
+                placeholder="求一个表达式的值（停在断点上时可用）"
+                spellcheck="false"
+                @keydown.enter="submitDebugInput"
+              />
+            </div>
+          </div>
 
           <!-- 终端：常驻 + v-show。切走切回会话还在（详见组件里的说明） -->
           <TerminalPanel
@@ -7181,6 +7869,17 @@ kbd {
   --color-git-new: #73c991;
   --color-git-deleted: #c74e39;
 
+  /* 调试。★ 同样不在主题文件里 —— 这几个是 VS Code 代码里的默认值，
+     从 `workbench.desktop.main.js` 里挖出来的原值：
+       debugIcon.breakpointForeground            = #E51400
+       debugIcon.breakpointUnverifiedForeground  = #848484
+       debugIcon.breakpointCurrentStackframeForeground = #FFCC00 / #BE8700
+       editor.stackFrameHighlightBackground      = #ffff0033 / #ffff6673 */
+  --color-debug-breakpoint: #e51400;
+  --color-debug-breakpoint-unverified: #848484;
+  --color-debug-arrow: #ffcc00;
+  --color-debug-frame-bg: #ffff0033;
+
   /* 快捷键帽（kbd）。故意用**半透明灰**而不是实色 ——
      深浅两套主题可以共用同一组值（下面浅色主题不用再写一遍） */
   --color-kbd-bg: rgba(128, 128, 128, 0.17);
@@ -7276,10 +7975,369 @@ kbd {
   --color-git-modified: #895503;
   --color-git-new: #007100;
   --color-git-deleted: #ad0707;
+
+  /* 断点的红两边一样（VS Code 就是这么定的：只有一个值）；
+     箭头和整行高亮则必须换 —— 亮黄铺在白底上根本看不清 */
+  --color-debug-breakpoint: #e51400;
+  --color-debug-breakpoint-unverified: #848484;
+  --color-debug-arrow: #be8700;
+  --color-debug-frame-bg: #ffff6673;
   --color-menubar-bg: #dddddd;
   --color-menubar-hover: #c4c4c4;
   --color-menu-bg: #ffffff;
   --color-menu-border: #c8c8c8;
+}
+
+/* ============================ 调试 ============================ */
+
+/* ---------- 编辑器里的装饰 ---------- */
+
+/* 断点红点。
+   ⚠ ★★ 不能直接给这个元素上背景色：Monaco 会把宿主元素（`.cgmr`）撑成
+     **整条缝**那么大（实测算出来 19×19），直接上色画出来是一个大圆饼，
+     而且我写的 width/height 根本盖不过它自带的尺寸。
+     用**伪元素**画一个居中的小圆点 —— 这样大小和位置就跟宿主元素多大了 */
+.debug-bp,
+.debug-bp-hollow,
+.debug-current-arrow {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.debug-bp::after,
+.debug-bp-hollow::after {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--color-debug-breakpoint);
+}
+
+/* 没验上的断点：空心圆。
+   ★ 实心 / 空心是 VS Code 的表达方式 —— 不点开侧栏也能看出这个断点有问题 */
+.debug-bp-hollow::after {
+  background: transparent;
+  border: 2px solid var(--color-debug-breakpoint-unverified);
+}
+
+/* 当前执行行的底色（值是 editor.stackFrameHighlightBackground） */
+.debug-current-line {
+  background: var(--color-debug-frame-bg);
+}
+
+/* 当前执行行左边那个黄三角。
+   ★★ 用 `::before` 而不是 `::after` —— 这里有个很隐蔽的坑：
+     **停在一个有断点的行上时，两个装饰会落在同一个 DOM 元素上**
+     （Monaco 把同一行的 glyph 装饰合并成一个元素，实测 class 是
+      `cgmr codicon debug-bp debug-current-arrow`）。
+     都用 ::after 的话两条规则会同时命中那一个伪元素，
+     叠出来的是「红底 + 三角形边框」这种四不像。
+     分开用两个伪元素，各自独立
+   ★ 形状用 border 拼，比塞一个 svg 简单，颜色也能直接跟变量走 */
+.debug-current-arrow::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 8px solid var(--color-debug-arrow);
+}
+
+/* 停在断点上那一行：黄箭头**取代**红点。
+   ★ 这是 VS Code 的行为 —— 那一行只有箭头，不再画一个红点 */
+.debug-current-arrow.debug-bp::after,
+.debug-current-arrow.debug-bp-hollow::after {
+  display: none;
+}
+
+/* ---------- 侧栏：运行和调试 ---------- */
+
+.sidebar-debug {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 0;
+}
+
+.debug-start {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: calc(100% - 16px);
+  margin: 6px 8px;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 3px;
+  background: var(--color-selection);
+  color: var(--color-text-on-accent);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.debug-start:hover:not(:disabled) {
+  filter: brightness(1.1);
+}
+
+/* ⚠ 禁用态写在 :hover 之后（同优先级后写的赢），否则鼠标移上去还是会亮 */
+.debug-start:disabled {
+  background: var(--color-hover);
+  color: var(--color-text-faint);
+  cursor: default;
+}
+
+.debug-start-glyph {
+  flex: 0 0 auto;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.debug-start-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-target {
+  margin: 0 8px 4px;
+  color: var(--color-text-faint);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-stop {
+  display: block;
+  width: calc(100% - 16px);
+  margin: 4px 8px 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.debug-stop:hover {
+  background: var(--color-hover);
+}
+
+.debug-section {
+  margin-top: 8px;
+  border-top: 1px solid var(--color-menu-border);
+  padding-top: 8px;
+}
+
+.debug-section-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 12px 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-faint);
+}
+
+.debug-section-count {
+  font-weight: 400;
+  opacity: 0.8;
+}
+
+.debug-frame,
+.debug-bp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 3px 12px;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  text-align: left;
+}
+
+.debug-frame {
+  cursor: pointer;
+}
+
+/* ⚠ 顺序：.active 要写在 :hover 后面（同优先级后写的赢），
+   否则鼠标扫过当前帧时高亮会退回普通色 */
+.debug-frame:hover {
+  background: var(--color-hover);
+}
+
+.debug-frame.active {
+  background: var(--color-selection);
+  color: var(--color-text-on-accent);
+}
+
+.debug-frame-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-frame-at {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.75;
+  font-size: 11px;
+}
+
+.debug-scope {
+  padding: 2px 12px;
+  font-size: 11px;
+  color: var(--color-text-faint);
+}
+
+.debug-variable {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 2px 12px 2px 20px;
+  font-size: 12px;
+  font-family: var(--font-mono, monospace);
+}
+
+.debug-variable-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  color: var(--color-text);
+}
+
+/* 值可能很长（一整段字符串），所以它能收缩 + 截断，
+   完整内容挂在 title 上 —— 和断点列表同一个思路 */
+.debug-variable-value {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--color-text-faint);
+}
+
+.debug-bp-dot {
+  flex: 0 0 auto;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--color-debug-breakpoint);
+}
+
+.debug-bp-dot.unverified {
+  background: transparent;
+  border: 2px solid var(--color-debug-breakpoint-unverified);
+}
+
+.debug-bp-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.debug-bp-line {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--color-text-faint);
+  font-size: 11px;
+}
+
+/* 平时不占地方，鼠标移到这一行才出现（和侧栏那个「从最近列表移除」一致） */
+.debug-bp-remove {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-text-faint);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+}
+
+.debug-bp-row:hover .debug-bp-remove,
+/* ⚠ 键盘用户 Tab 上来时也要看得见焦点在哪 —— 只靠 :hover 是不够的 */
+.debug-bp-remove:focus-visible {
+  opacity: 1;
+}
+
+.debug-bp-remove:hover {
+  background: var(--color-hover);
+  color: var(--color-text);
+}
+
+/* ---------- 调试控制台 ---------- */
+
+.panel-debug {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+.debug-console {
+  flex: 1;
+  min-height: 0;
+  margin: 0;
+  padding: 6px 10px;
+  overflow: auto;
+  /* ★ 输出是**原文**（程序 stdout / stderr），不能用等宽以外的字体，
+     也必须保留换行和空格 */
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--color-text);
+}
+
+.debug-console-input {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 4px 10px;
+  border-top: 1px solid var(--color-menu-border);
+}
+
+.debug-prompt {
+  color: var(--color-text-faint);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+}
+
+.debug-input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  outline: none;
+}
+
+.debug-input::placeholder {
+  color: var(--color-text-faint);
 }
 
 html,

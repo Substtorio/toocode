@@ -572,6 +572,8 @@
 | 按键到底落到谁身上 | 页内派发合成事件 + 读 `document.activeElement` | CDP 的 `Input.dispatchKeyEvent` 在这个 WebView 里会落到别处（整篇文档被替换过） |
 | 补全到底有几个 provider 在答 | suggest 内部模型：`getContribution("editor.contrib.suggestController").model.onDidSuggest` → `items[].provider` | 列表里只看到「多了一倍的行」，看不出来是两个来源 —— 而症状又长得像「就是重复了」 |
 | 改 `modeConfiguration` 到底生效没有 | 看补全条数会不会变 + 直接数 provider | 它**不报错也不生效**（那份 defaults 上根本没有订阅），只看代码会以为它管用 |
+| 调试协议的真实顺序 | 直连适配器的探针（自己写分帧，`probe-dap*.mjs`） | 规范说的和 debugpy 实际的**不一样**：`launch` 不回响应、`initialized` 在后面 —— 按规范写会死锁，而且不报错 |
+| 一行上两个 glyph 装饰落在哪 | 打印那个元素的 `className` | 会**合并到同一个元素**上 ⇒ 两个 `::after` 互相污染，叠出四不像 |
 
 两个提醒：
 
@@ -1619,6 +1621,94 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       另一个文件里的改动要切过去再撤销（没去对比 VS Code 的行为）。
       要做得更整齐得自己维护一份「跨文件编辑组」，暂时不值当
 
+- [x] **DAP：调试（协议 + 界面）**：
+  数据流：`dap.ts` → `invoke("dap_send")` → Rust 转发 → 适配器（`python -m debugpy.adapter`）
+            → `dap-message` 事件 → 前端解析 → 编辑器装饰 / 侧栏 / 调试控制台
+  ★★ **传输层和 LSP 是同一份代码**：都是「一个子进程 + `Content-Length` 分帧的 JSON」。
+    抽成了 `start_bridge` / `spawn_bridge_reader` / `spawn_bridge_stderr` /
+    `bridge_send` / `bridge_stop` / `bridge_stop_all`，命令只是薄薄一层包装；
+    事件名前缀不同（`lsp-*` / `dap-*`）而已。**DAP 就是 LSP 的兄弟协议**
+  ★ 两个 State 各存一份（`LspState(BridgeState)` / `DapState(BridgeState)`）——
+    Tauri 的 State 是**按类型**存的，同一种类型只能有一份。用 newtype 包一层，
+    才能让「给 DAP 会话发 LSP 消息」这类串台在类型上就不可能发生
+
+  ★★ **适配器哪来的**：和语言服务器一个思路 —— 用机器上已有的，不自己打包。
+    目前只认 **debugpy**（`python -m debugpy.adapter`），挑它的理由很实在：
+    它是**标准的 stdio DAP**，和 LSP 那套传输层天然合拍。
+    ⚠ js-debug（Node 那个，VS Code 自带）也在这台机器上，但它**不是 stdio** ——
+      要监听端口、用 socket 说话 ⇒ 得先给传输层加 TCP 支持。那是下一步
+    ★ 探测是「真起进程问一遍」（`python -c "import debugpy"`），
+      而且要**带超时**：Windows 上 `python3` 常常是应用商店的别名占位，
+      一跑就等用户去装 —— 不带超时那条线程就永久占住了
+
+  ★★★ **协议实测：三处和教科书不一样**（都写进 `dap.ts` 头部了）
+    1. **`launch` 的响应不会马上回来** —— debugpy 把它压到 `configurationDone`
+       之后才发（那时调试目标才真的跑起来）。⇒ 只能「发出去然后不管」，
+       绝不能 `await`。我第一版探针就是 `await` 了它，整个流程死在那儿，
+       Node 报的还是 `unsettled top-level await` 这种完全指不到原因的错
+    2. **`initialized` 事件在 `launch` 之后才来**（规范写的是紧跟 `initialize` 响应）。
+       ⇒ 在它之前发 `setBreakpoints` 会被拒（`Server is not available`）；
+         按规范写的客户端会卡在「等 initialized」，而且**不报错**、只是不动
+    3. `initialize` 响应的 body **就是 capabilities**（规范是 `{capabilities:…}`）
+       ⇒ 两种都认一下，别为了「谁对」跟适配器较劲
+
+  ★★ **断点的真相放在 UI 那边**（App.vue 的 `breakpoints`），`dap.ts` 只是在
+    「要发给适配器」时**回头问**它（`host.breakpointsFor`）。
+    两边各存一份的话迟早不一致，而那种不一致的表现是
+    **「界面上有红点、程序却不停」** —— 最难查的一类
+  ★ 会话 id 里掺时间戳（`dap-<36 进制时间>`）：光用自增序号的话，
+    刷新页面后会从 1 重新数，和上一页留在 Rust 里的那个**重名**
+    （LSP 那块踩过这个坑，症状是「新会话被旧的退出事件标成已停止」）
+  ★ 开始调试时把**所有**打过断点的文件都发一遍（不只是当前打开的）——
+    只发当前文件的话，「我在另一个文件里打了断点」就不生效，而那种失败完全无声
+
+  ★★★ **编辑器装饰上的两个坑（都很隐蔽）**：
+    · **同一行的多个 glyph 装饰会落到同一个 DOM 元素上** ——
+      实测「停在有断点的那一行」时 class 是
+      `cgmr codicon debug-bp debug-current-arrow`（两个装饰合并成一个元素）。
+      ⇒ 红点和箭头都用 `::after` 的话，两条规则会同时命中**那一个伪元素**，
+        叠出来的是「红底 + 三角形边框」这种四不像。
+        解法：红点走 `::after`、箭头走 `::before`，再显式加一条
+        「箭头在的时候把红点藏掉」（VS Code 也是箭头取代红点）
+    · **Monaco 会把 glyph 宿主元素撑成整条缝那么宽**（实测 19×19），
+      自己写的 `width: 10px` 盖不过它 ⇒ 直接上背景色会画出一个**大圆饼**。
+      ⇒ 用**伪元素**画一个居中的小圆点，大小就和宿主元素多大了
+    ⚠ 装饰是挂在**编辑器当时的 model** 上的 ⇒ 切标签必须重画
+      （不重画的表现是「切过去红点没了」，而断点其实还在）
+    ★ 颜色同样不在主题文件里，是从 `workbench.desktop.main.js` 挖的：
+      `debugIcon.breakpointForeground` = `#E51400`、
+      `debugIcon.breakpointCurrentStackframeForeground` = `#FFCC00` / `#BE8700`、
+      `editor.stackFrameHighlightBackground` = `#ffff0033` / `#ffff6673`
+    ★ `glyphMargin: true` 不加的话根本没地方画断点（默认是关的）
+
+  ★ 快捷键全是 VS Code 的键：F5（启动 / 继续，跑着时是暂停）、Shift+F5 停止、
+    F9 切换断点、F10 单步跳过、F11 单步进入、Shift+F11 单步跳出、
+    Ctrl+Shift+D 打开「运行和调试」视图。菜单里新加了一个「运行」
+  ⚠ ★★ **F5 在 WebView 里是「刷新页面」** —— 不 `preventDefault` 的话
+    用户一按整个界面就重新加载（会话、断点全重置）。这条是保命级别的
+
+  ✅ 验证（**真 debugpy 1.8.22，端到端**）：
+    · 启动日志 `[DAP] Python（python + debugpy）就绪（configurationDone：支持）`
+    · F9 打断点 → `setBreakpoints` 回 `verified: true`；侧栏断点列表出现 `demo.py 3`
+    · F5 → 停在断点：调用栈 `add demo.py:3` / `<module> demo.py:6`，
+      变量 Locals `a=2`、`b=3`、`total=5`
+    · 那一行有**黄箭头 + 黄底**（截图确认），编辑器光标也跳到第 3 行
+    · 调试控制台求 `a + b` → `5`
+    · F10 单步 → 停在第 3 行；F5 继续 → 程序输出 `5`，然后 `[调试会话已结束]`
+    ⚠ 验证时自己踩的两个坑：**先切到调试视图再找文件树是找不到的**
+      （那时侧边栏渲染的是调试视图，`.label` 根本不在 DOM 里）；
+      「断点元素多大」要看 glyph 宿主元素 —— 我一开始用
+      `.margin-view-overlays .debug-bp` 量到 0，其实 glyph 在
+      `.glyph-margin-widgets` 里，是**选择器写错了**
+
+  ⏳ 已知局限（都是有意先不做的）：
+    · **单会话**：同时只调一个程序（多会话要「调试配置」那一整套）
+    · **变量只列一层**：可展开的值有 `variablesReference`，但界面上还不能点开
+    · **没有 `launch.json`**：启动参数就是「当前文件 + 工作区根」
+    · 没接悬停求值（`supportsEvaluateForHovers`）
+    · 「没验上的断点」那个空心圆样式写了，但本机 debugpy 对空行也回
+      `verified: true` ⇒ 这条路径**没被真实触发过**
+
 ### 待办（按优先级）
 
 1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。
@@ -1637,13 +1727,13 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 4. **【已做完】语法的 `injectTo` 注入机制** —— 见上面「插件机制的第三块」那条
 5. **【已定方向，后期再做】文件/符号索引引入数据库**：用于全项目搜索加速，届时才选型（倾向 SQLite）。
    这是真需求驱动才引入，不要为凑简历硬加。
-6. **【进行中】活动栏加更多视图图标**：搜索视图已加（见上面「全项目搜索」那条，
-   `activeView` 已经和 `sidebarVisible` 拆开了）；**源代码管理已加**（见上面那条）。
-   **🔜 只剩「运行和调试」**（「扩展」暂不做）。
-   ⚠ 加之前先想清楚「它背后有没有真东西」—— 一个点不动的空图标比不放更糟：
-   · ~~**源代码管理**~~：✅ 已完成 —— 列出改动文件（`git status`）+ 点开看 diff，
-     Rust 侧跑 `git` 命令，没引任何新依赖
-   · **运行和调试**：要接 DAP（调试适配器协议），和 LSP 是同一个量级，得单独排期
+6. **【已做完】活动栏加更多视图图标**：搜索 / 源代码管理 / **运行和调试** 都加了
+   （「扩展」暂不做）。
+   ⚠ 加之前先想清楚「它背后有没有真东西」—— 一个点不动的空图标比不放更糟
+   · ~~**运行和调试**~~：✅ 已完成 —— DAP 客户端 + 断点 / 单步 / 调用栈 / 变量 /
+     调试控制台，用真 debugpy 端到端验过（见上面那条）
+   ★ 顺带记一笔：活动栏图标天生是**单选**的（`activeView` 只能有一个值），
+     所以「能同时开着」的东西不能塞进来（Topilot 就因此挪去了右侧）
    ★ 顺带记一笔：活动栏图标天生是**单选**的（`activeView` 只能有一个值），
      所以「能同时开着」的东西不能塞进来（Topilot 就因此挪去了右侧）
 7. **【已完成】Toocode 自己的 logo / 应用图标**：

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::{
     Child as StdChild, ChildStderr, ChildStdin, ChildStdout, Command, Stdio,
 };
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, State};
 
 // ============================ 数据结构 ============================
@@ -933,26 +933,38 @@ struct LspServerInfo {
     args: Vec<String>,
 }
 
-/// 跑起来的会话
-struct LspSession {
+/// 跑起来的桥。**LSP 和 DAP 共用同一个形状** ——
+/// 两边都是「一个子进程 + 一条 stdin 管道 + 一套 Content-Length 分帧」，没什么可分的
+struct BridgeSession {
     /// 留着是为了 stop 时能 kill —— 不存的话进程就没人管了
     child: StdChild,
     /// ★ 包成 Arc<Mutex<…>> 是为了「拿得到就行」：
-    ///   `lsp_send` 不必在整个写操作期间占着 sessions 那把大锁
+    ///   发消息时不必在整个写操作期间占着 sessions 那把大锁
     stdin: Arc<Mutex<ChildStdin>>,
 }
 
+/// 会话表
 #[derive(Default)]
-struct LspState {
-    sessions: Mutex<HashMap<String, LspSession>>,
+struct BridgeState {
+    sessions: Mutex<HashMap<String, BridgeSession>>,
 }
+
+/// ★ 为什么不干脆 `manage(BridgeState::default())` 两次：
+///   Tauri 的 State 是**按类型**存的，同一种类型只能有一份。
+///   两个 newtype 各存一份，才能让「给 DAP 会话发 LSP 消息」这类串台
+///   在类型上就不可能发生（就算两边的会话 id 撞名也不会互相踩）
+#[derive(Default)]
+struct LspState(BridgeState);
+
+#[derive(Default)]
+struct DapState(BridgeState);
 
 /// 发给前端的每条消息
 #[derive(Serialize, Clone)]
-struct LspMessage {
+struct BridgeMessage {
     session: String,
     /// 原始 JSON 文本。★ Rust 不解析它 —— 解析留前端，
-    /// 这样改 LSP 版本 / 加方法都不用重编 Rust
+    /// 这样改协议版本 / 加方法都不用重编 Rust
     body: String,
 }
 
@@ -1098,7 +1110,159 @@ async fn lsp_servers() -> Vec<LspServerInfo> {
         .unwrap_or_default()
 }
 
-/// 起一个语言服务器，返回会话 id
+/// 起一个 stdio 桥，返回会话 id。
+///
+/// ★★ 这是 LSP 和 DAP **共用**的那一段：两边都是「起个子进程，
+///   说话走 `Content-Length` 分帧的 JSON」。DAP 就是 LSP 的兄弟协议，
+///   连分帧都一样 —— 所以只写一份。
+///   区别只在**事件名**（`lsp-message` / `dap-message`）和程序参数。
+fn start_bridge(
+    app: AppHandle,
+    state: &BridgeState,
+    session: String,
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    channel: &'static str,
+) -> Result<(), String> {
+    let mut command = Command::new(program);
+    command.args(args);
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+
+    // cwd 只在目录真的存在时才设 —— 设一个不存在的路径会让 spawn 整个失败
+    //（终端那块踩过同一个坑）
+    if let Some(dir) = cwd.filter(|d| Path::new(d).is_dir()) {
+        command.current_dir(dir);
+    }
+
+    // ⚠ Windows 上不给这个的话会闪一个黑框（和 git 命令同一个坑）
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = command.spawn().map_err(|error| format!("启动子进程失败：{error}"))?;
+
+    let stdin = child.stdin.take().ok_or("拿不到子进程的 stdin")?;
+    let stdout = child.stdout.take().ok_or("拿不到子进程的 stdout")?;
+    let stderr = child.stderr.take().ok_or("拿不到子进程的 stderr")?;
+
+    spawn_bridge_reader(app.clone(), session.clone(), stdout, channel);
+    spawn_bridge_stderr(app, session.clone(), stderr, channel);
+
+    state.sessions.lock().unwrap().insert(
+        session,
+        BridgeSession {
+            child,
+            stdin: Arc::new(Mutex::new(stdin)),
+        },
+    );
+
+    Ok(())
+}
+
+/// 读子进程的输出，一帧一条事件发给前端
+fn spawn_bridge_reader(app: AppHandle, session: String, stdout: ChildStdout, channel: &'static str) {
+    // ★ 必须开独立线程：`read` 是阻塞的，挂在命令里会把命令线程整个卡死
+    //   （终端的 pty 那块踩过同一个坑）
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_frame(&mut reader) {
+                Ok(Some(body)) => {
+                    let _ = app.emit(
+                        &format!("{channel}-message"),
+                        BridgeMessage {
+                            session: session.clone(),
+                            body,
+                        },
+                    );
+                }
+                // EOF = 对端退出了，正常结束
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = app.emit(&format!("{channel}-error"), format!("{session}: {error}"));
+                    break;
+                }
+            }
+        }
+        // 不管怎么结束都通知一声 —— 前端要拿它把「已连接」状态收回去
+        let _ = app.emit(&format!("{channel}-exit"), session);
+    });
+}
+
+/// stderr 也得有人读。
+///
+/// ⚠ 不读的话管道缓冲区会满，对端一写日志就**卡死在那儿** ——
+///   表现是「起来了一会儿就没反应了」，而 stdout 那边什么都看不到
+///   （debugpy 尤其能写，它所有内部报错都往 stderr 倒）
+fn spawn_bridge_stderr(app: AppHandle, session: String, stderr: ChildStderr, channel: &'static str) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            let _ = app.emit(&format!("{channel}-stderr"), format!("[{session}] {line}"));
+        }
+    });
+}
+
+/// 往指定的会话发一帧
+fn bridge_send(state: &BridgeState, session: &str, message: &str, what: &str) -> Result<(), String> {
+    // ★ 先把 stdin 的 Arc 取出来、把 sessions 那把锁放掉，再去写 ——
+    //   写管道是会阻塞的，握着大锁写会把别的会话一起堵住
+    let stdin = {
+        let sessions = state.sessions.lock().unwrap();
+        let found = sessions
+            .get(session)
+            .ok_or_else(|| format!("没有这个会话：{session}"))?;
+        Arc::clone(&found.stdin)
+    };
+
+    let mut stdin = stdin.lock().unwrap();
+    // ⚠ `&mut *stdin` 而不是 `&mut stdin`：MutexGuard 本身不是 Write，
+    //   要显式解引用成里面的 ChildStdin
+    write_frame(&mut *stdin, message).map_err(|error| format!("写给{what}失败：{error}"))?;
+    Ok(())
+}
+
+/// 关掉一个会话（同时把进程杀掉）
+fn bridge_stop(state: &BridgeState, session: &str) {
+    let mut sessions = state.sessions.lock().unwrap();
+    if let Some(mut found) = sessions.remove(session) {
+        // kill 失败不是错误 —— 进程可能已经自己退了
+        let _ = found.child.kill();
+        let _ = found.child.wait();
+    }
+}
+
+/// 关掉**所有**会话。
+///
+/// ★★ 为什么需要它：前端**刷新页面**时（开发时改一行就 HMR、或者用户按 F5），
+///   旧页面的 `onUnmounted` 里那个 dispose 根本不会执行 ——
+///   页面是被直接拆掉的，不是「卸载」。于是 Rust 侧那些进程全成了孤儿：
+///   没人 stop、也没人会再给它们发消息。
+///   新页面起来时先清一次，就不会一代一代攒下来。
+///
+/// ⚠ 还有个更隐蔽的后果：进程虽然「活着」，但它的 stdin 只有 Rust 手里那一份。
+///   谁也发不了消息，等于白白占着内存。
+fn bridge_stop_all(state: &BridgeState) {
+    let all: Vec<BridgeSession> = {
+        let mut sessions = state.sessions.lock().unwrap();
+        // ★ 先 drain 出来、把锁放掉，再去 kill + wait ——
+        //   wait 是阻塞的，握着锁等子进程退出会把别的命令一起堵住
+        sessions.drain().map(|(_, session)| session).collect()
+    };
+
+    for mut session in all {
+        let _ = session.child.kill();
+        let _ = session.child.wait();
+    }
+}
+
+/// 起一个语言服务器
 #[tauri::command]
 async fn lsp_start(
     app: AppHandle,
@@ -1112,19 +1276,69 @@ async fn lsp_start(
         .find(|s| s.id == server_id)
         .ok_or_else(|| format!("找不到语言服务器：{server_id}"))?;
 
-    let mut command = Command::new(&info.program);
-    command.args(&info.args);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    start_bridge(app, &state.0, session, &info.program, &info.args, cwd.as_deref(), "lsp")
+}
 
-    // cwd 只在目录真的存在时才设 —— 设一个不存在的路径会让 spawn 整个失败
-    //（终端那块踩过同一个坑）
-    if let Some(dir) = cwd.as_ref().filter(|d| Path::new(d).is_dir()) {
-        command.current_dir(dir);
-    }
+/// 往前端指定的会话发一帧
+#[tauri::command]
+async fn lsp_send(state: State<'_, LspState>, session: String, message: String) -> Result<(), String> {
+    bridge_send(&state.0, &session, &message, "语言服务器")
+}
 
-    // ⚠ Windows 上不给这个的话会闪一个黑框（和 git 命令同一个坑）
+/// 关掉一个会话（同时把进程杀掉）
+#[tauri::command]
+async fn lsp_stop(state: State<'_, LspState>, session: String) -> Result<(), String> {
+    bridge_stop(&state.0, &session);
+    Ok(())
+}
+
+/// 关掉**所有**会话（刷新页面时先清一次，见 bridge_stop_all 的说明）
+#[tauri::command]
+async fn lsp_stop_all(state: State<'_, LspState>) -> Result<(), String> {
+    bridge_stop_all(&state.0);
+    Ok(())
+}
+
+// ============================ 调试（DAP） ============================
+//
+// ★★ DAP 和 LSP 的关系：**兄弟协议**。
+//   · 分帧一模一样（`Content-Length` + JSON），所以传输层直接复用上面那套
+//   · 区别在语义：LSP 管「代码长什么样」，DAP 管「程序跑到哪儿了」
+//   · 前端也是一样：`dap.ts` 和 `lsp.ts` 同构，但请求/事件的形状完全不同
+//
+// ★ 为什么不自己写调试器：调试器的核心是跟**操作系统**打交道
+//   （断点 = 改机器码 / ptrace / 系统调试 API），那是另一个量级的工程。
+//   业界统一的做法就是「说 DAP 这门语言，让现成的适配器去干活」——
+//   VS Code 那几百个 debugger 扩展全是这么实现的
+
+/// 一个可用的调试适配器
+#[derive(Serialize, Clone)]
+struct DapAdapterInfo {
+    /// 稳定标识（"debugpy" …）。前端拿它当会话 id 的一部分
+    id: String,
+    /// 给人看的名字
+    label: String,
+    /// 管哪些扩展名。前端拿它决定「当前这个文件能不能调试」
+    extensions: Vec<String>,
+    program: String,
+    args: Vec<String>,
+}
+
+/// 适配器清单只问一次 —— 每个候选都要真起一个进程问一遍「装没装」，不便宜
+static DAP_ADAPTERS: OnceLock<Vec<DapAdapterInfo>> = OnceLock::new();
+
+/// 问一下这个 python 里有没有 debugpy。
+///
+/// ⚠ ★ 必须带超时：这不是「一定会结束」的命令。
+///   Windows 上 `python3` 常常是应用商店的**别名占位**，一跑就等用户去装 ——
+///   没有超时的话这个命令会把调它的那条线程永久占住
+fn has_debugpy(program: &str) -> bool {
+    let mut command = Command::new(program);
+    command.args(["-c", "import debugpy"]);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -1132,126 +1346,107 @@ async fn lsp_start(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("启动语言服务器失败：{error}"))?;
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
 
-    let stdin = child.stdin.take().ok_or("拿不到语言服务器的 stdin")?;
-    let stdout = child.stdout.take().ok_or("拿不到语言服务器的 stdout")?;
-    let stderr = child.stderr.take().ok_or("拿不到语言服务器的 stderr")?;
-
-    spawn_lsp_reader(app.clone(), session.clone(), stdout);
-    spawn_lsp_stderr(app, session.clone(), stderr);
-
-    state.sessions.lock().unwrap().insert(
-        session,
-        LspSession {
-            child,
-            stdin: Arc::new(Mutex::new(stdin)),
-        },
-    );
-
-    Ok(())
-}
-
-/// 读服务器的输出，一帧一条事件发给前端
-fn spawn_lsp_reader(app: AppHandle, session: String, stdout: ChildStdout) {
-    // ★ 必须开独立线程：`read` 是阻塞的，挂在命令里会把命令线程整个卡死
-    //   （终端的 pty 那块踩过同一个坑）
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
-        loop {
-            match read_frame(&mut reader) {
-                Ok(Some(body)) => {
-                    let _ = app.emit(
-                        "lsp-message",
-                        LspMessage {
-                            session: session.clone(),
-                            body,
-                        },
-                    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if std::time::Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
                 }
-                // EOF = 服务器退出了，正常结束
-                Ok(None) => break,
-                Err(error) => {
-                    let _ = app.emit("lsp-error", format!("{session}: {error}"));
-                    break;
-                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
+            Err(_) => return false,
         }
-        // 不管怎么结束都通知一声 —— 前端要拿它把「已连接」状态收回去
-        let _ = app.emit("lsp-exit", session);
-    });
+    }
 }
 
-/// 服务器的 stderr 也得有人读。
+/// 枚举本机可用的调试适配器。
 ///
-/// ⚠ 不读的话管道缓冲区会满，服务器一写日志就**卡死在那儿** ——
-///   表现是「服务器起来了一会儿就没反应了」，而 stdout 那边什么都看不到
-fn spawn_lsp_stderr(app: AppHandle, session: String, stderr: ChildStderr) {
-    std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = app.emit("lsp-stderr", format!("[{session}] {line}"));
+/// ★ 和语言服务器一个思路：**不自己打包适配器，用机器上已有的**。
+///   目前只认 debugpy（Python）—— 它是标准的 **stdio** DAP，
+///   和我们这套传输层天然合拍。
+///
+/// ⚠ js-debug（Node 那个，VS Code 自带）也在这台机器上，但它**不是 stdio**：
+///   它要监听一个端口、用 socket 说话 ⇒ 得先给传输层加 TCP 支持。
+///   那是下一步的事（这个列表加一项就行）
+fn find_dap_adapters() -> Vec<DapAdapterInfo> {
+    let mut adapters = Vec::new();
+
+    // ⚠ 只试 `python` 和 `py`，**故意不试 `python3`**：
+    //   Windows 上它常常是应用商店的别名占位，跑起来只会弹商店
+    for (bin, id) in [("python", "debugpy"), ("py", "debugpy-py")] {
+        let Some(program) = which(bin) else { continue };
+        // ★ 光有 python 不够，还得确认 debugpy 真的装了 ——
+        //   这是**环境事实**，只有真问一下才知道。
+        //   不问的话，用户要点「启动调试」才会看到一句难懂的 ModuleNotFoundError
+        if !has_debugpy(&program) {
+            continue;
         }
-    });
+        adapters.push(DapAdapterInfo {
+            id: id.to_string(),
+            label: format!("Python（{bin} + debugpy）"),
+            extensions: vec!["py".to_string()],
+            program,
+            // `python -m debugpy.adapter` 就是 VS Code 的 Python 扩展用的那个入口
+            args: vec!["-m".to_string(), "debugpy.adapter".to_string()],
+        });
+    }
+
+    adapters
 }
 
-/// 往前端指定的会话发一帧
-#[tauri::command]
-async fn lsp_send(state: State<'_, LspState>, session: String, message: String) -> Result<(), String> {
-    // ★ 先把 stdin 的 Arc 取出来、把 sessions 那把锁放掉，再去写 ——
-    //   写管道是会阻塞的，握着大锁写会把别的会话一起堵住
-    let stdin = {
-        let sessions = state.sessions.lock().unwrap();
-        let found = sessions
-            .get(&session)
-            .ok_or_else(|| format!("没有这个会话：{session}"))?;
-        Arc::clone(&found.stdin)
-    };
+fn dap_adapters_cached() -> Vec<DapAdapterInfo> {
+    DAP_ADAPTERS.get_or_init(find_dap_adapters).clone()
+}
 
-    let mut stdin = stdin.lock().unwrap();
-    // ⚠ `&mut *stdin` 而不是 `&mut stdin`：MutexGuard 本身不是 Write，
-    //   要显式解引用成里面的 ChildStdin
-    write_frame(&mut *stdin, &message).map_err(|error| format!("写给语言服务器失败：{error}"))?;
+/// 列出可用的调试适配器
+#[tauri::command]
+async fn dap_adapters() -> Vec<DapAdapterInfo> {
+    // 要真起进程问「装没装」，算阻塞 IO —— 别占住 async 的线程
+    tauri::async_runtime::spawn_blocking(dap_adapters_cached)
+        .await
+        .unwrap_or_default()
+}
+
+/// 起一个调试适配器
+#[tauri::command]
+async fn dap_start(
+    app: AppHandle,
+    state: State<'_, DapState>,
+    session: String,
+    adapter_id: String,
+    cwd: Option<String>,
+) -> Result<(), String> {
+    let info = dap_adapters_cached()
+        .into_iter()
+        .find(|a| a.id == adapter_id)
+        .ok_or_else(|| format!("找不到调试适配器：{adapter_id}"))?;
+
+    start_bridge(app, &state.0, session, &info.program, &info.args, cwd.as_deref(), "dap")
+}
+
+#[tauri::command]
+async fn dap_send(state: State<'_, DapState>, session: String, message: String) -> Result<(), String> {
+    bridge_send(&state.0, &session, &message, "调试适配器")
+}
+
+#[tauri::command]
+async fn dap_stop(state: State<'_, DapState>, session: String) -> Result<(), String> {
+    bridge_stop(&state.0, &session);
     Ok(())
 }
 
-/// 关掉一个会话（同时把进程杀掉）
+/// 关掉所有调试会话（刷新页面时先清一次）
 #[tauri::command]
-async fn lsp_stop(state: State<'_, LspState>, session: String) -> Result<(), String> {
-    let mut sessions = state.sessions.lock().unwrap();
-    if let Some(mut found) = sessions.remove(&session) {
-        // kill 失败不是错误 —— 进程可能已经自己退了
-        let _ = found.child.kill();
-        let _ = found.child.wait();
-    }
-    Ok(())
-}
-
-/// 关掉**所有**会话。
-///
-/// ★★ 为什么需要它：前端**刷新页面**时（开发时改一行就 HMR、或者用户按 F5），
-///   旧页面的 `onUnmounted` 里那个 `disposeLsp()` 根本不会执行 ——
-///   页面是被直接拆掉的，不是「卸载」。于是 Rust 侧那些进程全成了孤儿：
-///   没人 stop、也没人会再给它们发消息。
-///   新页面起来时先清一次，就不会一代一代攒下来。
-///
-/// ⚠ 还有个更隐蔽的后果：进程虽然「活着」，但它的 stdin 只有 Rust 手里那一份。
-///   谁也发不了消息，等于白白占着内存。
-#[tauri::command]
-async fn lsp_stop_all(state: State<'_, LspState>) -> Result<(), String> {
-    let all: Vec<LspSession> = {
-        let mut sessions = state.sessions.lock().unwrap();
-        // ★ 先 drain 出来、把锁放掉，再去 kill + wait ——
-        //   wait 是阻塞的，握着锁等子进程退出会把别的命令一起堵住
-        sessions.drain().map(|(_, session)| session).collect()
-    };
-
-    for mut session in all {
-        let _ = session.child.kill();
-        let _ = session.child.wait();
-    }
+async fn dap_stop_all(state: State<'_, DapState>) -> Result<(), String> {
+    bridge_stop_all(&state.0);
     Ok(())
 }
 
@@ -2647,12 +2842,18 @@ pub fn run() {
             lsp_start,
             lsp_send,
             lsp_stop,
-            lsp_stop_all
+            lsp_stop_all,
+            dap_adapters,
+            dap_start,
+            dap_send,
+            dap_stop,
+            dap_stop_all
         ])
         // 终端会话表。放在 State 里而不是全局变量 —— Tauri 会管它的生命周期
         .manage(PtyState::default())
-        // 语言服务器会话表。同样的理由
+        // 语言服务器 / 调试适配器的会话表。同样的理由
         .manage(LspState::default())
+        .manage(DapState::default())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
