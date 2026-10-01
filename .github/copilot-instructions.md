@@ -984,30 +984,37 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
     主题文件里**没有** `gitDecoration.*` 这些键，它们属于 VS Code 代码里的默认值
     （和 `terminal.ansi*` 同一类情况）。浅色必须换 ——
     深色那套 `#e2c08d`（淡黄）/ `#73c991`（亮绿）铺在白底上直接发糊
-  ★★ **活动栏图标直接用 VS Code 原生的 codicon 路径，不自己描**：
+  ★★ **活动栏三个图标全部用 VS Code 原生的 codicon 路径，不自己描**：
     从 `raw.githubusercontent.com/microsoft/vscode-codicons/main/src/icons/<名字>.svg`
     用 `Invoke-WebRequest` 下下来，把 `<path d="...">` 原样抄进 `ACTIVITY_VIEWS`。
-    比手画一个「大概像」的可靠得多 —— 而且省掉了下面那些几何坑
+    比手画一个「大概像」的可靠得多 —— 而且省掉了下面那些几何坑。
+    现在用的是 `files` / `search-large` / `source-control`
+    ⚠ ★ **抄之前先看 svg 上的 `viewBox`，网格尺寸不一样**：
+      `files` / `search-large` / `source-control` 是 **24×24**，
+      而 `search`（不带 -large）是 **16×16** —— 那是给菜单 / 按钮用的，
+      **活动栏要的是 `search-large`**。想找同类变体：
+      `(Invoke-RestMethod "https://api.github.com/repos/microsoft/vscode-codicons/contents/src/icons").name`
+      列一遍全部 655 个名字再筛
     ★★ **codicon 是「填充」图形，不是描边图形**（`fill="currentColor"`，没有 `stroke`）：
       图上那几个圆之所以看着像空心环，靠的是子路径**绕向相反** ——
       在 nonzero 填充规则下把内圈那块**挖掉**。
-      ⇒ 用我们默认的 `fill="none" stroke="currentColor"` 画，得到的是「粗描边轮廓图」
+      ⇒ 用 `fill="none" stroke="currentColor"` 画，得到的是「粗描边轮廓图」
         （圆的孔被描边填小、连接线变成粗条），**和原生完全不是一个东西**；
         单纯把 `fill` 打开、`stroke` 留着更糟：两个一起画
-      ⇒ 所以 `ACTIVITY_VIEWS` 有了 `filled?: boolean`，
-        在 CSS 里写成 `.activity-item svg.icon-filled { fill: currentColor; stroke: none }`
-        （用 CSS 而不是绑 `:fill` / `:stroke`：HTML 呈现属性优先级**最低**，
-         CSS 天然盖得住，模板里那几行可以原样留着）
-    ⚠ **不同 codicon 的网格尺寸不一样**！`source-control` / `files` 是 24×24，
-      而 `search` 是 **16×16**。抄之前先看 svg 上的 `viewBox`，别一律按 24 算
-    ⚠ **codicon 是「满格」设计**：`source-control` 竖着占满 y `0→24`。
-      所以它比我们手画的那两个（16 / 17 高）**明显大一圈** ——
-      在原生 VS Code 里所有图标都是这个尺寸，是我们那两个偏小
+      ⇒ 所以 svg 上**不写** fill / stroke，统一由一条 CSS 给：
+        `.activity-item svg { fill: currentColor }`。
+        写在 CSS 而不是属性上，「图标是填充的」这件事只有一个出处，
+        模板里不用重复三遍（真想加描边图标时再开例外）
+    ⚠ **codicon 是「满格」设计**：内容从 x/y 的 0 一路铺到 24，
+      所以它比之前手画的那版（16~17 高）**明显大一圈** ——
+      而原生 VS Code 里所有活动栏图标都是这个尺寸，是手画的那版偏小了。
+      三个都换掉之后才协调（实测 `19.5×24` / `21×21` / `18×24`）
+    ⚠ 实测居中：活动栏 48px，三个图标的 `svg` 都是左右各留 12px
   ⚠ ★★ **拿「克隆到浮层上放大」验证图标时有个陷阱**：
-    把 svg `cloneNode` 到活动栏**外面**之后，`.activity-item svg.icon-filled`
-    这条选择器**就不匹配了**（它要求是活动栏的后代）——
-    于是克隆体按 HTML 属性（`fill="none" stroke`）渲染，
-    截出来一张「粗描边、孔很小」的假图，会让人以为自己的改动写错了。
+    把 svg `cloneNode` 到活动栏**外面**之后，`.activity-item svg` 这条选择器
+    **就不匹配了**（它要求是活动栏的后代）——
+    于是克隆体按 HTML 属性渲染（早先是 `fill="none" stroke`，现在干脆是默认的黑色填充），
+    截出来一张假图，会让人以为自己的改动写错了。
     ⇒ 要么把浮层挂进 `.activity-item` 里，要么给浮层补一条同名作用域的规则。
       这类「脱离原上下文之后就变样」的验证陷阱，和 scoped 样式那条是同一类
   ⚠ ★★ **活动栏图标的路径必须「围绕 viewBox 中心」画**：
@@ -1018,8 +1025,13 @@ node scripts/check-theme-colors.mjs     # 哪些 UI 颜色键深浅两边都有
     ★ 验证办法：量**路径自己**的包围盒，而不是 svg 元素的位置 ——
       `svg.querySelector("path").getBBox()`，
       `x + width/2` 和 `y + height/2` 都应该落在 12 附近。
-      实测：资源管理器 `(12, 12)` / 搜索 `(12.5, 12.5)` / 源代码管理 `(12, 12)`
+      实测：搜索 `(12, 12)` / 源代码管理 `(12, 12)`；
+      资源管理器 `(11.25, 12)` —— **这个 0.75 是 `files` 自带的**
+      （后面那张纸只露出一角），原生就是这样，不是我们画歪了
     ★ 想看得清就放大截图 —— 24px 下的细节肉眼根本判不出来
+    ⚠ **别用 `position: fixed` 把活动栏挪出来截图**：它会脱离 flex，
+      `flex: 0 0 48px` 失效、宽度塌成 24px，截出来的图全是错的
+      （实测踩到过，还以为图标溢出了）
 
 ### 待办（按优先级）
 
