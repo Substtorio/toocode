@@ -56,6 +56,7 @@ import { registerLspLanguage, registerLspOpenHandler } from "./lspFeatures";
 // 前端分开是因为两个协议的语义完全不同（一个管代码长什么样，一个管程序跑到哪儿了）
 import {
   adapterFor,
+  attachToDebugPort,
   availableAdapters,
   configureDap,
   currentSession,
@@ -2754,6 +2755,9 @@ const debugConsoleText = computed(() => debugConsole.value.join(""));
 /** 启动 / 停止这些动作进行中，按钮置灰 */
 const debugBusy = ref(false);
 
+/** 「连接到调试端口」那一栏里填的端口 */
+const debugAttachPort = ref("");
+
 const debugStateLabel = computed(() => {
   switch (debugState.value) {
     case "starting":
@@ -3005,6 +3009,54 @@ async function stopDebug(): Promise<void> {
   if (session !== null) await session.stop(true);
   // 会话已经结束了的话 onEnded 不会再来，这里自己收一次
   if (debugState.value !== "idle") finishDebugView("已停止");
+}
+
+/**
+ * 连到一个**已经在监听**的调试适配器端口，然后调试当前文件。
+ *
+ * ★★ 为什么需要这条路径：有些适配器**只**提供端口模式
+ *   （js-debug 那一系的 `DebugAdapterServer`、跑在别的机器上的适配器）。
+ *   stdio 那条路对它们无能为力
+ * ⚠ 我们不负责把那个适配器拉起来 —— 那是用户自己的事，
+ *   比如先在终端里跑 `python -m debugpy.adapter --port 5678`
+ */
+async function attachDebugPort(): Promise<void> {
+  const port = Number(debugAttachPort.value.trim());
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    appendDebugConsole(`[端口填得不对] ${debugAttachPort.value}\n`);
+    scrollDebugConsole();
+    return;
+  }
+
+  // 调的还是「当前这个文件」—— 端口那头的适配器负责把它跑起来
+  const program = debuggableFile();
+  if (program === null) {
+    appendDebugConsole("[先打开一个能被调试的文件]\n");
+    scrollDebugConsole();
+    return;
+  }
+
+  debugBusy.value = true;
+  debugState.value = "starting";
+  debugTarget.value = program;
+  clearDebugScene();
+  appendDebugConsole(`[连接] 127.0.0.1:${port}\n`);
+  scrollDebugConsole();
+
+  const ok = await attachToDebugPort(
+    { host: "127.0.0.1", port },
+    program,
+    workspaceRoot.value,
+    [...breakpoints.value.keys()],
+  );
+
+  debugBusy.value = false;
+  if (!ok) {
+    debugState.value = "idle";
+    debugTarget.value = null;
+    appendDebugConsole("[连接失败]\n");
+    scrollDebugConsole();
+  }
 }
 
 /** 会话结束（自己停 / 程序跑完 / 进程没了）时把界面收回来 */
@@ -5633,6 +5685,34 @@ watch(activeTabPath, async (path) => {
                 ×
               </button>
             </div>
+          </div>
+
+          <!-- 连接到已经在监听的调试端口。
+               ★ 为什么要这个：有些适配器**只**提供端口模式，
+                 stdio 那条路对它们无能为力 -->
+          <div class="debug-section">
+            <div class="debug-section-title">连接到调试端口</div>
+            <div class="debug-attach">
+              <input
+                v-model="debugAttachPort"
+                class="debug-attach-input"
+                type="text"
+                placeholder="端口"
+                spellcheck="false"
+                @keydown.enter="attachDebugPort"
+              />
+              <button
+                class="debug-attach-go"
+                type="button"
+                :disabled="debugBusy || debugAdapter === null"
+                @click="attachDebugPort"
+              >
+                附加
+              </button>
+            </div>
+            <p class="sidebar-empty">
+              适配器已经在某个端口上监听时用它（例：python -m debugpy.adapter --port 5678）
+            </p>
           </div>
         </div>
 
@@ -8283,6 +8363,54 @@ kbd {
 .debug-bp-remove:hover {
   background: var(--color-hover);
   color: var(--color-text);
+}
+
+/* ---------- 连接到调试端口 ---------- */
+
+.debug-attach {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 12px 4px;
+}
+
+.debug-attach-input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  outline: none;
+}
+
+/* ★ 聚焦时用 --color-selection（VS Code 的焦点边框色），
+   而不是 --color-link —— 后者是「文字链接」那种偏亮的蓝 */
+.debug-attach-input:focus {
+  border-color: var(--color-selection);
+}
+
+.debug-attach-go {
+  flex: 0 0 auto;
+  padding: 3px 10px;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.debug-attach-go:hover:not(:disabled) {
+  background: var(--color-hover);
+}
+
+/* ⚠ 禁用态写在 :hover 之后（同优先级后写的赢），否则鼠标移上去还是会亮 */
+.debug-attach-go:disabled {
+  color: var(--color-text-faint);
+  cursor: default;
 }
 
 /* ---------- 调试控制台 ---------- */

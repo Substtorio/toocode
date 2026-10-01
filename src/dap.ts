@@ -133,13 +133,22 @@ interface PendingRequest {
   settle: (body: unknown | null) => void;
 }
 
-/** 一个调试会话 = 一个适配器进程 + 一次调试活动 */
+/** 一个调试会话 = 一个适配器进程（或一个端口连接）+ 一次调试活动 */
 class DapSession {
   readonly id: string;
-  private readonly adapter: DapAdapterInfo;
+  /** 给人看的名字，只用在日志里 */
+  private readonly label: string;
   private readonly host: DapHost;
   private readonly disposers: UnlistenFn[] = [];
   private readonly pending = new Map<number, PendingRequest>();
+
+  /**
+   * `launch` 请求里那个 `type`。
+   *
+   * ★ 它由适配器决定（debugpy 是 "python"），两种传输都一样 ——
+   *   它描述的是「谁来跑这个程序」，不是「通道怎么连」
+   */
+  private launchType = "python";
 
   /**
    * `initialized` 事件还没来的时候挂在这儿。
@@ -155,8 +164,8 @@ class DapSession {
   /** 当前停在哪个线程上 —— `continue` / 单步都要用它 */
   private threadId = 0;
 
-  constructor(adapter: DapAdapterInfo, id: string, host: DapHost) {
-    this.adapter = adapter;
+  constructor(label: string, id: string, host: DapHost) {
+    this.label = label;
     this.id = id;
     this.host = host;
   }
@@ -165,8 +174,45 @@ class DapSession {
     return this.ended;
   }
 
-  /** 起适配器、握手、把断点设上，然后让它跑起来 */
-  async start(program: string, cwd: string | null, breakpointFiles: string[]): Promise<void> {
+  /**
+   * 起适配器（stdio）并跑起来。
+   */
+  async start(
+    adapter: DapAdapterInfo,
+    program: string,
+    cwd: string | null,
+    breakpointFiles: string[],
+  ): Promise<void> {
+    this.launchType = "python";
+    await this.connect(program, cwd, breakpointFiles, () =>
+      invoke("dap_start", { session: this.id, adapterId: adapter.id, cwd }),
+    );
+  }
+
+  /**
+   * 连到一个**已经在监听端口**的适配器。
+   *
+   * ★★ 和 stdio 唯一的区别就是「怎么把通道接上」——
+   *   握手、断点、单步、变量……**一模一样**（实测过完整流程）
+   */
+  async attach(
+    remote: { host: string; port: number },
+    program: string,
+    cwd: string | null,
+    breakpointFiles: string[],
+  ): Promise<void> {
+    await this.connect(program, cwd, breakpointFiles, () =>
+      invoke("dap_attach", { session: this.id, host: remote.host, port: remote.port }),
+    );
+  }
+
+  /** 握手：两条路都走这里 */
+  private async connect(
+    program: string,
+    cwd: string | null,
+    breakpointFiles: string[],
+    open: () => Promise<unknown>,
+  ): Promise<void> {
     // ⚠ ★★ 必须先 listen 再 start：反了会丢掉适配器启动时吐的头几帧
     //   （终端 PTY 和 LSP 那两处踩的都是同一个坑）。
     //   也正因为这个顺序，**会话 id 由前端生成**
@@ -195,15 +241,11 @@ class DapSession {
       }),
     );
 
-    await invoke("dap_start", {
-      session: this.id,
-      adapterId: this.adapter.id,
-      cwd,
-    });
+    await open();
 
     // ---- 握手 ----
     const capabilities = await this.request("initialize", {
-      adapterID: this.adapter.id,
+      adapterID: this.launchType,
       clientID: "toocode",
       clientName: "Toocode",
       linesStartAt1: true,
@@ -213,7 +255,7 @@ class DapSession {
       supportsVariableType: true,
     });
     this.host.log(
-      `[DAP] ${this.adapter.label} 就绪（configurationDone：${
+      `[DAP] ${this.label} 就绪（configurationDone：${
         readCapability(capabilities, "supportsConfigurationDoneRequest") ? "支持" : "不支持"
       }）`,
     );
@@ -224,7 +266,7 @@ class DapSession {
 
     // ★★ launch **不 await**！响应会被压到 configurationDone 之后（见文件头说明）
     this.notify("launch", {
-      type: "python",
+      type: this.launchType,
       request: "launch",
       program,
       cwd,
@@ -587,14 +629,46 @@ export async function startDebugging(
   // ★ 会话 id 里掺时间戳：光用自增序号的话，刷新页面后会从 1 重新数，
   //   和上一页留在 Rust 里的那个**重名**（LSP 那边踩过这个坑，
   //   症状是「新会话被旧的退出事件标记成已停止」，然后什么都不动了）
-  const session = new DapSession(adapter, `dap-${Date.now().toString(36)}`, host);
+  const session = new DapSession(adapter.label, `dap-${Date.now().toString(36)}`, host);
   current = session;
 
   try {
-    await session.start(program, cwd, breakpointFiles);
+    await session.start(adapter, program, cwd, breakpointFiles);
     return true;
   } catch (error) {
     host.log(`[DAP] 启动失败：${String(error)}`);
+    await session.stop(true);
+    current = null;
+    return false;
+  }
+}
+
+/**
+ * 连到一个已经跑着的调试适配器端口，然后调试 `program`。
+ *
+ * ★ 什么场景用：适配器**只**提供端口模式（js-debug 那一系的 server）、
+ *   或者适配器根本不在本机（远程调试）
+ * ⚠ 不负责把那个适配器拉起来 —— 那是用户自己的事（比如先在终端里跑
+ *   `python -m debugpy.adapter --port 5678`）
+ */
+export async function attachToDebugPort(
+  remote: { host: string; port: number },
+  program: string,
+  cwd: string | null,
+  breakpointFiles: string[],
+): Promise<boolean> {
+  if (host === null) return false;
+  if (current !== null) await current.stop(true);
+
+  const label = `端口 ${remote.host}:${remote.port}`;
+  const session = new DapSession(label, `dap-${Date.now().toString(36)}`, host);
+  current = session;
+
+  try {
+    await session.attach(remote, program, cwd, breakpointFiles);
+    return true;
+  } catch (error) {
+    host.log(`[DAP] 连接调试端口失败：${String(error)}`);
     await session.stop(true);
     current = null;
     return false;

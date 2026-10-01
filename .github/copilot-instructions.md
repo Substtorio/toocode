@@ -1636,7 +1636,8 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     目前只认 **debugpy**（`python -m debugpy.adapter`），挑它的理由很实在：
     它是**标准的 stdio DAP**，和 LSP 那套传输层天然合拍。
     ⚠ js-debug（Node 那个，VS Code 自带）也在这台机器上，但它**不是 stdio** ——
-      要监听端口、用 socket 说话 ⇒ 得先给传输层加 TCP 支持。那是下一步
+      要监听端口、用 socket 说话 ⇒ 走下面那条「TCP 通道」。
+      ⚠ 但**它那条路是死的**，详见下面那一条
     ★ 探测是「真起进程问一遍」（`python -c "import debugpy"`），
       而且要**带超时**：Windows 上 `python3` 常常是应用商店的别名占位，
       一跑就等用户去装 —— 不带超时那条线程就永久占住了
@@ -1708,6 +1709,57 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     · 没接悬停求值（`supportsEvaluateForHovers`）
     · 「没验上的断点」那个空心圆样式写了，但本机 debugpy 对空行也回
       `verified: true` ⇒ 这条路径**没被真实触发过**
+
+- [x] **DAP 的 TCP 通道（接一个「已经在监听端口」的适配器）**：
+  ★★ **动机**：有些适配器**只有端口模式** —— 它们自己监听一个 socket，等客户端连上来。
+    stdio 那条路对它们无能为力（进程不是我们起的，也拿不到它的 stdin/stdout）
+  ★★★ **实测结论：TCP 的握手和 stdio 逐字节一样**
+    先拿 Node 直接连 `python -m debugpy.adapter --port 5678` 跑完一整轮：
+    initialize → launch（不等响应）→ initialized → setBreakpoints（回 `verified:true`）→
+    configurationDone → stopped 在第 2 行 → Locals `a=2 b=3` → continue →
+    stdout `5` → exited(0) → terminated。**全程不需要任何 access token**
+    ⇒ 所以「连端口」只在**传输层**加东西，协议层一行都不用改
+      （`DapSession` 里 `start()` / `attach()` 的差别只有「怎么把通道接上」，
+        之后走同一个私有 `connect()`）
+  ★★ **抽象：`BridgeWriter` 枚举**（`Stdio(ChildStdin)` / `Tcp(TcpStream)`）——
+    发消息的代码只认 `impl Write`，不用写 `if` 分支
+  ★★ **而读那边根本不需要枚举**：读线程本来就该是
+    `spawn_bridge_reader<R: Read + Send + 'static>(…)` —— 泛型一加，
+    `ChildStdout` 和 `TcpStream` 都能喂进去
+    ⇒ 通用教训：**「写」和「读」要分开抽象**。
+      写是「往哪儿发」，得存到结构体里活很久 ⇒ 枚举；
+      读是「起个线程一直读」，活不过那个线程 ⇒ 泛型就够，别硬套枚举
+  ⚠ **`BridgeSession.child` 变成 `Option<StdChild>`** —— TCP 会话**没有子进程**，
+    `bridge_stop` 里要 `if let Some(child) = entry.child.as_mut()`。
+    非 Option 的话就只能塞一个假 Child 进去，那是纯粹骗自己
+  ⚠ **`sessions` 得包成 `Arc<Mutex<HashMap<…>>>`** ——
+    连端口会**阻塞**（要重试几次），必须放 `spawn_blocking`；
+    而 `spawn_blocking` 的闭包要求 `'static`，借来的 `&Mutex` 进不去
+  ★ **连接要重试**（每 100ms 一次，最多 8 秒）：
+    用户多半会「先在应用里点附加、再去终端起适配器」，
+    一次失败就放弃的话他会以为「这功能不支持」
+    ⚠ `last_error` 故意**不**初始化成空串 —— 那样编译器会提示「赋了但没读过」
+  ⚠ **读线程泛型化之后 `ChildStdout` 就没用了** —— 记得从 `use std::process::{…}`
+    里删掉，否则只是一个 unused import 警告（不报错，但脏）
+  ⚠ 前端那个适配器列表里**两个 debugpy 其实是同一个东西**
+    （`python` 和 `py` 两条命令都指向它）⇒ 日志会出现两行
+    `Python（python + debugpy）、Python（py + debugpy）`。
+    界面上只取第一个，不影响功能
+  ✅ 验证（真 debugpy 1.8.22 + `--port 5678` + CDP 直连真窗口）：
+    · 侧栏新一欄「连接到调试端口」，填 `5678` → 点「附加」
+    · 日志 `[DAP] 端口 127.0.0.1:5678 就绪（configurationDone：支持）`
+    · 断点（第 2 行，F9 打的）生效：停在 `add demo.py:2`，
+      调用栈 `add demo.py:2` / `<module> demo.py:5`，Locals `a=2 b=3`
+    · 调试控制台求 `a + b` → `5`
+    · F5 继续 → 程序 stdout 打出 `5` → `[调试会话已结束]`
+  ★★ **js-debug 那条路是死的**（记一笔，免得下次又花时间去试）：
+    VS Code 自带的 js-debug **没有独立的 DAP 服务器入口** ——
+    `node bootloader.js` 直接退出（exit code 0、什么都不打印），
+    翻遍它目录也没有 `dapDebugServer.js`，整个仓库里没有 `--server` 这个字符串；
+    npm 上也没有（`@vscode/js-debug` 和 `vscode-js-debug` 都是 404）。
+    它只在 VS Code **自己的进程里**被当模块调起来，外面拿不到。
+    ⇒ 但 TCP 支持本身仍然值：`debugpy.adapter --port` 就能用，
+      而且「连到远端机器上的适配器」也只能走它
 
 ### 待办（按优先级）
 

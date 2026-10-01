@@ -4,12 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 // ⚠ `Child` 这个名字已经被 portable_pty 占了（终端那块的），
 //   所以 std 的这个显式改名成 StdChild —— 两边混用会编不过，但报错信息不好懂
-use std::process::{
-    Child as StdChild, ChildStderr, ChildStdin, ChildStdout, Command, Stdio,
-};
+// ★ 这里**不需要** ChildStdout：读线程已经泛型化成 `impl Read` 了
+use std::process::{Child as StdChild, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, State};
 
@@ -933,20 +933,51 @@ struct LspServerInfo {
     args: Vec<String>,
 }
 
+/// 写端。★ stdio 和 TCP 两种形态——上面那层（`write_frame`）不必知道区别，
+/// 把差异圈在这一个枚举里
+enum BridgeWriter {
+    /// 子进程的 stdin（LSP 和 debugpy 的默认形态）
+    Stdio(ChildStdin),
+    /// 一个 TCP 连接（适配器**自己监听端口**的那种，比如 debugpy 的 `--port` 模式）。
+    /// ⚠ 选它是因为：有些适配器**只**提供端口模式（尤其 js-debug 那一系）
+    Tcp(TcpStream),
+}
+
+impl Write for BridgeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdio(writer) => writer.write(buf),
+            Self::Tcp(writer) => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stdio(writer) => writer.flush(),
+            Self::Tcp(writer) => writer.flush(),
+        }
+    }
+}
+
 /// 跑起来的桥。**LSP 和 DAP 共用同一个形状** ——
-/// 两边都是「一个子进程 + 一条 stdin 管道 + 一套 Content-Length 分帧」，没什么可分的
+/// 两边都是「一个子进程（或一个 socket）+ 一套 Content-Length 分帧」，没什么可分的
 struct BridgeSession {
-    /// 留着是为了 stop 时能 kill —— 不存的话进程就没人管了
-    child: StdChild,
+    /// 留着是为了 stop 时能 kill —— 不存的话进程就没人管了。
+    /// ⚠ TCP 模式可能**没有**子进程（适配器早就跑在别处了），所以是 Option
+    child: Option<StdChild>,
     /// ★ 包成 Arc<Mutex<…>> 是为了「拿得到就行」：
     ///   发消息时不必在整个写操作期间占着 sessions 那把大锁
-    stdin: Arc<Mutex<ChildStdin>>,
+    writer: Arc<Mutex<BridgeWriter>>,
 }
 
 /// 会话表
+///
+/// ★ 里面那层是 `Arc<Mutex<…>>` 而不是裸的 `Mutex<…>`：
+///   连 TCP 端口是**阻塞**且要重试的，得放到 `spawn_blocking` 里干，
+///   而 `State` 不让移出去 —— 所以能移的只有这个 Arc
 #[derive(Default)]
 struct BridgeState {
-    sessions: Mutex<HashMap<String, BridgeSession>>,
+    sessions: Arc<Mutex<HashMap<String, BridgeSession>>>,
 }
 
 /// ★ 为什么不干脆 `manage(BridgeState::default())` 两次：
@@ -1118,7 +1149,7 @@ async fn lsp_servers() -> Vec<LspServerInfo> {
 ///   区别只在**事件名**（`lsp-message` / `dap-message`）和程序参数。
 fn start_bridge(
     app: AppHandle,
-    state: &BridgeState,
+    sessions: &Mutex<HashMap<String, BridgeSession>>,
     session: String,
     program: &str,
     args: &[String],
@@ -1154,23 +1185,79 @@ fn start_bridge(
     spawn_bridge_reader(app.clone(), session.clone(), stdout, channel);
     spawn_bridge_stderr(app, session.clone(), stderr, channel);
 
-    state.sessions.lock().unwrap().insert(
+    sessions.lock().unwrap().insert(
         session,
         BridgeSession {
-            child,
-            stdin: Arc::new(Mutex::new(stdin)),
+            child: Some(child),
+            writer: Arc::new(Mutex::new(BridgeWriter::Stdio(stdin))),
         },
     );
 
     Ok(())
 }
 
-/// 读子进程的输出，一帧一条事件发给前端
-fn spawn_bridge_reader(app: AppHandle, session: String, stdout: ChildStdout, channel: &'static str) {
+/// 连到一个**已经在监听端口**的调试适配器。
+///
+/// ★★ 为什么要重试：适配器刚被拉起来时，端口可能还没进入监听状态。
+///   只连一次的话会**偶发**失败，而且报错是「拒绝连接」，看起来像端口写错了
+/// ⇒ 给一个总超时（默认 8 秒），里面每隔 100ms 试一次
+///
+/// ★ 这种模式下**没有子进程**：适配器是别人（用户自己 / 另一个工具）拉起来的，
+///   我们只是接上去。所以 `stop` 时只关连接，不去 kill 谁
+fn connect_bridge(
+    app: AppHandle,
+    sessions: &Mutex<HashMap<String, BridgeSession>>,
+    session: String,
+    host: &str,
+    port: u16,
+    channel: &'static str,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    // ★ 不初始化成空串：那样编译器会提示「赋了但没读过」
+    let mut last_error;
+
+    loop {
+        match TcpStream::connect((host, port)) {
+            Ok(stream) => {
+                // ★ 读写要各用一份：try_clone 出来的是**同一个连接**的另一个句柄
+                let reader = stream
+                    .try_clone()
+                    .map_err(|error| format!("复制 socket 句柄失败：{error}"))?;
+
+                spawn_bridge_reader(app, session.clone(), reader, channel);
+
+                sessions.lock().unwrap().insert(
+                    session,
+                    BridgeSession {
+                        child: None,
+                        writer: Arc::new(Mutex::new(BridgeWriter::Tcp(stream))),
+                    },
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                last_error = error.to_string();
+                if std::time::Instant::now() > deadline {
+                    return Err(format!("连不上 {host}:{port}（重试了 8 秒）：{last_error}"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+}
+
+/// 读子进程 / socket 的输出，一帧一条事件发给前端。
+///
+/// ★ 参数写成 `impl Read`：stdio（`ChildStdout`）和 TCP（`TcpStream`）都是它 ——
+///   于是这两种传输的**读循环只需要一份代码**
+fn spawn_bridge_reader<R>(app: AppHandle, session: String, input: R, channel: &'static str)
+where
+    R: Read + Send + 'static,
+{
     // ★ 必须开独立线程：`read` 是阻塞的，挂在命令里会把命令线程整个卡死
     //   （终端的 pty 那块踩过同一个坑）
     std::thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
+        let mut reader = BufReader::new(input);
         loop {
             match read_frame(&mut reader) {
                 Ok(Some(body)) => {
@@ -1210,31 +1297,40 @@ fn spawn_bridge_stderr(app: AppHandle, session: String, stderr: ChildStderr, cha
 }
 
 /// 往指定的会话发一帧
-fn bridge_send(state: &BridgeState, session: &str, message: &str, what: &str) -> Result<(), String> {
-    // ★ 先把 stdin 的 Arc 取出来、把 sessions 那把锁放掉，再去写 ——
-    //   写管道是会阻塞的，握着大锁写会把别的会话一起堵住
-    let stdin = {
-        let sessions = state.sessions.lock().unwrap();
-        let found = sessions
+fn bridge_send(
+    sessions: &Mutex<HashMap<String, BridgeSession>>,
+    session: &str,
+    message: &str,
+    what: &str,
+) -> Result<(), String> {
+    // ★ 先把写端的 Arc 取出来、把 sessions 那把锁放掉，再去写 ——
+    //   写管道 / socket 是会阻塞的，握着大锁写会把别的会话一起堵住
+    let writer = {
+        let found = sessions.lock().unwrap();
+        let entry = found
             .get(session)
             .ok_or_else(|| format!("没有这个会话：{session}"))?;
-        Arc::clone(&found.stdin)
+        Arc::clone(&entry.writer)
     };
 
-    let mut stdin = stdin.lock().unwrap();
-    // ⚠ `&mut *stdin` 而不是 `&mut stdin`：MutexGuard 本身不是 Write，
-    //   要显式解引用成里面的 ChildStdin
-    write_frame(&mut *stdin, message).map_err(|error| format!("写给{what}失败：{error}"))?;
+    let mut writer = writer.lock().unwrap();
+    // ⚠ `&mut *writer` 而不是 `&mut writer`：MutexGuard 本身不是 Write，
+    //   要显式解引用成里面的写端
+    write_frame(&mut *writer, message).map_err(|error| format!("写给{what}失败：{error}"))?;
     Ok(())
 }
 
-/// 关掉一个会话（同时把进程杀掉）
-fn bridge_stop(state: &BridgeState, session: &str) {
-    let mut sessions = state.sessions.lock().unwrap();
-    if let Some(mut found) = sessions.remove(session) {
-        // kill 失败不是错误 —— 进程可能已经自己退了
-        let _ = found.child.kill();
-        let _ = found.child.wait();
+/// 关掉一个会话（有子进程就把它杀掉）
+fn bridge_stop(sessions: &Mutex<HashMap<String, BridgeSession>>, session: &str) {
+    let mut found = sessions.lock().unwrap();
+    if let Some(mut entry) = found.remove(session) {
+        // ⚠ TCP 模式（接别人的适配器）没有子进程 —— 不判一下会直接 panic。
+        //   那种情况下把连接丢掉（writer 被 drop）就是正确的「断开」
+        if let Some(child) = entry.child.as_mut() {
+            // kill 失败不是错误 —— 进程可能已经自己退了
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1248,17 +1344,19 @@ fn bridge_stop(state: &BridgeState, session: &str) {
 ///
 /// ⚠ 还有个更隐蔽的后果：进程虽然「活着」，但它的 stdin 只有 Rust 手里那一份。
 ///   谁也发不了消息，等于白白占着内存。
-fn bridge_stop_all(state: &BridgeState) {
+fn bridge_stop_all(sessions: &Mutex<HashMap<String, BridgeSession>>) {
     let all: Vec<BridgeSession> = {
-        let mut sessions = state.sessions.lock().unwrap();
+        let mut found = sessions.lock().unwrap();
         // ★ 先 drain 出来、把锁放掉，再去 kill + wait ——
         //   wait 是阻塞的，握着锁等子进程退出会把别的命令一起堵住
-        sessions.drain().map(|(_, session)| session).collect()
+        found.drain().map(|(_, session)| session).collect()
     };
 
-    for mut session in all {
-        let _ = session.child.kill();
-        let _ = session.child.wait();
+    for mut entry in all {
+        if let Some(child) = entry.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -1276,26 +1374,26 @@ async fn lsp_start(
         .find(|s| s.id == server_id)
         .ok_or_else(|| format!("找不到语言服务器：{server_id}"))?;
 
-    start_bridge(app, &state.0, session, &info.program, &info.args, cwd.as_deref(), "lsp")
+    start_bridge(app, &state.0.sessions, session, &info.program, &info.args, cwd.as_deref(), "lsp")
 }
 
 /// 往前端指定的会话发一帧
 #[tauri::command]
 async fn lsp_send(state: State<'_, LspState>, session: String, message: String) -> Result<(), String> {
-    bridge_send(&state.0, &session, &message, "语言服务器")
+    bridge_send(&state.0.sessions, &session, &message, "语言服务器")
 }
 
 /// 关掉一个会话（同时把进程杀掉）
 #[tauri::command]
 async fn lsp_stop(state: State<'_, LspState>, session: String) -> Result<(), String> {
-    bridge_stop(&state.0, &session);
+    bridge_stop(&state.0.sessions, &session);
     Ok(())
 }
 
 /// 关掉**所有**会话（刷新页面时先清一次，见 bridge_stop_all 的说明）
 #[tauri::command]
 async fn lsp_stop_all(state: State<'_, LspState>) -> Result<(), String> {
-    bridge_stop_all(&state.0);
+    bridge_stop_all(&state.0.sessions);
     Ok(())
 }
 
@@ -1429,24 +1527,57 @@ async fn dap_start(
         .find(|a| a.id == adapter_id)
         .ok_or_else(|| format!("找不到调试适配器：{adapter_id}"))?;
 
-    start_bridge(app, &state.0, session, &info.program, &info.args, cwd.as_deref(), "dap")
+    start_bridge(app, &state.0.sessions, session, &info.program, &info.args, cwd.as_deref(), "dap")
+}
+
+/// 连到一个**已经在监听端口**的调试适配器。
+///
+/// ★★ 为什么值得单独做一个命令：有些适配器**只**提供端口模式 ——
+///   js-debug 那一系的 `DebugAdapterServer`、跑在别的机器上的适配器等。
+///   stdio 那条路对它们无能为力（实测：VS Code 自带的 js-debug 在
+///   这台机器上**没有**可独立启动的 DAP 服务器入口，`node bootloader.js`
+///   直接就退了；它只接受扩展宿主驱动）。
+///   但带 `--port` 的适配器（比如 debugpy 的 debugServer 模式）就能这么接
+///
+/// ★ 握手流程和 stdio 模式**一模一样**（实测）：
+///   initialize → launch（不等响应）→ initialized → setBreakpoints → configurationDone ——
+///   换的只是传输层
+///
+/// ⚠ 连接是**阻塞且要重试**的（最多 8 秒），所以丢进 spawn_blocking ——
+///   别占住 async 的线程（和 `lsp_servers` 一个理由）
+#[tauri::command]
+async fn dap_attach(
+    app: AppHandle,
+    state: State<'_, DapState>,
+    session: String,
+    host: String,
+    port: u16,
+) -> Result<(), String> {
+    let sessions = Arc::clone(&state.0.sessions);
+    let target = host.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        connect_bridge(app, &sessions, session, &target, port, "dap")
+    })
+    .await
+    .map_err(|error| format!("连接调试端口失败：{error}"))?
 }
 
 #[tauri::command]
 async fn dap_send(state: State<'_, DapState>, session: String, message: String) -> Result<(), String> {
-    bridge_send(&state.0, &session, &message, "调试适配器")
+    bridge_send(&state.0.sessions, &session, &message, "调试适配器")
 }
 
 #[tauri::command]
 async fn dap_stop(state: State<'_, DapState>, session: String) -> Result<(), String> {
-    bridge_stop(&state.0, &session);
+    bridge_stop(&state.0.sessions, &session);
     Ok(())
 }
 
 /// 关掉所有调试会话（刷新页面时先清一次）
 #[tauri::command]
 async fn dap_stop_all(state: State<'_, DapState>) -> Result<(), String> {
-    bridge_stop_all(&state.0);
+    bridge_stop_all(&state.0.sessions);
     Ok(())
 }
 
@@ -2845,6 +2976,7 @@ pub fn run() {
             lsp_stop_all,
             dap_adapters,
             dap_start,
+            dap_attach,
             dap_send,
             dap_stop,
             dap_stop_all
