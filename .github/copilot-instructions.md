@@ -2099,12 +2099,18 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 
 ### 待办（按优先级）
 
-> **0.2.0 发布的收尾（2026-10-02 记下）**
-> - **Release 说明还是手写的那几条**（面板 / 活动栏 / 模型名称…）。可以换成整理过的那份：
->   `gh release edit v0.2.0 --notes-file <md>`（草稿那份在 tag 消息里，也见上面「0.2.0 实测记录」）
-> - **安装器本身没双击验过**（验的是 `release\toocode.exe`）。它 per-user 安装、不要管理员权限：
->   跑一遍 `bundle\nsis\Toocode_0.2.0_x64-setup.exe`，确认装完能起、开始菜单和卸载项都在、
->   并且用户数据目录 `%APPDATA%\com.toocode.app`（含密钥和聊天记录）不受影响
+> **0.2.0 发布的收尾 —— ✅ 两件都做完了（2026-10-02）**
+> 说明换成了整理过的那份（Topilot / LSP / DAP / 插件机制 / 工作台 + 四个静默 bug 的修复），
+> 安装器也真装了一遍又卸干净了 —— 实测见下面「0.2.0 安装器实测记录」。
+> 原来手写那 5 条（怕以后想找）：面板新增功能：调试控制台、问题 / 活动栏新增功能：
+> 运行与调试、源代码管理 / 将 Topilot 的模型名称显示改为模型版本 / 修改了活动栏图标 /
+> 修改了文件树展开收起箭头图标
+>
+> 还剩下的零碎（都不急）：
+> - `%APPDATA%\com.toocode.app\toocode.chats.json.bak`（19 KB，验证时留下的测试会话）——
+>   用户自己决定删不删。⚠ 顺手发现：真正的 `toocode.chats.json` **不存在**，只有这个 `.bak`
+> - `%LOCALAPPDATA%\com.toocode.app`（WebView2 配置目录）长到 **696 MB**，
+>   卸载**不会**删它，而且它和 dev 是共用的一份 —— **别手贱删**（见下面那条）
 
 1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。
    下一步是：
@@ -2688,6 +2694,57 @@ tag 填 `v0.1.0`（对上 `tauri.conf.json` 里的 `version`）→ 把
 想让老用户一升级就换过去，得改成「读的时候顺手迁一下」
 ⚠ 打包前记得先 `Get-Process toocode | Stop-Process -Force` 并确认 1420 释放，
   否则 dev 那边的 cargo 会和打包抢 `target` 的锁
+
+### 0.2.0 安装器实测记录（装 → 验 → 卸，完整走了一遍）
+
+| 步骤 | 期望 | 实测 |
+| --- | --- | --- |
+| 装 | per-user 安装、不要管理员权限 | ✅ 静默 `/S` 退出码 0、**2.3 秒** |
+| 装到哪 | `%LOCALAPPDATA%\Toocode` | ✅ 只有 2 个文件：`toocode.exe`（8,950,272 字节）+ `uninstall.exe`（79,094 字节）|
+| 开始菜单 | 有快捷方式 | ✅ `Programs\Toocode.lnk` |
+| 桌面 | —— | ✅ **也有一个**（Tauri 的 NSIS 模板两个都建），两个的 `IconLocation` 都是 `,0` |
+| 卸载登记项 | 出现在「应用和功能」里 | ✅ `DisplayName` / `DisplayVersion=0.2.0` / `Publisher` / `InstallLocation` / `UninstallString` / `DisplayIcon` 全齐 |
+| 起得来 | 窗口出来 | ✅ 标题 `Toocode`、69 MB |
+| 后端可用 | `invoke("lsp_servers")` | ✅ 回 json / html / css ⇒ 装出来的 exe 里 Rust 是好的 |
+| 版本号 | 0.2.0 | ✅ 标题栏 logo 的 tooltip 就是 `Toocode 0.2.0` |
+| UI 正常 | —— | ✅ 活动栏 4 项 / 标题栏 3 个按钮 / Monaco 1 个 / tooltip 接管 16 个而 `[title]` 残留 0 |
+| 用户数据 | 不受影响 | ✅ `%APPDATA%\com.toocode.app` 两个文件分毫未动 |
+| 卸 | 卸干净 | ✅ 目录 / 卸载项 / 两个快捷方式全清 |
+
+★★ **别用哈希对比「安装后的 exe」和 `release\toocode.exe`** —— 它们**必然不同**，
+但只差 **3 个字节**：打包器会把二进制里那个 `__TAURI_BUNDLE_TYPE_VAR_UNK` 占位符
+**原地改掉**，NSIS 的安装包里写成 `..._NSS`（`tauri-utils` 里那张表：
+`DEB` / `RPM` / `APP` / `MSI` / `NSS` …），运行时靠它知道「我是个被装出来的应用」。
+· 所以 `release\toocode.exe` 是 `UNK` 版本、安装包里那个是 `NSS` 版本 —— 尺寸一样、功能一样
+· ★ 顺手记住这个坑的形态：`Get-FileHash` 一比就报警，而**逐字节比只有一个位置不同** ⇒
+  **先量「差了多少字节」，再决定要不要怀疑构建出了问题**（3 个字节 vs 几百万个，性质完全不同）
+★ 真正该比的是**安装包**本身：线上附件的 `digest` 和本地 `Get-FileHash` 能对上 ——
+  那才是发给别人的东西（0.2.0 实测一致）
+
+⚠★ **卸载器会留一个 `HKCU\Software\Toocode\Toocode`**（默认值 = 安装目录）。
+定性用的是「**先删掉它 → 重装 → 装完先不启动应用**」这个实验（装完就出现 ⇒
+是**安装器**写的，不是应用首次运行写的）。它本来是给安装器「记住上次装到哪」用的，
+卸载时没清 ⇒ 卸完会留下一个指向**已删目录**的残值。
+无害（我们自己的代码不读它），但要知道有这回事：
+· 想清掉：`Remove-Item "HKCU:\Software\Toocode" -Recurse -Force`
+★ 通用点：**判断「谁写的」时，要把可能写它的那两个动作分开做** ——
+  「装完先别启动」这一步不能省，不然永远分不清是安装器还是应用写的
+
+⚠★ **`%LOCALAPPDATA%\com.toocode.app` 是 WebView2 的配置目录，卸载不会删它**
+（Tauri 默认 `deleteAppDataOnUninstall: false`，我们的 `tauri.conf.json` 里也没有 nsis 段）。
+这台机器上它已经 **696 MB / 3646 个文件**。
+**别顺手删**：主题、布局、`new_vscode:lastFolder`、以及最要命的 **hot exit 未保存内容**
+全在里面 —— 而且它 **dev 和安装版是共用**的一份（所以「用安装版试试」不会得到干净的
+localStorage）。想省空间只清 `EBWebView\Default\Cache` / `Code Cache` / `GPUCache` 这几个子目录
+
+★ 验证安装版用的还是老办法：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
+  + 那个 `cdp-eval.mjs`。⚠ 它**把端口写死 9222**，所以要么用 9222 起、要么改一个副本
+  ⚠ 表达式里别带中文：走 PowerShell 管道会被按 ASCII 编码搞坏 ⇒ 写成 `.js` 文件，
+  再 `cmd /c "node cdp-eval.mjs --stdin < 文件"` 喂进去
+  （PowerShell 5.1 **不支持** `<` 重定向，必须借 `cmd /c`）
+★ 换 Release 说明之前先 `gh release view v0.2.0 --json body --jq .body` 备份一份 ——
+  覆盖掉就找不回来了（而且 `gh` 需要 `HTTPS_PROXY` 环境变量；
+  这台机器上 Clash 关掉时那个代理会拒绝连接，此时**去掉代理直连反而通**）
 
 ### 用 gh 发版（省掉手点网页）—— 2026-10-02 实际走通
 
