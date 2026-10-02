@@ -74,7 +74,7 @@ import appIconUrl from "../src-tauri/icons/128x128.png";
 //   打包出来的安装包名、git tag 都是照着它来的。
 //   写死一个字符串就等于多了第二份真相，迟早对不上
 import appConf from "../src-tauri/tauri.conf.json";
-import type { FileNode, Menu, MenuItem, SearchMatch, SearchResponse } from "./types";
+import type { FileNode, IndexInfo, Menu, MenuItem, SearchMatch, SearchResponse } from "./types";
 
 /**
  * 当前窗口。
@@ -2302,6 +2302,7 @@ async function saveFile(path: string): Promise<boolean> {
     savedVersions.set(path, model.getAlternativeVersionId());
     markClean(path);
 
+    touchSearchIndex();
     flashSaveNotice(`已保存 ${fileNameOf(path)}`);
     return true;
   } catch (error) {
@@ -2379,6 +2380,8 @@ async function saveFileAs(path: string): Promise<boolean> {
   // 文件名变了，语言也可能要跟着变 ——
   // 存成 .ts 却不给 TypeScript 高亮就太怪了
   monaco.editor.setModelLanguage(model, languageFromPath(target));
+
+  touchSearchIndex();
 
   const index = openTabs.value.indexOf(path);
   if (index !== -1) openTabs.value.splice(index, 1, target);
@@ -3528,6 +3531,125 @@ const searchResults = ref<SearchMatch[]>([]);
 const searchTruncated = ref(false);
 /** 实际扫了多少文件 —— 给用户一个「它确实在干活」的反馈 */
 const searchFilesScanned = ref(0);
+
+// ---------- 搜索索引的状态 ----------
+// ★ 索引只是**加速手段**：拿不到状态就当作没有索引，搜索照常能搜
+const indexInfo = ref<IndexInfo | null>(null);
+const indexRebuilding = ref(false);
+
+/**
+ * 读一次索引状态。
+ * ⚠ 它只做几次 count 查询，不做全树扫描 —— 所以搜完一次调一次也不心疼
+ */
+async function refreshIndexInfo() {
+  const root = workspaceRoot.value;
+  if (!root) {
+    indexInfo.value = null;
+    return;
+  }
+  try {
+    indexInfo.value = await invoke<IndexInfo>("index_info", { root });
+  } catch {
+    // 索引不可用不是错误 —— 搜索会走全量扫描
+    indexInfo.value = null;
+  }
+  scheduleIndexPoll();
+}
+
+/**
+ * 让后台把索引补齐。
+ *
+ * ★ 索引也可以只靠「用户搜索」推动（搜索自己会往前推一批），
+ *   但那样一个大仓库要搜很多次才建得完 —— 在那之前每次搜索都要现场扫
+ *   那些没建好的文件（= 和以前一样慢）。后台补是「打开文件夹就该偷偷干的事」
+ */
+async function warmSearchIndex() {
+  const root = workspaceRoot.value;
+  if (!root) {
+    indexInfo.value = null;
+    return;
+  }
+  try {
+    indexInfo.value = await invoke<IndexInfo>("index_warm", { root });
+  } catch (error) {
+    console.warn("[搜索索引] 后台补齐没启动，搜索会走全量扫描", error);
+    indexInfo.value = null;
+  }
+  scheduleIndexPoll();
+}
+
+/**
+ * 告诉索引「磁盘变过了」。
+ *
+ * ★ 只是让下一次搜索重新扫一遍（一次 stat 扫描），不是马上重建 ——
+ *   不调的话，刚保存的内容最多要等索引的 TTL（800ms）才搜得到，
+ *   「刚写完就搜不到」是很让人怀疑人生的
+ */
+function touchSearchIndex() {
+  const root = workspaceRoot.value;
+  if (!root) return;
+  // ① 告诉索引「磁盘变过了」—— 下一次搜索一定重新扫一遍
+  // ② 顺便叫后台把那几个改过的文件补进索引（不然它们要等下一次搜索才进）
+  void invoke("index_invalidate", { root }).catch(() => {
+    // 索引没起来 / 数据库坏了都无所谓，下一次搜索会走旧路径
+  });
+  void warmSearchIndex();
+}
+
+/** 重建索引。索引是派生数据，随时可以重建（见搜索视图那一行上的按钮） */
+async function rebuildIndex() {
+  const root = workspaceRoot.value;
+  if (!root || indexRebuilding.value) return;
+  indexRebuilding.value = true;
+  try {
+    indexInfo.value = await invoke<IndexInfo>("index_rebuild", { root });
+  } catch (error) {
+    console.warn("[搜索索引] 重建失败，搜索会走全量扫描", error);
+    indexInfo.value = null;
+  } finally {
+    indexRebuilding.value = false;
+  }
+}
+
+/** 索引状态那一行的文案 */
+const indexSummary = computed(() => {
+  const info = indexInfo.value;
+  if (!workspaceRoot.value) return "";
+  if (!info || !info.built) return "未使用索引（走全量扫描）";
+  if (info.files === 0) return "索引还是空的";
+  const skip = info.skipped > 0 ? `，${info.skipped} 个超出上限` : "";
+  if (info.pending > 0) {
+    return `正在建索引 · ${info.indexed}/${info.files - info.skipped}${skip}`;
+  }
+  return `索引已就绪 · ${info.files} 个文件${skip}`;
+});
+
+/** 索引那一行的 tooltip：把「占了多少地方」这类细节放这里，不撑爆那一行 */
+const indexDetail = computed(() => {
+  const info = indexInfo.value;
+  if (!info || !info.built) {
+    return "没有用索引，每次搜索都会把文件读一遍";
+  }
+  const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  const ratio = info.indexedBytes > 0 ? (info.dbBytes / info.indexedBytes).toFixed(1) : "?";
+  return [
+    `文件：${info.files} 个（${info.indexed} 个已索引，${info.pending} 个待建，${info.skipped} 个超出上限）`,
+    `已索引源码：${mb(info.indexedBytes)} → 库文件：${mb(info.dbBytes)}（约 ${ratio} 倍）`,
+    `上次同步：新建/重建 ${info.updated} 个，删除 ${info.removed} 个，花了 ${info.tookMs} ms`,
+  ].join("\n");
+});
+
+// 还在建索引的时候每秒刷一次状态 —— 否则那一行就永远停在打开侧栏的那一刻。
+// ★ 建完之后立刻停（compare 到 pending 为 0），不留一个常驻的定时器
+let indexPollTimer = 0;
+function scheduleIndexPoll() {
+  window.clearTimeout(indexPollTimer);
+  if ((indexInfo.value?.pending ?? 0) === 0) return;
+  indexPollTimer = window.setTimeout(async () => {
+    await refreshIndexInfo();
+    scheduleIndexPoll();
+  }, 1000);
+}
 const searchBusy = ref(false);
 const searchError = ref<string | null>(null);
 /** 是否搜过至少一次：用来区分「还没搜」和「搜了但没结果」——这两种该说不同的话 */
@@ -3640,7 +3762,12 @@ async function runSearch() {
     searchResults.value = [];
     searchDone.value = true;
   } finally {
-    if (seq === searchSeq) searchBusy.value = false;
+    if (seq === searchSeq) {
+      searchBusy.value = false;
+      // 索引有可能在刚才那次搜索里又往前推了一批（索引是渐进建的），
+      // 所以顺带把状态刷新一下
+      void refreshIndexInfo();
+    }
   }
 }
 
@@ -3700,6 +3827,8 @@ function openSearchResult(match: SearchMatch) {
 function showSearchView() {
   activeView.value = "search";
   sidebarVisible.value = true;
+  // 侧栏一打开就把索引状态读出来（它只做几次 count 查询，很便宜）
+  void refreshIndexInfo();
   // 展开搜索视图后把焦点送进输入框，用户可以立刻打字
   void nextTick(() => searchInputRef.value?.focus());
 }
@@ -3888,6 +4017,10 @@ function handleSourceControlShortcut(event: KeyboardEvent) {
 //   （打开文件夹、恢复上次的、关闭置空、恢复失败时清掉），
 //   挨个去加调用必然漏掉一处，而漏掉的表现是「列表还是上一个仓库的改动」
 watch(workspaceRoot, () => void refreshGitStatus(), { immediate: true });
+
+// 搜索索引也是同一个理由：换了工作区就让后台开始补这个工作区的索引。
+// ★ 关工作区时也走到这里（workspaceRoot 变 null），warmSearchIndex 会把状态清空
+watch(workspaceRoot, () => void warmSearchIndex(), { immediate: true });
 
 /**
  * Topilot 快捷键 **Ctrl+Alt+I**。
@@ -5558,6 +5691,23 @@ watch(activeTabPath, async (path) => {
           <p v-if="searchError" class="tree-error">{{ searchError }}</p>
           <p v-else-if="searchSummary" class="search-summary">{{ searchSummary }}</p>
 
+          <!-- 索引状态。
+               ★ 它存在的意义就是让「搜索变快了」这件事**看得见** ——
+                 否则用户只会记得「以前搜得很慢」，不知道什么时候开始不慢了 -->
+          <div v-if="workspaceRoot" class="search-index">
+            <span class="search-index-text" :title="indexDetail">{{ indexSummary }}</span>
+            <button
+              v-if="indexInfo?.built"
+              class="search-index-action"
+              type="button"
+              :disabled="indexRebuilding"
+              title="清空索引重建（索引是派生数据，随时可以重建）"
+              @click="rebuildIndex"
+            >
+              {{ indexRebuilding ? "重建中…" : "重建" }}
+            </button>
+          </div>
+
           <div class="search-results">
             <p v-if="!workspaceRoot" class="sidebar-empty">还没有打开文件夹</p>
             <p v-else-if="!searchQuery.trim()" class="sidebar-empty">输入关键词开始搜索</p>
@@ -6698,6 +6848,46 @@ watch(activeTabPath, async (path) => {
   margin: 2px 12px 6px;
   color: var(--color-text-dim);
   font-size: 11px;
+}
+
+/* 索引状态那一行：左边一句话，右边一个「重建」 */
+.search-index {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 12px 6px;
+  font-size: 11px;
+  color: var(--color-text-dim);
+}
+
+.search-index-text {
+  flex: 1;
+  min-width: 0;
+  /* 状态文案有可能很长（比如正在建索引时带数字），截断比换行好看 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.search-index-action {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--color-link);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.search-index-action:hover:not(:disabled) {
+  background: var(--color-hover);
+  border-color: var(--color-menu-border);
+}
+
+.search-index-action:disabled {
+  color: var(--color-text-dim);
+  cursor: default;
 }
 
 .search-results {

@@ -13,6 +13,10 @@ use std::process::{Child as StdChild, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, State};
 
+// 搜索索引（SQLite）。单独一个文件 —— 它自己有一整套「建库 / 同步 / 查询」的逻辑，
+// 塞进 lib.rs 只会让这个已经三千多行的文件更难找东西
+mod searchdb;
+
 // ============================ 数据结构 ============================
 
 /// 文件树节点。
@@ -2845,8 +2849,24 @@ const MAX_LINE_CHARS: usize = 400;
 /// 防软链接成环的兜底深度
 const MAX_SEARCH_DEPTH: usize = 32;
 
-/// 把所有值得搜的文件收集起来。和 `walk()` 共用 IGNORED_DIRS，但不设业务深度上限
-fn collect_search_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+/// 搜索要扫的一个文件。
+///
+/// ★ 为什么要把 mtime/size 一起带出来：`searchdb` 要靠它判断「这个文件变过没有」，
+///   而「每次搜索都做一遍 stat 扫描」正是索引的**固定成本**。
+///   在外面再 `metadata()` 一次，等于每个文件多一次系统调用 ——
+///   一次搜索多几千次，就不是零头了
+struct SearchFile {
+    path: PathBuf,
+    /// 毫秒时间戳（拿不到就是 0，那就每次重建）
+    mtime_ms: i64,
+    size: u64,
+}
+
+/// 把所有值得搜的文件收集起来。和 `walk()` 共用 IGNORED_DIRS，但不设业务深度上限。
+///
+/// ★ 两条路都从这里拿文件：索引的 stat 差集、以及索引还没覆盖到的那部分文件的
+///   现场扫描 —— 共用同一个遍历，忽略规则 / 深度上限 / 大小上限就只需要维护一份
+fn collect_search_files(dir: &Path, out: &mut Vec<SearchFile>, depth: usize) {
     if depth > MAX_SEARCH_DEPTH {
         return;
     }
@@ -2866,10 +2886,21 @@ fn collect_search_files(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
             }
             collect_search_files(&path, out, depth + 1);
         } else if meta.is_file() && meta.len() <= MAX_SEARCH_FILE_BYTES {
-            out.push(path);
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            out.push(SearchFile {
+                path,
+                mtime_ms,
+                size: meta.len(),
+            });
         }
     }
 }
+
 
 /// 在一个文件的内容里找出所有匹配。
 ///
@@ -2947,8 +2978,14 @@ fn search_in_text(
 }
 
 /// 在整个文件夹里搜关键词
+///
+/// ★ 有索引时走索引（`searchdb`），没有 / 建不出来 / 查询词太短时**完全退回**
+///   原来的现场扫描 —— 两条路的结果一样，只是快慢不同。
+///   这是整套设计里最重要的一条：索引是**加速手段**，不是正确性的前提
 #[tauri::command]
 async fn search_in_folder(
+    app: tauri::AppHandle,
+    store: State<'_, crate::searchdb::IndexStore>,
     path: String,
     query: String,
     case_sensitive: bool,
@@ -2963,15 +3000,56 @@ async fn search_in_folder(
 
     // ★ 搜索是重活（要挨个读文件），必须挪到**阻塞线程池**里。
     //   直接在 async fn 主体里跑会把运行时线程占住，同时发起的其它调用只能排队
+    let store = store.0.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        let mut files = Vec::new();
-        collect_search_files(Path::new(&path), &mut files, 0);
+        // ① 问索引：「哪些文件可能命中」+「哪些文件还没建好」
+        //
+        //    ⚠ 这里任何一步出问题都当成「没有索引」处理，绝不能让**搜索本身**失败 ——
+        //      索引是锦上添花，它坏了不该连搜索都用不了
+        let plan = if crate::searchdb::is_indexable(&query) {
+            crate::searchdb::with_index(&app, &store, &path, |index| {
+                index.sync(Path::new(&path), false)?;
+                if !index.is_usable() {
+                    return Ok(None);
+                }
+                Ok(Some((
+                    index.candidate_paths(&query)?,
+                    index.unindexed_paths()?,
+                )))
+            })
+            .unwrap_or_else(|err| {
+                println!("[搜索索引] 这次没用上索引，走旧路径：{err}");
+                None
+            })
+        } else {
+            // 查询词短于 3 个字符：trigram 提取不出三元组，索引帮不上忙
+            None
+        };
+
+        // ② 要读哪些文件
+        let targets: Vec<PathBuf> = match plan {
+            Some((candidates, unindexed)) => {
+                // ★ 两类文件**必须都读**：
+                //   · candidates —— 索引说「里面可能有这个词」
+                //   · unindexed —— 还没建进索引的（索引是渐进建的）
+                //   少了后者就等于「索引没建完 → 搜不到东西」，而那种错是无声的
+                let mut targets: Vec<PathBuf> =
+                    candidates.into_iter().map(PathBuf::from).collect();
+                targets.extend(unindexed.into_iter().map(PathBuf::from));
+                targets
+            }
+            None => {
+                let mut entries = Vec::new();
+                collect_search_files(Path::new(&path), &mut entries, 0);
+                entries.into_iter().map(|entry| entry.path).collect()
+            }
+        };
 
         let mut matches: Vec<SearchMatch> = Vec::new();
         let mut truncated = false;
         let mut files_scanned = 0usize;
 
-        for file in &files {
+        for file in &targets {
             if matches.len() >= MAX_SEARCH_RESULTS {
                 truncated = true;
                 break;
@@ -3014,6 +3092,7 @@ async fn search_in_folder(
     .await
     .map_err(|err| err.to_string())?
 }
+
 
 // ============================ 终端（PTY） ============================
 //
@@ -3203,6 +3282,10 @@ pub fn run() {
             scan_theme_extensions,
             scan_snippet_extensions,
             search_in_folder,
+            searchdb::index_info,
+            searchdb::index_warm,
+            searchdb::index_rebuild,
+            searchdb::index_invalidate,
             pty_spawn,
             pty_write,
             pty_resize,
@@ -3232,6 +3315,8 @@ pub fn run() {
         // 语言服务器 / 调试适配器的会话表。同样的理由
         .manage(LspState::default())
         .manage(DapState::default())
+        // 搜索索引（每个工作区一个 SQLite 库）
+        .manage(searchdb::IndexStore::default())
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

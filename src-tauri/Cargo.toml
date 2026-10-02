@@ -39,6 +39,7 @@ base64 = "0.23.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # 消费上面的 stream 要用 StreamExt
 futures-util = "0.3"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 # API 密钥的加密存储（**仅 Windows**）。
 #

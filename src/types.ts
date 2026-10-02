@@ -34,6 +34,35 @@ export interface SearchResponse {
 }
 
 /**
+ * 搜索索引的状态（对应 Rust 侧的 IndexInfo）。
+ *
+ * ★ 索引是**加速手段**，不是正确性的前提：拿不到 / 建不起来时搜索照常能用，
+ *   只是退回全量扫描
+ */
+export interface IndexInfo {
+    /** 索引里的文件总数 */
+    files: number;
+    /** 其中内容已经建好的 */
+    indexed: number;
+    /** 还没建好的（这些每次搜索都要现场扫） */
+    pending: number;
+    /** 超出上限、决定不索引的（同样现场扫，但**不会**再减少） */
+    skipped: number;
+    /** 上次同步里新建 / 重建了几个 */
+    updated: number;
+    /** 上次同步里删掉了几个 */
+    removed: number;
+    /** 上次同步花了多少毫秒 */
+    tookMs: number;
+    /** 库文件多大（字节） */
+    dbBytes: number;
+    /** 已进索引的源码字节数。和 dbBytes 一比就知道索引膨胀了多少倍 */
+    indexedBytes: number;
+    /** 索引是不是真的能用了（false = 一直在走旧路径） */
+    built: boolean;
+}
+
+/**
  * 菜单项。子菜单和普通项用的是**同一个形状** —— 区别只在有没有 `items`。
  *
  * ★ 为什么放在这里而不是 App.vue：MenuList.vue 要递归地用它，
