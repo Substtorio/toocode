@@ -2106,11 +2106,15 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 > 运行与调试、源代码管理 / 将 Topilot 的模型名称显示改为模型版本 / 修改了活动栏图标 /
 > 修改了文件树展开收起箭头图标
 >
-> 还剩下的零碎（都不急）：
-> - `%APPDATA%\com.toocode.app\toocode.chats.json.bak`（19 KB，验证时留下的测试会话）——
->   用户自己决定删不删。⚠ 顺手发现：真正的 `toocode.chats.json` **不存在**，只有这个 `.bak`
-> - `%LOCALAPPDATA%\com.toocode.app`（WebView2 配置目录）长到 **696 MB**，
->   卸载**不会**删它，而且它和 dev 是共用的一份 —— **别手贱删**（见下面那条）
+> 还剩下的零碎 —— ✅ 也清完了（同日）：
+> - `%APPDATA%\com.toocode.app\toocode.chats.json.bak` → **已删**。
+>   ★ 删之前先读了一遍确认是测试垃圾（8 段会话、7 段是同一句 `读一下 package.json…`，
+>     是我验证时发的）—— **删任何看起来像「用户的记录」的文件之前都该这么干**。
+>   ⚠ 顺手发现：真正的 `toocode.chats.json` **不存在**（只有那个 `.bak`）。
+>   不影响使用：读不到时返回 `[]`，下次存会话会自动重建（Rust 那边有测试钉着）
+> - `%LOCALAPPDATA%\com.toocode.app`（WebView2 配置目录）**696 MB → 29.2 MB**，
+>   只删了纯缓存子目录（配方见下面那条），存放 localStorage 的
+>   `EBWebView\Default\Local Storage` **删前删后都是 6 个文件 / 22226 字节，分毫未动**
 
 1. **【已做完】LSP：诊断 + 补全 / 悬停 / 跳转定义 + 重命名 + 自动导入 + 「问题」面板**。
    下一步是：
@@ -2732,10 +2736,23 @@ tag 填 `v0.1.0`（对上 `tauri.conf.json` 里的 `version`）→ 把
 
 ⚠★ **`%LOCALAPPDATA%\com.toocode.app` 是 WebView2 的配置目录，卸载不会删它**
 （Tauri 默认 `deleteAppDataOnUninstall: false`，我们的 `tauri.conf.json` 里也没有 nsis 段）。
-这台机器上它已经 **696 MB / 3646 个文件**。
-**别顺手删**：主题、布局、`new_vscode:lastFolder`、以及最要命的 **hot exit 未保存内容**
-全在里面 —— 而且它 **dev 和安装版是共用**的一份（所以「用安装版试试」不会得到干净的
-localStorage）。想省空间只清 `EBWebView\Default\Cache` / `Code Cache` / `GPUCache` 这几个子目录
+它长到过 **696 MB / 3646 个文件**，而且 **dev 和安装版是共用**的一份
+（所以「用安装版试试」不会得到干净的 localStorage）。
+**别整个删** —— 里面存着主题、布局、`new_vscode:lastFolder`、
+以及最要命的 **hot exit 未保存内容**（在 `EBWebView\Default\Local Storage`）。
+★ 但**可以只删纯缓存**，2026-10-02 实测 **696 MB → 29.2 MB**：
+```powershell
+$d = "$env:LOCALAPPDATA\com.toocode.app\EBWebView\Default"
+foreach ($t in @("Cache","Code Cache","GPUCache","DawnGraphiteCache","DawnWebGPUCache")) {
+  Remove-Item "$d\$t" -Recurse -Force -ErrorAction SilentlyContinue }
+```
+实测大头就是前两个（`Cache` 376.8 MB / `Code Cache` 287.4 MB，合计占 96%）。
+⚠ 关掉应用再删（文件被占用时静默删不干净，记得检查目录是不是真没了）
+⚠ 删完第一次启动会略慢：`Code Cache` 是 V8 编译好的 JS，得重新编一遍
+★ 剩下那 29 MB 是 WebView2 自己的运行时组件（`Subresource Filter` / `GrShaderCache` /
+`component_crx_cache` / `hyphen-data` …），**不用管** —— 删了它还会下回来
+★ 验证「没伤到数据」的办法：比对 `Local Storage` 子目录的**文件数 + 字节数**
+（这次是 6 / 22226，前后一致）—— 比「看起来没事」可靠得多
 
 ★ 验证安装版用的还是老办法：`WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222`
   + 那个 `cdp-eval.mjs`。⚠ 它**把端口写死 9222**，所以要么用 9222 起、要么改一个副本
