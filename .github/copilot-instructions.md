@@ -2290,8 +2290,8 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 > ⚠ **发这一版时 `github.com` 连不上、`api.github.com` 却好使** —— `git push` 全废，
 > 而 `gh` 一路顺。解法是 `git -c http.curloptResolve=github.com:443:<可用 IP>`，
 > 详见上面那条（分层诊断 DNS → TCP → **真实 HTTPS**，第 3 步不能跳）
-> ⏳ 还剩：**安装器没真装过**（0.2.0 那次「装 → 验 → 卸」完整走过一遍，
-> 1.0.0 只验了附件哈希）
+> ✅ 安装器也真装过一遍了（装 → 验 → 卸，全部通过）—— 实测见下面「1.0.0 安装器实测记录」
+>
 > ⚠ 顺手发现 cargo 的进度走的是 **stderr** —— 只看 stdout 那个日志会以为「卡住了」
 > （最后一行还停在前端的 `✓ built in 3.19s`）
 
@@ -2965,6 +2965,47 @@ foreach ($t in @("Cache","Code Cache","GPUCache","DawnGraphiteCache","DawnWebGPU
 ★ 换 Release 说明之前先 `gh release view v0.2.0 --json body --jq .body` 备份一份 ——
   覆盖掉就找不回来了（而且 `gh` 需要 `HTTPS_PROXY` 环境变量；
   这台机器上 Clash 关掉时那个代理会拒绝连接，此时**去掉代理直连反而通**）
+
+### 1.0.0 安装器实测记录（装 → 验 → 卸，完整走了一遍）—— 2026-10-03
+
+0.2.0 那次验过的项目这版重新走了一遍，结论全部一致。
+
+| 步骤 | 期望 | 实测 |
+| --- | --- | --- |
+| 装 | per-user 安装、不要管理员权限 | ✅ 静默 `/S` 退出码 0、**42.6 秒**（0.2.0 是 2.3 秒） |
+| 装到哪 | `%LOCALAPPDATA%\Toocode` | ✅ 只有 2 个文件：`toocode.exe`（10,701,312 字节）+ `uninstall.exe`（79,094 字节） |
+| 开始菜单 / 桌面 | 各一个快捷方式 | ✅ `Programs\Toocode.lnk` + 桌面 `Toocode.lnk` |
+| 卸载登记项 | 出现在「应用和功能」里 | ✅ `DisplayName` / `DisplayVersion=1.0.0` / `InstallLocation` / `UninstallString` / `DisplayIcon` 全齐 |
+| 起得来 | 窗口出来 | ✅ 标题 `Toocode`、76.2 MB |
+| 后端可用 | `invoke("lsp_servers")` | ✅ 回 **4 个**（json / html / css / rust-analyzer） |
+| 版本号 | 1.0.0 | ✅ logo 的 tooltip 就是 `Toocode 1.0.0` |
+| UI 正常 | —— | ✅ 活动栏 4 项 / 标题栏 3 个按钮 / Monaco 挂上了 / tooltip 接管 16 个而 `[title]` 残留 **0** |
+| 密钥能读 | `has_secret` | ✅ 走完整解密流程回的 `true` |
+| 用户数据 | 不受影响 | ✅ `%APPDATA%\com.toocode.app` 装前装后都是 **5 个文件 / 14,873,069 字节** |
+| 卸 | 卸干净 | ✅ 目录 / 卸载项 / 两个快捷方式全清（1.1 秒） |
+
+⚠ **42.6 秒 vs 2.3 秒**：这版慢得多，最可能是 Windows Defender 扫那个 10.7 MB 的 exe
+（0.2.0 只有 8.5 MB）。不影响功能，但**「装得慢」不等于「装坏了」** ——
+判断依据要拿**退出码 + 装完的目录内容**，不要靠时间。
+
+★★ **「相差 3 个字节」这条在 1.0.0 上再次复现**（逐字节比：尺寸同为 10,701,312，
+不同的字节数 = **3**）⇒ 那条结论是稳的：`release\toocode.exe` 是 `UNK` 版本、
+装出来那个是 `NSS` 版本。⚠ 有意思的是打包日志里写的是
+`Info Patching d:\…\release\toocode.exe with bundle type information: nsis` ——
+**字面上说的是「改 release 那个 exe」，但实测两边仍然差 3 个字节**。
+★ 所以别靠日志的文字推断，**逐字节量一遍才作数**。
+
+⚠★ **卸载器留下的 `HKCU\Software\Toocode\Toocode` 这版照旧**（值 = 安装目录，
+指向已删路径）。和 0.2.0 一模一样的形态 ⇒ 这条也是稳的，不是偶发。
+清掉：`Remove-Item "HKCU:\Software\Toocode" -Recurse -Force`
+
+⚠ **`Publisher` 登记成 `toocode`（小写）而不是 `Toocode`** —— 「应用和功能」
+里那一列会显示小写。根因：`tauri.conf.json` 的 `bundle` 段里**没写 `publisher`**
+（现在只有 `icons`），Tauri 就回落到小写的形式。纯观感问题，不影响功能。
+
+⚠ ★ **「比对 Local Storage 字节数」这个办法只在不启动应用时才有意义** ——
+本次比基线大了 346 字节（22,226 → 22,572），因为**装了之后真起了一次应用**，
+它自己会往里写。一旦启动过，就只能断言「还在」，不能断言「没变」。
 
 ### 用 gh 发版（省掉手点网页）—— 2026-10-02 实际走通
 
