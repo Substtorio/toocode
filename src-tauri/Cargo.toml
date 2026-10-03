@@ -2,7 +2,15 @@
 name = "toocode"
 version = "0.2.0"
 description = "Toocode —— 一个仿 VS Code 的桌面代码编辑器"
-authors = ["you"]
+authors = ["Substtorio"]
+# 和仓库根目录那份 LICENSE 保持一致。
+# ★ 两处都要写：LICENSE 文件是给人看、给 GitHub 认的，
+#   crate 元信息是给 cargo / 打包工具看的
+license = "MIT"
+# 这个 crate 是**应用的一部分**，不打算发到 crates.io。
+# 显式写出来防手滑（和 package.json 里那个 private: true 是一回事，
+# 两个都和「版权」无关，只是「别发布」）
+publish = false
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -39,7 +47,17 @@ base64 = "0.23.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 # 消费上面的 stream 要用 StreamExt
 futures-util = "0.3"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+# 搜索索引（全文 / 文件名 / 符号）用的嵌入式数据库。
+#
+# ★ `bundled`：把 SQLite 的 C 源码一起编进来。好处是**安装包仍然只有一个 exe**，
+#   不依赖系统的 sqlite3.dll（和「语言服务器不自己打包、直接用本机的」是相反取舍：
+#   数据库必须在进程里，而语言服务器可以是个子进程）
+# ★★ `default-features = false`：默认那套会带上 `ffi-sqlite-wasm-rs`
+#   （为 wasm 目标准备的），在 Windows 上根本用不到 —— 但它会进依赖图，
+#   于是 `cargo metadata --offline` 会去要一个从没下载过的包而失败。
+#   只留 `bundled` 就够了，FTS5 + trigram 分词器都在里面（有用例钉着）
+rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 
 # API 密钥的加密存储（**仅 Windows**）。
 #

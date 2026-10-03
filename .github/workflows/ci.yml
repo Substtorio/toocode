@@ -1,0 +1,51 @@
+name: CI
+
+# 1.0 的实质承诺是「别人 clone 下来能跑通」—— 这个工作流就是那句话的凭据：
+# 前端类型检查 + 构建，加上 Rust 的测试。
+#
+# ⚠ 这里**不打完整安装包**：`tauri build` 要十几分钟（还要下 NSIS），
+#   而它和本地打包完全重复。需要出包时用 workflow_dispatch 手动触发本地流程。
+#
+# ⚠ 有几个 Rust 测试需要本机装了 VS Code / node（它们是要拿真实的语法文件、
+#   真实的语言服务器来验）。那些用例在条件不具备时**自动跳过**，
+#   所以在干净的 runner 上也是绿的 —— 那是刻意的设计，不是漏测。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    # ★ 必须是 Windows：这个应用是 Windows 专有的（DPAPI 加密密钥、
+    #   注册表里找 VS Code、PTY 走 ConPTY），在 Linux runner 上编都编不过
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # ★ `npm ci` 而不是 `npm install`：严格按 package-lock.json 装，
+      #   CI 和本地才是同一套版本（`install` 可能顺手把依赖升上去 ——
+      #   这个项目踩过 Tauri 的 npm 包和 Rust crate 版本对不上导致打包失败的坑）
+      - run: npm ci
+
+      # ⚠ 这一步要放在 cargo test **之前**：`npm run build` 产出 `dist/`，
+      #   而 tauri 的构建脚本要读那个目录（没有它会报 frontendDist 不存在）。
+      #   这条依赖关系从 CI 文件里看不出来，所以写在这儿
+      #   （它里面已经含了 `vue-tsc --noEmit`，见 package.json 的 scripts）
+      - run: npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # 缓存编译产物。没有它每次都要从头编 tauri + bundled 的 SQLite（十几分钟）
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: cargo test
+        working-directory: src-tauri

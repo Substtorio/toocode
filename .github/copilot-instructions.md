@@ -2216,7 +2216,71 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
   · `%LOCALAPPDATA%\\com.toocode.app\\index\\<哈希>.db` 是**派生数据**，
     随时可以删（删了会重建），也可以在工作区面板里点「重建」
 
+- [x] **发布 1.0 前的准备（LICENSE / README / CI / 依赖许可扫描）**：
+  起因是「感觉已经能作为 1.0 发布了」。功能上确实够了，
+  **缺的不是功能，是对外承诺那几样**。
+
+  ★★ **先说最刺眼的一条：README 在自贬，而且是错的。**
+  它的「已知的局限」还写着「还没有 LSP，所以没有智能提示和跳转定义」
+  「调试控制台和『问题』面板是空壳」—— 这两句在 LSP / DAP 做完之后就已经不成立了。
+  ⇒ 通篇重写：功能清单补上 LSP / 调试 / 源代码管理 / 搜索索引 / 快捷键表；
+    已知局限换成**当前真实**的那几条；新增「测试」和「稳定性承诺」两节。
+  ★ 通用教训：**README 是别人看到的第一份东西，而它最容易过期** ——
+    这个项目有二十多万字的开发笔记，但入口那份描述的还是 0.1.0 的样子。
+    「只在脑子里是最新的」等于没有：入口文件过期时，读者看到的是**相反**的事实
+
+  ★ `LICENSE` 选 **MIT**，两条实在的理由：
+  ① 上游依赖全是宽松许可，选它不给自己加约束；② 那段 "AS IS" 免责声明是**这个应用真需要**的
+  —— 它会写用户的文件（保存 / hot exit / Topilot 落盘 / 跨文件重命名），
+  弄丢数据的风险不该由作者扛。
+  ⚠ 顺带纠正一个容易混的东西：`package.json` 里的 `"private": true` **和版权无关**，
+    它只管「别 `npm publish`」；Cargo 那边对应的是 `publish = false`
+  ★ 元信息要写**三处**：`LICENSE` 文件（给人看、给 GitHub 认）+ `package.json` 的
+    `license` + `Cargo.toml` 的 `license`。顺手把 `authors = ["you"]` 换成真的了
+  ⚠ LICENSE 文件里**只放许可正文**，不要加中文说明 —— GitHub 靠文本匹配识别许可证类型，
+    多写的段落会让它认不出来
+
+  ★★ **CI（`.github/workflows/ci.yml`）**：`npm ci` → `npm run build`（里含 `vue-tsc`）
+  → `cargo test`。1.0 的实质承诺是「别人 clone 下来能跑通」，这个文件就是那句话的凭据。
+  · 必须 `windows-latest`：这个应用是 Windows 专有的（DPAPI、注册表找 VS Code、ConPTY）
+  · **`npm run build` 必须在 `cargo test` 之前** —— `tauri-build` 要读 `dist/`，
+    没有它会报 `frontendDist` 不存在。这条依赖从 CI 文件本身看不出来，所以写了注释
+  · ⚠ 那几个需要本机装了 VS Code / node 的用例**本来就有「条件不具备就跳过」**
+    （它们要拿真实的语法文件 / 语言服务器来验）⇒ 干净 runner 上也是绿的。
+    那是刻意设计，不是漏测 —— 但**要写清楚**，否则下次看到「跳过了」会以为是坏的
+  · 本地只预演了两步：`npm run build` 过；YAML 用 `npx --yes js-yaml` 解过
+    （用 npx 跑，不把解析器装进项目）
+
+  ★★ **依赖许可扫描顺手挖出一个真东西**：本来只想确认没有 GPL，
+  结果 `cargo metadata` **卡住不动**；加 `--offline` 才看到真原因：
+  `failed to download sqlite-wasm-rs v0.5.5` —— `cargo add rusqlite` 时默认 features 带了
+  `ffi-sqlite-wasm-rs`（为 wasm 准备的），在 Windows 上根本用不到，但它进了依赖图。
+  ⇒ 改成 `default-features = false, features = ["bundled"]`：`sqlite-wasm-rs` / `rsqlite-vfs`
+    从锁文件里消失，43 个用例仍然全过（FTS5 + trigram 都在，有用例钉着）
+  ⚠ `cargo metadata` 还要加 **`--filter-platform x86_64-pc-windows-msvc`**：
+    不加它会把别的平台的依赖也解析一遍（于是联网、于是卡住）
+  · 结果：Rust 侧 **334 个第三方 crate** —— MIT / Apache-2.0 系为主，18 个 `Unicode-3.0`、
+    5 个 `MPL-2.0`（弱传染，但它明确允许把**未修改的**库静态链接进更大的作品）、
+    少量 BSD / ISC / Zlib / Unlicense / 0BSD。**没有 GPL / AGPL**
+  · 前端 **32 个生产依赖**：24 个 MIT，其余 Apache-2.0 / ISC / BSD；
+    唯一要留意的 `dompurify` 是 `MPL-2.0 OR Apache-2.0` —— 有一个更宽松的选项可挑
+  · ⚠ 写扫描脚本时踩了自己的坑：只遍历了 `node_modules/*/package.json`，
+    于是 `@vue/shared` 这种**带 scope 的包**全报「未读到」（`node_modules/@vue` 是目录不是包）
+    ⇒ 得额外走一层 `node_modules/@*/*/package.json`
+  · ⚠ 还有一次「解析失败、输出为空」被我显示成「共 1 个 crate」——
+    因为 PowerShell 里 `@($null).Count` 等于 **1**。
+    ⇒ **空结果的断言不能靠计数**
+
 ### 待办（按优先级）
+
+> **发布 1.0 的收尾 —— 只剩最后一步（2026-10-03）**
+> 已完成：LICENSE（MIT）、README 重写、CI、依赖许可扫描。
+> 剩下的：改四处版本号 → `npm run tauri build` → tag `v1.0.0` → Release 附件
+> ⚠ 推上去之后**第一次 CI 要盯一眼**（`gh run list`）—— 本地只预演了两步，
+>   runner 上那段（Rust 缓存 / `Swatinem/rust-cache` / `cargo test` 真跑）没验证过
+> ⚠ 版本号那四处：`package.json` / `package-lock.json`（用
+>   `npm install --package-lock-only` 同步，**别手改**）/ `src-tauri/tauri.conf.json`
+>   （安装包名照它来）/ `src-tauri/Cargo.toml`
 
 > **✅ 搜索索引（SQLite）做完了（2026-10-02）** —— 内容 / 文件名 / 符号三样，
 > 详见上面那条。实测：2000 文件语料上「查不存在的词」506ms → **35ms（扫 0 个文件）**。
