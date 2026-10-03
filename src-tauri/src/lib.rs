@@ -3284,6 +3284,7 @@ pub fn run() {
             search_in_folder,
             searchdb::index_info,
             searchdb::index_files,
+            searchdb::index_symbols,
             searchdb::index_warm,
             searchdb::index_rebuild,
             searchdb::index_invalidate,

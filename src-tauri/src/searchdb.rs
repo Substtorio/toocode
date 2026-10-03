@@ -65,6 +65,9 @@ const SYNC_TTL_MS: u128 = 800;
 ///   前端的进度会一直转、后台线程也停不下来
 const MAX_INDEX_BYTES: i64 = 128 * 1024 * 1024;
 
+/// 符号搜索一次最多返回多少条
+const DEFAULT_SYMBOL_LIMIT: usize = 300;
+
 /// 文件名搜索一次最多返回多少条。
 /// ★ 它只是**候选集**：真正的排序在前端（`fuzzy.ts` 那套打分）。
 ///   截断要有个上限，不然一个十万文件的大仓库光序列化就能把前端卡住
@@ -89,6 +92,18 @@ pub struct Index {
     max_bytes: i64,
     /// 上次同步的结果，TTL 内直接复用
     last: IndexInfo,
+}
+
+/// 一条符号命中（「转到符号」用）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SymbolRow {
+    pub path: String,
+    pub name: String,
+    /// LSP 的 SymbolKind 编号
+    pub kind: i64,
+    pub line: usize,
+    pub column: usize,
 }
 
 /// 索引的状态 / 一次同步的统计。
@@ -186,6 +201,19 @@ fn migrate(conn: &Connection) -> Result<(), String> {
             body,
             tokenize = 'trigram'
         );
+
+        -- 符号。「转到符号」（Ctrl+T）用
+        -- ★ kind 用的是 **LSP 的 SymbolKind 编号**：将来打开过的文件改用
+        --   语言服务器的 `documentSymbol` 覆盖掉这里的粗糙结果时，编号不用换算
+        CREATE TABLE IF NOT EXISTS symbols(
+            path TEXT    NOT NULL,
+            name TEXT    NOT NULL,
+            kind INTEGER NOT NULL,
+            line INTEGER NOT NULL,
+            col  INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS symbols_name ON symbols(name);
+        CREATE INDEX IF NOT EXISTS symbols_path ON symbols(path);
         "#,
     )
     .map_err(|err| format!("建索引表失败：{err}"))
@@ -388,10 +416,10 @@ impl Index {
 
         // ③ 没了的 → 删掉（连带 fts 里那行）
         {
-            let gone: Vec<i64> = known
+            let gone: Vec<(i64, String)> = known
                 .iter()
                 .filter(|(path, _)| !seen.contains(path.as_str()))
-                .map(|(_, (id, _, _))| *id)
+                .map(|(path, (id, _, _))| (*id, path.clone()))
                 .collect();
             if !gone.is_empty() {
                 let tx = self.conn.transaction().map_err(|err| err.to_string())?;
@@ -402,9 +430,17 @@ impl Index {
                     let mut del_file = tx
                         .prepare("DELETE FROM files WHERE id = ?1")
                         .map_err(|err| err.to_string())?;
-                    for id in &gone {
+                    let mut del_symbols = tx
+                        .prepare("DELETE FROM symbols WHERE path = ?1")
+                        .map_err(|err| err.to_string())?;
+                    for (id, path) in &gone {
                         del_fts.execute([id]).map_err(|err| err.to_string())?;
                         del_file.execute([id]).map_err(|err| err.to_string())?;
+                        // ★ 文件没了，它的符号也得跟着走 —— 不然 Ctrl+T 会搜到一个
+                        //   打不开的位置（而那种失败是「点了没反应」，不报错）
+                        del_symbols
+                            .execute(params![path])
+                            .map_err(|err| err.to_string())?;
                         removed += 1;
                     }
                 }
@@ -465,33 +501,58 @@ impl Index {
             let mut mark = tx
                 .prepare("UPDATE files SET indexed = ?2 WHERE id = ?1")
                 .map_err(|err| err.to_string())?;
+            let mut del_symbols = tx
+                .prepare("DELETE FROM symbols WHERE path = ?1")
+                .map_err(|err| err.to_string())?;
+            let mut insert_symbol = tx
+                .prepare(
+                    "INSERT INTO symbols(path, name, kind, line, col) VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|err| err.to_string())?;
 
             for (id, path, size) in pending {
                 if now_ms().saturating_sub(started) > SYNC_BUDGET_MS {
                     break;
                 }
-                // 到顶了：剩下的标成「不索引」—— 它们继续走现场扫描，结果不会少。
-                // ⚠ 必须和「待索引」分开，否则 pending 永远不为 0（进度条一直转、
-                //   后台线程也停不下来）
-                if used + size > self.max_bytes {
-                    mark.execute(params![id, SKIPPED])
-                        .map_err(|err| err.to_string())?;
-                    continue;
-                }
-                // 读不出来 / 不是 UTF-8 就当它没有内容 ——
-                // 和旧路径一样（搜索应该容错，不该因为一个文件整个失败）
+
+                // 读一次，符号和正文共用
                 let text = std::fs::read(&path)
                     .ok()
                     .and_then(|bytes| String::from_utf8(bytes).ok());
+
+                // ★ 符号**不受内容上限管**：它只存「名字 + 行号」，几百字节一个，
+                //   而 Ctrl+T 的价值就在于整个仓库都能找到符号。
+                //   上限管的是正文索引的体积（那个会膨到源码的好几倍）
+                del_symbols
+                    .execute(params![path])
+                    .map_err(|err| err.to_string())?;
+                if let Some(text) = &text {
+                    for symbol in scan_symbols(&path, text) {
+                        insert_symbol
+                            .execute(params![
+                                path,
+                                symbol.name,
+                                symbol.kind,
+                                symbol.line as i64,
+                                symbol.column as i64
+                            ])
+                            .map_err(|err| err.to_string())?;
+                    }
+                }
+
+                // 正文索引：超出上限就不进去（上面符号已经存好了）
+                let over_cap = used + size > self.max_bytes;
                 del.execute([id]).map_err(|err| err.to_string())?;
                 if let Some(text) = text {
-                    insert
-                        .execute(params![id, path, text.to_lowercase()])
-                        .map_err(|err| err.to_string())?;
+                    if !over_cap {
+                        insert
+                            .execute(params![id, path, text.to_lowercase()])
+                            .map_err(|err| err.to_string())?;
+                        used += size;
+                    }
                 }
-                mark.execute(params![id, DONE])
+                mark.execute(params![id, if over_cap { SKIPPED } else { DONE }])
                     .map_err(|err| err.to_string())?;
-                used += size;
             }
         }
         tx.commit().map_err(|err| err.to_string())?;
@@ -549,6 +610,38 @@ impl Index {
         Ok(rows.flatten().collect())
     }
 
+    /// 按名字找符号（「转到符号」用）。
+    ///
+    /// ★ 前缀命中排在子串命中前面：敲 `scan` 时 `scan_symbols` 应该比
+    ///   `rescan_all` 靠前 —— VS Code 也是这个行为
+    pub fn find_symbols(&self, query: &str, limit: usize) -> Result<Vec<SymbolRow>, String> {
+        let lower = query.to_lowercase();
+        let needle = like_pattern(&lower);
+        let prefix = format!("{}%", escape_like(&lower));
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT path, name, kind, line, col FROM symbols \
+                 WHERE lower(name) LIKE ?1 ESCAPE '\\' \
+                 ORDER BY (CASE WHEN lower(name) LIKE ?2 ESCAPE '\\' THEN 0 ELSE 1 END), \
+                          length(name), name \
+                 LIMIT ?3",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![needle, prefix, limit as i64], |r| {
+                Ok(SymbolRow {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    kind: r.get(2)?,
+                    line: r.get::<_, i64>(3)? as usize,
+                    column: r.get::<_, i64>(4)? as usize,
+                })
+            })
+            .map_err(|err| err.to_string())?;
+        Ok(rows.flatten().collect())
+    }
+
     /// 还没进内容索引的文件 —— 这些得走旧的现场扫描，结果才不会漏。
     /// ★ 包含「待索引」（0）和「决定不索引」（2）两种：后者的内容是**永远**不会进索引的，
     ///   不把它们算进来的话，那些文件就永远搜不到了
@@ -597,20 +690,23 @@ pub fn is_indexable(query: &str) -> bool {
     false
 }
 
-/// 把查询词包成 LIKE 模式，顺手把 LIKE 的元字符转义掉。
-/// ⚠ 不转义的话，用户搜 `100%` 里的 `%` 会变成通配符 —— 候选集变大。
-///   结果依然是对的（真正命不命中由 `search_in_text` 决定），但会白读一堆文件
-fn like_pattern(needle: &str) -> String {
-    let mut out = String::with_capacity(needle.len() + 2);
-    out.push('%');
+/// 把一个字符串里的 LIKE 元字符转义掉（`%` `_` `\`）
+fn escape_like(needle: &str) -> String {
+    let mut out = String::with_capacity(needle.len());
     for ch in needle.chars() {
         if matches!(ch, '%' | '_' | '\\') {
             out.push('\\');
         }
         out.push(ch);
     }
-    out.push('%');
     out
+}
+
+/// 把查询词包成 LIKE 模式，顺手把 LIKE 的元字符转义掉。
+/// ⚠ 不转义的话，用户搜 `100%` 里的 `%` 会变成通配符 —— 候选集变大。
+///   结果依然是对的（真正命不命中由 `search_in_text` 决定），但会白读一堆文件
+fn like_pattern(needle: &str) -> String {
+    format!("%{}%", escape_like(needle))
 }
 
 /// 把字符串包成 SQL 字面量（单引号里再把单引号翻倍）。
@@ -626,6 +722,325 @@ fn sql_literal(value: &str) -> String {
         out.push(ch);
     }
     out.push('\'');
+    out
+}
+
+// ============================ 符号扫描 ============================
+//
+// ★ 为什么用行级启发式，而不是语言服务器：`Ctrl+T` 要在**整个仓库**里找符号，
+//   而语言服务器只在你打开过的文件上有数据。扫描虽然粗糙，但「覆盖面全」
+//   和「不用等服务器起来」是它的价值。
+//
+// ⚠ 它失败的方式是「少几个符号 / 名字取歪了」，**不会报错** ——
+//   所以这里的自标是「常见写法别漏」，不追求精确。
+//   将来打开过的文件可以用 LSP 的 `documentSymbol` 覆盖掉这些粗糙结果，
+//   表结构不用动（`kind` 用的就是 LSP 的编号）
+
+/// 一个挖出来的符号
+#[derive(Clone)]
+struct SymbolHit {
+    name: String,
+    kind: i64,
+    /// 1 起的行号
+    line: usize,
+    /// 1 起的列号（符号名在这一行的第几个**字符**）
+    column: usize,
+}
+
+/// 声明前面可能出现的修饰词。剥掉它们才能看到真正的关键字
+/// ⚠ `const` 不在表里：它既是修饰词也是关键字，当成关键字处理才对
+const MODIFIERS: &[&str] = &[
+    "pub", "export", "default", "async", "unsafe", "abstract", "final", "public", "private",
+    "protected", "internal", "declare", "readonly", "open", "override", "extern",
+];
+
+/// 「关键字 → 符号类型」的表。
+/// ★ 表放在一处，加一种语言就是加一行 —— 不用去改扫描逻辑
+fn keywords_for(ext: &str) -> &'static [(&'static str, i64)] {
+    match ext {
+        "rs" => &[
+            ("fn", 12),
+            ("struct", 23),
+            ("enum", 10),
+            ("trait", 11),
+            ("impl", 2),
+            ("mod", 2),
+            ("const", 14),
+            ("static", 14),
+            ("type", 26),
+        ],
+        "ts" | "tsx" | "js" | "jsx" | "mjs" | "cjs" | "vue" => &[
+            ("function", 12),
+            ("class", 5),
+            ("interface", 11),
+            ("type", 26),
+            ("enum", 10),
+            ("const", 13),
+            ("let", 13),
+            ("var", 13),
+        ],
+        "py" => &[("def", 12), ("class", 5)],
+        _ => &[
+            ("function", 12),
+            ("func", 12),
+            ("fn", 12),
+            ("def", 12),
+            ("class", 5),
+            ("interface", 11),
+            ("struct", 23),
+            ("enum", 10),
+            ("const", 14),
+        ],
+    }
+}
+
+/// 值得扫符号的扩展名。不在表里的（`.txt` / `.log` / `.lock` …）直接跳过 ——
+/// 不跳过的话，一篇说明文里的 “class Foo” 也会变成符号
+fn is_code_ext(ext: &str) -> bool {
+    matches!(
+        ext,
+        "rs" | "ts"
+            | "tsx"
+            | "js"
+            | "jsx"
+            | "mjs"
+            | "cjs"
+            | "vue"
+            | "py"
+            | "java"
+            | "kt"
+            | "kts"
+            | "cs"
+            | "go"
+            | "rb"
+            | "php"
+            | "swift"
+            | "dart"
+            | "scala"
+            | "c"
+            | "cc"
+            | "cpp"
+            | "h"
+            | "hpp"
+            | "sh"
+            | "ps1"
+            | "sql"
+            | "lua"
+    )
+}
+
+fn extension_of(path: &str) -> String {
+    // `rsplit_once` 而不是 `split('.').last()`：后者会把目录名里的点也算进来
+    path.rsplit_once('.')
+        .map(|(_, ext)| ext.to_lowercase())
+        .unwrap_or_default()
+}
+
+/// 把一个标识符字符当一个词。其余字符都是分隔符
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
+/// 把一行切成「词 + 它在这一行的字符下标」。
+/// ★ 不用 `split_whitespace`：它不给位置，而我们要存符号名的列号
+fn words_of(line: &str) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut start = 0usize;
+    for (index, ch) in line.chars().enumerate() {
+        if is_word_char(ch) {
+            if current.is_empty() {
+                start = index;
+            }
+            current.push(ch);
+        } else if !current.is_empty() {
+            out.push((std::mem::take(&mut current), start));
+        }
+    }
+    if !current.is_empty() {
+        out.push((current, start));
+    }
+    out
+}
+
+fn is_identifier(word: &str) -> bool {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) if first.is_alphabetic() || first == '_' || first == '$' => {}
+        _ => return false,
+    }
+    word.chars().count() <= 120
+}
+
+/// 从一份源码里挖符号
+fn scan_symbols(path: &str, text: &str) -> Vec<SymbolHit> {
+    let ext = extension_of(path);
+    match ext.as_str() {
+        "md" | "markdown" => return scan_headings(text),
+        "css" | "scss" | "less" => return scan_selectors(text),
+        "json" | "jsonc" => return scan_json_keys(text),
+        _ => {}
+    }
+    if !is_code_ext(&ext) {
+        return Vec::new();
+    }
+
+    let keywords = keywords_for(&ext);
+    let mut out = Vec::new();
+
+    for (index, raw) in text.lines().enumerate() {
+        if out.len() >= 2000 {
+            break; // 病态文件（一行一个声明写几千行）不追
+        }
+        let trimmed = raw.trim_start();
+        // 注释行跳过：注释里的 “fn foo” 不是符号
+        if trimmed.starts_with("//")
+            || trimmed.starts_with('*')
+            || trimmed.starts_with("/*")
+            || trimmed.starts_with('#')
+        {
+            continue;
+        }
+        let indent = raw.chars().count() - trimmed.chars().count();
+        let words = words_of(trimmed);
+
+        // ★ 在前几个词里找**第一个关键字**，名字取它后面第一个标识符。
+        //   为什么不是「只看第一个词」：`pub(crate) fn foo` 、
+        //   `export default async function foo` 都有好几层前缀
+        //   为什么只找前 5 个词就停：再往后就不是声明头了
+        for (position, (word, _)) in words.iter().take(5).enumerate() {
+            let Some((_, kind)) = keywords.iter().find(|(keyword, _)| keyword == word) else {
+                continue;
+            };
+            let Some((name, name_column)) = words
+                .iter()
+                .skip(position + 1)
+                .find(|(candidate, _)| is_identifier(candidate))
+            else {
+                break;
+            };
+            out.push(SymbolHit {
+                name: name.clone(),
+                kind: *kind,
+                line: index + 1,
+                column: indent + name_column + 1,
+            });
+            break;
+        }
+    }
+
+    let _ = MODIFIERS; // 修饰词已经在「找第一个关键字」里自然跳过了，这里留个提示
+    out
+}
+
+/// Markdown 标题（`#` ~ `######`）。
+/// ★ 要跳过围栏代码块 —— 代码块里的 `# 注释` 不是标题
+fn scan_headings(text: &str) -> Vec<SymbolHit> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for (index, raw) in text.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|ch| *ch == '#').count();
+        if hashes == 0 || hashes > 6 {
+            continue;
+        }
+        let name = trimmed.chars().skip(hashes).collect::<String>();
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(SymbolHit {
+            name: name.to_string(),
+            kind: 15, // String —— 标题在 VS Code 里也是这一类
+            line: index + 1,
+            column: hashes + 2,
+        });
+    }
+    out
+}
+
+/// CSS 的类 / id 选择器。元素选择器不收 —— 那太多了，列表会被淹掉
+fn scan_selectors(text: &str) -> Vec<SymbolHit> {
+    let mut out = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let trimmed = raw.trim_start();
+        let Some(brace) = trimmed.find('{') else { continue };
+        let head = trimmed[..brace].trim();
+        // 一行里既有声明又有 `{`（比如 `a { color: red }`）就不当选择器
+        if head.is_empty() || trimmed.contains(';') {
+            continue;
+        }
+        let name = head
+            .split([',', ' '])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !(name.starts_with('.') || name.starts_with('#')) {
+            continue;
+        }
+        let indent = raw.chars().count() - trimmed.chars().count();
+        out.push(SymbolHit {
+            name: name.to_string(),
+            kind: 5,
+            line: index + 1,
+            column: indent + 1,
+        });
+    }
+    out
+}
+
+/// JSON 的**顶层**键。
+/// ★ 判「顶层」靠跟踪括号深度，不靠缩进 —— 缩进几格是格式化工具的自由，
+///   而深度是语法事实
+fn scan_json_keys(text: &str) -> Vec<SymbolHit> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (index, raw) in text.lines().enumerate() {
+        let indent = raw.chars().count() - raw.trim_start().chars().count();
+        let trimmed = raw.trim_start();
+        if depth == 1 && trimmed.starts_with('"') {
+            if let Some(end) = trimmed[1..].find('"') {
+                let name = &trimmed[1..1 + end];
+                let rest = trimmed[1 + end + 1..].trim_start();
+                if rest.starts_with(':') && !name.is_empty() {
+                    out.push(SymbolHit {
+                        name: name.to_string(),
+                        kind: 20, // Key
+                        line: index + 1,
+                        column: indent + 2,
+                    });
+                }
+            }
+        }
+        for ch in raw.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match ch {
+                '"' => in_string = true,
+                '{' | '[' => depth += 1,
+                '}' | ']' => depth -= 1,
+                _ => {}
+            }
+        }
+    }
     out
 }
 
@@ -731,6 +1146,21 @@ pub fn index_files(
     with_index(&app, &store.0, &root, |index| {
         index.sync(Path::new(&root), false)?;
         index.find_files(&query, limit.unwrap_or(DEFAULT_FILE_LIMIT))
+    })
+}
+
+/// 按名字找符号（「转到符号」用）。
+#[tauri::command]
+pub fn index_symbols(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, IndexStore>,
+    root: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<SymbolRow>, String> {
+    with_index(&app, &store.0, &root, |index| {
+        index.sync(Path::new(&root), false)?;
+        index.find_symbols(&query, limit.unwrap_or(DEFAULT_SYMBOL_LIMIT))
     })
 }
 
@@ -1085,6 +1515,119 @@ mod tests {
         let vues = names(".vue");
         assert_eq!(vues.len(), 2);
         assert!(vues[0].ends_with("App.vue"), "短的应该在前：{vues:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scans_common_declarations_and_skips_noise() {
+        let hits = |path: &str, text: &str| -> Vec<String> {
+            scan_symbols(path, text)
+                .into_iter()
+                .map(|symbol| format!("{}:{}", symbol.name, symbol.line))
+                .collect()
+        };
+
+        // Rust：修饰词要剥掉，`pub(crate)` 这种带括号的也算修饰
+        assert_eq!(
+            hits(
+                "a.rs",
+                "pub fn alpha() {}\nimpl Beta {\n    async fn gamma(&self) {}\n}\n"
+            ),
+            vec!["alpha:1", "Beta:2", "gamma:3"]
+        );
+        assert_eq!(hits("a.rs", "pub(crate) fn hidden() {}\n"), vec!["hidden:1"]);
+        // TS：修饰词有好几层
+        assert_eq!(
+            hits("a.ts", "export default async function delta() {}\n"),
+            vec!["delta:1"]
+        );
+        assert_eq!(
+            hits("a.ts", "export const EPSILON = 1;\nclass Zeta {}\n"),
+            vec!["EPSILON:1", "Zeta:2"]
+        );
+        assert_eq!(hits("a.py", "class Eta:\n    def theta(self):\n"), vec![
+            "Eta:1",
+            "theta:2"
+        ]);
+        // 注释里的「声明」不是声明
+        assert_eq!(hits("a.rs", "// fn ghost() {}\n"), Vec::<String>::new());
+        // 不认识的行不硬编：`if let` / `for` 不是声明
+        assert_eq!(hits("a.rs", "if let Some(x) = y {}\nfor i in 0..3 {}\n"), Vec::<
+            String,
+        >::new());
+        // 不该扫的扩展名（一篇说明文里的 class Foo 不是符号）
+        assert_eq!(hits("a.txt", "function whatever() {}\n"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn scans_markdown_headings_css_selectors_and_json_keys() {
+        let names = |path: &str, text: &str| -> Vec<String> {
+            scan_symbols(path, text)
+                .into_iter()
+                .map(|symbol| symbol.name)
+                .collect()
+        };
+
+        // ★ markdown 要跳过围栏代码块 —— 代码块里的 `# 注释` 不是标题
+        assert_eq!(
+            names("a.md", "# Title\n\n```\n# 这不是标题\n```\n\n## Sub\n"),
+            vec!["Title", "Sub"]
+        );
+        // CSS 只收类 / id 选择器
+        assert_eq!(
+            names("a.css", ".foo {\n  color: red;\n}\n#bar:hover {\n}\ndiv {\n}\n"),
+            vec![".foo", "#bar:hover"]
+        );
+        // JSON 只收顶层的键（靠括号深度判断，不靠缩进）
+        assert_eq!(
+            names(
+                "a.json",
+                "{\n  \"alpha\": 1,\n  \"nested\": {\n    \"beta\": 2\n  }\n}\n"
+            ),
+            vec!["alpha", "nested"]
+        );
+    }
+
+    #[test]
+    fn symbols_follow_the_file_through_change_and_delete() {
+        let dir = temp_workspace("toocode-index-symbols");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("src/a.ts"),
+            "export function alphaThing() {}\nexport const betaThing = 1;\nexport function thingOne() {}\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("README.md"), "# Gamma Heading\n").unwrap();
+
+        let mut index = Index::memory();
+        index.sync(&dir, true).unwrap();
+        let names = |index: &Index, query: &str| -> Vec<String> {
+            index
+                .find_symbols(query, 50)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.name)
+                .collect()
+        };
+
+        assert_eq!(names(&index, "alphathing"), vec!["alphaThing"], "大小写不敏感");
+        assert_eq!(names(&index, "gamma"), vec!["Gamma Heading"], "markdown 标题也算符号");
+        // 前缀命中排在子串命中前面：thing 开头的那条应该第一
+        let thing = names(&index, "thing");
+        assert_eq!(thing[0], "thingOne", "前缀命中要排前面：{thing:?}");
+        assert!(thing.contains(&"alphaThing".to_string()));
+
+        // 文件改了 → 旧符号不能还留着（否则点进去是空的）
+        std::fs::write(dir.join("src/a.ts"), "export function renamedThing() {}\n").unwrap();
+        index.sync(&dir, true).unwrap();
+        assert_eq!(names(&index, "alphathing"), Vec::<String>::new());
+        assert_eq!(names(&index, "renamedthing"), vec!["renamedThing"]);
+
+        // 文件删了 → 符号也得跟着走
+        std::fs::remove_file(dir.join("README.md")).unwrap();
+        index.sync(&dir, true).unwrap();
+        assert_eq!(names(&index, "gamma"), Vec::<String>::new());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

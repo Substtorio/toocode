@@ -24,6 +24,22 @@ export interface SearchMatch {
     end: number;
 }
 
+/**
+ * 一条符号命中（对应 Rust 侧的 SymbolRow）。
+ *
+ * ★ `kind` 用的是 **LSP 的 SymbolKind 编号** —— 将来打开过的文件改用语言服务器
+ *   的 `documentSymbol` 覆盖这些启发式结果时，编号不用换算
+ */
+export interface SymbolRow {
+    path: string;
+    name: string;
+    kind: number;
+    /** 1 起的行号 */
+    line: number;
+    /** 1 起的列号 */
+    column: number;
+}
+
 /** 一次搜索的结果（对应 Rust 侧的 SearchResponse） */
 export interface SearchResponse {
     matches: SearchMatch[];

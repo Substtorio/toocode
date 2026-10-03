@@ -74,7 +74,15 @@ import appIconUrl from "../src-tauri/icons/128x128.png";
 //   打包出来的安装包名、git tag 都是照着它来的。
 //   写死一个字符串就等于多了第二份真相，迟早对不上
 import appConf from "../src-tauri/tauri.conf.json";
-import type { FileNode, IndexInfo, Menu, MenuItem, SearchMatch, SearchResponse } from "./types";
+import type {
+  FileNode,
+  IndexInfo,
+  Menu,
+  MenuItem,
+  SearchMatch,
+  SearchResponse,
+  SymbolRow,
+} from "./types";
 
 /**
  * 当前窗口。
@@ -1775,6 +1783,7 @@ const WELCOME_SHORTCUTS: readonly WelcomeShortcut[] = [
   // ---- 常显：最常用的那几条 ----
   { keys: ["Ctrl", "Shift", "P"], label: "命令面板", primary: true },
   { keys: ["Ctrl", "P"], label: "转到文件", primary: true },
+  { keys: ["Ctrl", "T"], label: "转到符号（整个工作区）", primary: true },
   { keys: ["Ctrl", "S"], label: "保存当前文件", primary: true },
   { keys: ["Ctrl", "Shift", "F"], label: "在文件夹中搜索", primary: true },
   { keys: ["Ctrl", "Alt", "I"], label: "显示 / 隐藏 Topilot", primary: true },
@@ -4445,6 +4454,7 @@ const menus = computed<Menu[]>(() => {
       { separator: true },
       { label: "命令面板…", shortcut: "Ctrl+Shift+P", run: () => openQuickOpen("commands") },
       { label: "转到文件…", shortcut: "Ctrl+P", run: () => openQuickOpen("files") },
+      { label: "转到符号…", shortcut: "Ctrl+T", run: () => openQuickOpen("symbol") },
       { label: "在文件中查找", shortcut: "Ctrl+Shift+F", run: showSearchView },
       { label: "源代码管理", shortcut: "Ctrl+Shift+G", run: showSourceControlView },
       { label: "运行和调试", shortcut: "Ctrl+Shift+D", run: showDebugView },
@@ -4521,7 +4531,7 @@ const menus = computed<Menu[]>(() => {
 //   命令面板 → menus 拍平；快速打开 → fileTree 拍平。
 //   转换都在这里做，组件只认 `{ key, text, hint }`
 
-type QuickOpenMode = "commands" | "files" | "context";
+type QuickOpenMode = "commands" | "files" | "context" | "symbol";
 
 const quickOpenMode = ref<QuickOpenMode | null>(null);
 
@@ -4557,21 +4567,19 @@ function flattenFiles(nodes: readonly FileNode[], out: FileNode[] = []): FileNod
   return out;
 }
 
-/** 快速打开的文件列表。右侧那行灰字是相对路径 —— 同名文件只能靠它区分 */
-const filePalette = computed(() => {
+/**
+ * 快速打开的文件列表（**文件树**那份）。右侧那行灰字是相对路径 —— 同名文件只能靠它区分。
+ *
+ * ★ 现在它只是兜底：首选是索引里那张磁盘清单（见 indexedFiles），
+ *   但索引拿不到时（或关键词还空着）就用这份 —— 它是现成的，不用等后端
+ */
+const filePalette = computed<QuickOpenEntry[]>(() => {
   const root = workspaceRoot.value;
-  const byPath = new Map<string, FileNode>();
-
-  const entries = flattenFiles(fileTree.value).map((node) => {
-    byPath.set(node.path, node);
-    return {
-      key: node.path,
-      text: node.name,
-      hint: root ? relativePath(node.path, root) : undefined,
-    };
-  });
-
-  return { entries, byPath };
+  return flattenFiles(fileTree.value).map((node) => ({
+    key: node.path,
+    text: node.name,
+    hint: root ? relativePath(node.path, root) : undefined,
+  }));
 });
 
 /**
@@ -4585,6 +4593,61 @@ const filePalette = computed(() => {
  */
 const indexedFiles = ref<QuickOpenEntry[] | null>(null);
 let fileIndexTimer = 0;
+
+/**
+ * 「转到符号」的候选集：索引里那张符号表（行级扫描挖出来的）。
+ *
+ * ★ 它和「转到文件」的差别不只是数据源：符号是**带位置**的，
+ *   选中要直接跳到那一行，所以还要一张 key → 位置的表。
+ *   用 Map 而不是把位置编进 key —— 路径里可能带冒号（`C:\…`），
+ *   拆回来就得处理转义；Map 没有这个问题（命令面板也是这么做的）
+ */
+const symbolEntries = ref<QuickOpenEntry[]>([]);
+let symbolTargets = new Map<string, { path: string; line: number; column: number }>();
+let symbolTimer = 0;
+
+/// 符号类型的中文名（`kind` 用的是 LSP 的 SymbolKind 编号）
+const SYMBOL_KIND_LABELS: Record<number, string> = {
+  2: "模块",
+  5: "类",
+  7: "属性",
+  10: "枚举",
+  11: "接口",
+  12: "函数",
+  13: "变量",
+  14: "常量",
+  15: "标题",
+  20: "键",
+  23: "结构体",
+  26: "类型",
+};
+
+async function refreshSymbols(query: string) {
+  const root = workspaceRoot.value;
+  // ★ 空关键词**不拉列表**：一张按名字排的前几百条里，
+  //   打头的全是一两个字母的局部变量（`u`、`v`、`at`）—— 看着像坏了。
+  //   VS Code 的 Ctrl+T 空着时也是什么都不列
+  if (!root || !query.trim()) {
+    symbolEntries.value = [];
+    symbolTargets = new Map();
+    return;
+  }
+  try {
+    const rows = await invoke<SymbolRow[]>("index_symbols", { root, query });
+    const targets = new Map<string, { path: string; line: number; column: number }>();
+    symbolEntries.value = rows.map((row) => {
+      const key = `${row.path}:${row.line}:${row.column}`;
+      targets.set(key, { path: row.path, line: row.line, column: row.column });
+      const label = SYMBOL_KIND_LABELS[row.kind] ?? "符号";
+      return { key, text: row.name, hint: `${label} · ${relativePath(row.path, root)}` };
+    });
+    symbolTargets = targets;
+  } catch (error) {
+    console.warn("[搜索索引] 符号索引没拿到", error);
+    symbolEntries.value = [];
+    symbolTargets = new Map();
+  }
+}
 
 async function refreshIndexedFiles(query: string) {
   const root = workspaceRoot.value;
@@ -4607,6 +4670,11 @@ async function refreshIndexedFiles(query: string) {
 
 /** 输入框内容变了（防抖 120ms —— 每敲一个字都发一次请求没必要） */
 function onQuickOpenQuery(value: string) {
+  if (quickOpenMode.value === "symbol") {
+    window.clearTimeout(symbolTimer);
+    symbolTimer = window.setTimeout(() => void refreshSymbols(value), 120);
+    return;
+  }
   if (quickOpenMode.value !== "files" && quickOpenMode.value !== "context") return;
   window.clearTimeout(fileIndexTimer);
   if (!value.trim()) {
@@ -4618,16 +4686,18 @@ function onQuickOpenQuery(value: string) {
 
 const quickOpenEntries = computed<QuickOpenEntry[]>(() => {
   if (quickOpenMode.value === "commands") return commandPalette.value.entries;
+  if (quickOpenMode.value === "symbol") return symbolEntries.value;
   // ★ 「给 Topilot 添加上下文」用的**也是**文件列表 —— 数据源一模一样，
   //   只是选中之后干的事不同（那边打开文件，这边收进输入区）
   if (quickOpenMode.value === "files" || quickOpenMode.value === "context") {
-    return indexedFiles.value ?? filePalette.value.entries;
+    return indexedFiles.value ?? filePalette.value;
   }
   return [];
 });
 
 const quickOpenPlaceholder = computed(() => {
   if (quickOpenMode.value === "commands") return "输入命令名…";
+  if (quickOpenMode.value === "symbol") return "输入符号名…";
   if (quickOpenMode.value === "context") return "选一个文件附加给 Topilot…";
   return "输入文件名…";
 });
@@ -4635,6 +4705,11 @@ const quickOpenPlaceholder = computed(() => {
 const quickOpenEmptyText = computed(() => {
   // 「转到文件」/「添加上下文」在没打开文件夹时永远是空的，给一句能看懂的话
   if (quickOpenMode.value !== "commands" && !workspaceRoot.value) return "还没有打开文件夹";
+  // 符号索引可能还在建（渐进建的），空列表要说清原因
+  if (quickOpenMode.value === "symbol" && indexInfo.value && indexInfo.value.pending > 0) {
+    return "符号索引还在建，过一会儿再试";
+  }
+  if (quickOpenMode.value === "symbol") return "输入符号名开始搜索";
   return undefined;
 });
 
@@ -4643,6 +4718,11 @@ function openQuickOpen(mode: QuickOpenMode) {
   closeMenu();
   // 候选集每次打开都从文件树那份开始（即时、且不会带着上一次的关键词）
   indexedFiles.value = null;
+  // 符号：空关键词不预拉列表，等用户敲字（见 refreshSymbols 里的说明）
+  if (mode === "symbol") {
+    symbolEntries.value = [];
+    symbolTargets = new Map();
+  }
   quickOpenMode.value = mode;
 }
 
@@ -4674,8 +4754,21 @@ function onQuickOpenSelect(key: string) {
     return;
   }
 
-  const node = filePalette.value.byPath.get(key);
-  if (node) openFile(node.path);
+  // ★ 符号：key → 位置的那张表是 refreshSymbols 建的。
+  //   不把位置编进 key 是因为路径里本来就有冒号（`C:\…`），拆回来要处理转义
+  if (mode === "symbol") {
+    const target = symbolTargets.get(key);
+    // 走 revealAt 而不是 openFile + 设置光标：它管「打开 + 把光标放过去」，
+    // 而且处理了「目标就是当前标签」那种 openFile 不触发 watch 的情况
+    // （问题面板那边踩过这个坑）
+    if (target) revealAt(target);
+    return;
+  }
+
+  // ★ 文件：key 就是完整路径（文件树那份和索引那份都是这么定的），所以直接开。
+  //   ⚠ 不能再拿 filePalette.byPath 反查：索引里那些**超出文件树深度**的文件
+  //     根本不在那张表里，查不到的表现就是「回车了没反应」
+  openFile(key);
 }
 
 /**
@@ -4697,8 +4790,22 @@ function handleQuickOpenShortcut(event: KeyboardEvent) {
 }
 
 /**
- * 导航快捷键。和 VS Code 一致，每个方向都绑两套：
+ * Ctrl+T 转到符号。
  *
+ * ★ VS Code 里 Ctrl+T 是「在**整个工作区**里找符号」，Ctrl+Shift+O 是「在当前文件里找」。
+ *   我们这边只有工作区级的那份索引，所以 Ctrl+T 正好对应它的能力
+ * ⚠ 走捕获阶段：Monaco 自己也认 Ctrl+T（内置的 showAllSymbols）
+ */
+function handleSymbolShortcut(event: KeyboardEvent) {
+  if (!event.ctrlKey || event.altKey || event.shiftKey) return;
+  if (event.key.toLowerCase() !== "t") return;
+  event.preventDefault();
+  if (quickOpenMode.value === "symbol") closeQuickOpen();
+  else openQuickOpen("symbol");
+}
+
+/**
+ * 导航快捷键。和 VS Code 一致，每个方向都绑两套： *
  *   Alt+← / Alt+→              和浏览器、大多数 IDE 的习惯一致
  *   Ctrl+Alt+- / Ctrl+Shift+-  VS Code 文档里写的那一对
  *
@@ -5060,6 +5167,7 @@ onMounted(async () => {
 
   // 命令面板 / 快速打开。同样用捕获阶段 —— 见 handleQuickOpenShortcut 上面的说明
   window.addEventListener("keydown", handleQuickOpenShortcut, true);
+  window.addEventListener("keydown", handleSymbolShortcut, true);
 
   // 前进后退。捕获阶段同样必要 —— Alt+← 是 WebView2 的内建后退
   window.addEventListener("keydown", handleNavigateShortcut, true);
@@ -5139,6 +5247,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handlePanelShortcut, true);
   window.removeEventListener("keydown", handleProblemsShortcut, true);
   window.removeEventListener("keydown", handleQuickOpenShortcut, true);
+  window.removeEventListener("keydown", handleSymbolShortcut, true);
   window.removeEventListener("keydown", handleNavigateShortcut, true);
   window.removeEventListener("keydown", handleSearchShortcut, true);
   window.removeEventListener("keydown", handleSourceControlShortcut, true);
