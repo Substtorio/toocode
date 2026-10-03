@@ -3283,6 +3283,7 @@ pub fn run() {
             scan_snippet_extensions,
             search_in_folder,
             searchdb::index_info,
+            searchdb::index_files,
             searchdb::index_warm,
             searchdb::index_rebuild,
             searchdb::index_invalidate,

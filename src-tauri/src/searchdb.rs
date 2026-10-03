@@ -65,6 +65,11 @@ const SYNC_TTL_MS: u128 = 800;
 ///   前端的进度会一直转、后台线程也停不下来
 const MAX_INDEX_BYTES: i64 = 128 * 1024 * 1024;
 
+/// 文件名搜索一次最多返回多少条。
+/// ★ 它只是**候选集**：真正的排序在前端（`fuzzy.ts` 那套打分）。
+///   截断要有个上限，不然一个十万文件的大仓库光序列化就能把前端卡住
+const DEFAULT_FILE_LIMIT: usize = 2000;
+
 /// `files.indexed` 的取值
 const PENDING: i64 = 0; // 待索引
 const DONE: i64 = 1; // 已经进索引了
@@ -522,6 +527,28 @@ impl Index {
         Ok(rows.flatten().collect())
     }
 
+    /// 按**文件名 / 路径**找文件（快速打开用的候选集）。
+    ///
+    /// ★ 这里刻意不用 FTS5：路径一共就几万条，一次 `LIKE` 全表扫也就几毫秒 ——
+    ///   为它再养一张 trigram 索引不值得（那张索引会比路径本身大得多）。
+    ///   内容搜索那边不同：正文是几百 MB，扫不起
+    /// ★ 排序只用「路径短的在前」这个粗规则。真正该排的是「哪个更像用户要找的」，
+    ///   而那是前端的模糊打分该干的事 —— 在 SQL 里再实现一遍只会两套结果不一致
+    pub fn find_files(&self, query: &str, limit: usize) -> Result<Vec<String>, String> {
+        let needle = like_pattern(&query.to_lowercase());
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT path FROM files WHERE lower(path) LIKE ?1 ESCAPE '\\' \
+                 ORDER BY length(path), path LIMIT ?2",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = stmt
+            .query_map(params![needle, limit as i64], |r| r.get::<_, String>(0))
+            .map_err(|err| err.to_string())?;
+        Ok(rows.flatten().collect())
+    }
+
     /// 还没进内容索引的文件 —— 这些得走旧的现场扫描，结果才不会漏。
     /// ★ 包含「待索引」（0）和「决定不索引」（2）两种：后者的内容是**永远**不会进索引的，
     ///   不把它们算进来的话，那些文件就永远搜不到了
@@ -688,6 +715,23 @@ fn warm(store: Arc<Mutex<HashMap<String, Index>>>, root: String) {
             set.remove(&key);
         }
     });
+}
+
+/// 按文件名找文件（「转到文件」用）。
+/// ★ 和内容搜索一样，索引没建好也有结果 —— `files` 表是**磁盘清单**，
+///   不需要内容建好；搜索前先同步一下就能拿到当前的文件列表
+#[tauri::command]
+pub fn index_files(
+    app: tauri::AppHandle,
+    store: tauri::State<'_, IndexStore>,
+    root: String,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<String>, String> {
+    with_index(&app, &store.0, &root, |index| {
+        index.sync(Path::new(&root), false)?;
+        index.find_files(&query, limit.unwrap_or(DEFAULT_FILE_LIMIT))
+    })
 }
 
 /// 开始后台补齐（前端在工作区打开时调一次）。
@@ -1009,6 +1053,38 @@ mod tests {
         std::fs::write(dir.join("b.txt"), "world\n").unwrap();
         let info = index.sync(&dir, false).unwrap();
         assert_eq!(info.updated, 1, "标脏之后必须重新扫");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_files_matches_any_part_of_the_path_case_insensitively() {
+        let dir = temp_workspace("toocode-index-names");
+        std::fs::create_dir_all(dir.join("src/components")).unwrap();
+        std::fs::write(dir.join("src/App.vue"), "x").unwrap();
+        std::fs::write(dir.join("src/components/ChatPanel.vue"), "x").unwrap();
+        std::fs::write(dir.join("README.md"), "x").unwrap();
+
+        let mut index = Index::memory();
+        index.sync(&dir, true).unwrap();
+        let names = |q: &str| -> Vec<String> {
+            index
+                .find_files(q, 50)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.replace('\\', "/"))
+                .collect()
+        };
+
+        // 大小写不敏感（用户敲的都是小写）
+        assert_eq!(names("app.vue").len(), 1);
+        // 命中的是**整条路径**，所以目录名也能搜
+        assert!(names("components")[0].ends_with("components/ChatPanel.vue"));
+        assert_eq!(names("zzzz").len(), 0);
+        // 粗排序：短的路径排前面（真正的排序在前端的模糊打分）
+        let vues = names(".vue");
+        assert_eq!(vues.len(), 2);
+        assert!(vues[0].ends_with("App.vue"), "短的应该在前：{vues:?}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

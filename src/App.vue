@@ -4574,12 +4574,54 @@ const filePalette = computed(() => {
   return { entries, byPath };
 });
 
+/**
+ * 「转到文件」的候选集：优先用**索引**（SQLite 里的磁盘清单）。
+ *
+ * ★ 比文件树那份强在哪：文件树有**深度上限**（`MAX_DEPTH = 6`），
+ *   埋在更深处的文件根本不在树里，也就永远搜不到。索引没有这个限制
+ * ★ 空关键词时**不用索引**：那时文件树那份是现成的，能立刻显示出东西，
+ *   而索引要一来一回（用户看到的就是输入框空着、列表也空着）
+ * ⚠ 拿不到就退回文件树那份 —— 索引只是加速手段
+ */
+const indexedFiles = ref<QuickOpenEntry[] | null>(null);
+let fileIndexTimer = 0;
+
+async function refreshIndexedFiles(query: string) {
+  const root = workspaceRoot.value;
+  if (!root) {
+    indexedFiles.value = null;
+    return;
+  }
+  try {
+    const paths = await invoke<string[]>("index_files", { root, query });
+    indexedFiles.value = paths.map((path) => ({
+      key: path,
+      text: path.split(/[\\/]/).pop() ?? path,
+      hint: relativePath(path, root),
+    }));
+  } catch (error) {
+    console.warn("[搜索索引] 文件名索引没拿到，退回文件树那份", error);
+    indexedFiles.value = null;
+  }
+}
+
+/** 输入框内容变了（防抖 120ms —— 每敲一个字都发一次请求没必要） */
+function onQuickOpenQuery(value: string) {
+  if (quickOpenMode.value !== "files" && quickOpenMode.value !== "context") return;
+  window.clearTimeout(fileIndexTimer);
+  if (!value.trim()) {
+    indexedFiles.value = null;
+    return;
+  }
+  fileIndexTimer = window.setTimeout(() => void refreshIndexedFiles(value), 120);
+}
+
 const quickOpenEntries = computed<QuickOpenEntry[]>(() => {
   if (quickOpenMode.value === "commands") return commandPalette.value.entries;
   // ★ 「给 Topilot 添加上下文」用的**也是**文件列表 —— 数据源一模一样，
   //   只是选中之后干的事不同（那边打开文件，这边收进输入区）
   if (quickOpenMode.value === "files" || quickOpenMode.value === "context") {
-    return filePalette.value.entries;
+    return indexedFiles.value ?? filePalette.value.entries;
   }
   return [];
 });
@@ -4599,6 +4641,8 @@ const quickOpenEmptyText = computed(() => {
 function openQuickOpen(mode: QuickOpenMode) {
   // 浮层会盖住菜单，先把菜单收起来
   closeMenu();
+  // 候选集每次打开都从文件树那份开始（即时、且不会带着上一次的关键词）
+  indexedFiles.value = null;
   quickOpenMode.value = mode;
 }
 
@@ -6323,6 +6367,7 @@ watch(activeTabPath, async (path) => {
       :placeholder="quickOpenPlaceholder"
       :items="quickOpenEntries"
       :empty-text="quickOpenEmptyText"
+      @query="onQuickOpenQuery"
       @select="onQuickOpenSelect"
       @close="closeQuickOpen"
     />

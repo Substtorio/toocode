@@ -39,6 +39,14 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: "select", key: string): void;
   (e: "close"): void;
+  /**
+   * 输入框的当前内容。
+   *
+   * ★ 为什么要把它抛出去：候选集有可能来自后端（「转到文件」的大仓库场景），
+   *   后端只能拿到关键词才能缩小范围 —— 候选集大得全量拉回来就不划算了。
+   *   组件自己不管这事，它只是把「用户敲了什么」告诉调用方
+   */
+  (e: "query", value: string): void;
 }>();
 
 /** 列表再长也不会超过这个数 —— 不封顶的话一次渲染几千个节点会卡 */
@@ -56,6 +64,7 @@ const results = computed(() =>
 // 输入变了就把选中项拉回第一条 —— 否则会出现「选中第 5 项，但新结果只剩 2 项」
 watch(query, () => {
   activeIndex.value = 0;
+  emit("query", query.value);
 });
 
 // 结果变短时也要夹一下（比如删字符导致结果变少）
