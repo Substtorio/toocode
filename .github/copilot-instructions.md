@@ -2273,14 +2273,27 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
 
 ### 待办（按优先级）
 
-> **发布 1.0 的收尾 —— 只剩最后一步（2026-10-03）**
-> 已完成：LICENSE（MIT）、README 重写、CI、依赖许可扫描。
-> 剩下的：改四处版本号 → `npm run tauri build` → tag `v1.0.0` → Release 附件
-> ⚠ 推上去之后**第一次 CI 要盯一眼**（`gh run list`）—— 本地只预演了两步，
->   runner 上那段（Rust 缓存 / `Swatinem/rust-cache` / `cargo test` 真跑）没验证过
-> ⚠ 版本号那四处：`package.json` / `package-lock.json`（用
->   `npm install --package-lock-only` 同步，**别手改**）/ `src-tauri/tauri.conf.json`
->   （安装包名照它来）/ `src-tauri/Cargo.toml`
+> **✅ 1.0.0 发布了（2026-10-03）** —— 作者的判断是「功能上已经够了」，
+> 缺的不是功能，而是**对外承诺那几样**，所以这一版补的是 LICENSE / README 重写 / CI。
+>
+> | 项目 | 值 |
+> | --- | --- |
+> | 提交 | `dbf8761`（CI 打磨）→ `8185fc2`（版本号 1.0.0） |
+> | tag / Release | `v1.0.0`，**不是草稿、不是预发布** |
+> | 安装包 | `Toocode_1.0.0_x64-setup.exe`，5,815,389 字节 |
+> | 附件 digest | `sha256:dbfc347a⋯b624b6e3` —— 和本地 `Get-FileHash` **逐位一致** |
+> | 裸 exe | 10.71 MB（0.2.0 是 8.54 —— 涨的这 2 MB 是 bundled SQLite） |
+> | 编译耗时 | 前端 3.19 s + Rust release **3 m 11 s** |
+> | 四处版本号 | `package.json` / `package-lock.json`（用 `npm install --package-lock-only` 同步）/ `tauri.conf.json`（安装包名照它来）/ `Cargo.toml`；`Cargo.lock` 由 cargo 编译时自己更新 |
+> | CI | `37090970975`（3m50s，首绿）→ `37091351943`（1m56s，缓存命中）→ `37092084176`（版本号那次） |
+>
+> ⚠ **发这一版时 `github.com` 连不上、`api.github.com` 却好使** —— `git push` 全废，
+> 而 `gh` 一路顺。解法是 `git -c http.curloptResolve=github.com:443:<可用 IP>`，
+> 详见上面那条（分层诊断 DNS → TCP → **真实 HTTPS**，第 3 步不能跳）
+> ⏳ 还剩：**安装器没真装过**（0.2.0 那次「装 → 验 → 卸」完整走过一遍，
+> 1.0.0 只验了附件哈希）
+> ⚠ 顺手发现 cargo 的进度走的是 **stderr** —— 只看 stdout 那个日志会以为「卡住了」
+> （最后一行还停在前端的 `✓ built in 3.19s`）
 
 > **✅ 搜索索引（SQLite）做完了（2026-10-02）** —— 内容 / 文件名 / 符号三样，
 > 详见上面那条。实测：2000 文件语料上「查不存在的词」506ms → **35ms（扫 0 个文件）**。
@@ -2999,6 +3012,40 @@ gh release create v0.2.0 --title "Toocode 0.2.0" --notes-file "$env:TEMP\notes.m
   （实测 0.2.0 一致），`state` 要是 `uploaded`
 - 顺带 `gh auth setup-git` 会给 git 装 **host 级** credential helper
   （`credential.https://github.com.helper`），但连接性还是两说 —— 直连 github 依旧时好时坏
+
+### ★★★ `git push` 连不上、但 `gh` 好使 —— 2026-10-03 发 1.0.0 时实测
+
+两次 `git push` 都是 `Failed to connect to github.com port 443`（`Connection was reset`），
+而**同一时刻** `gh api rate_limit` 完全正常。
+★ 「全都连不上」和「只有 `github.com` 连不上」是两种完全不同的故障，
+混在一起就只能干等。分层的诊断顺序（DNS → TCP → **真实 HTTPS**）：
+```powershell
+Resolve-DnsName github.com -Type A                       # 1. 解析出来了吗
+Test-NetConnection github.com -Port 443                  # 2. TCP 通吗
+curl.exe -sS -o NUL --noproxy "*" --max-time 12 -w "%{http_code}" `
+  --resolve "github.com:443:<ip>" https://github.com/  # 3. 真能说 HTTPS 吗
+```
+实测：`github.com` → `20.205.243.166` **解析正常但 TCP 443 不通**；
+`api.github.com` → `20.205.243.168` TCP 通、`gh` 能用。
+⇒ ★ **DNS 解析成功不代表那条路能走**，第 2 步不能跳。
+
+★★ **TCP 通也不等于能说话** —— 这是本次最关键的一步验证。逐个 IP 测下来：
+`20.205.243.166` 不通；`140.82.112.3` / `.113.3` / `.114.3` / `20.27.177.113`
+**TCP 都通**，但要用 curl 带 `--resolve`（把域名钉到那个 IP）确认它们
+真能完成 TLS 握手 + 拿到 HTTP 200（`20.205.243.168` 就是个反例：TCP 通，HTTP 400）。
+
+★★★ **解法：让 git 自己把域名钉到 IP 上** —— 不用改 `hosts`（要管理员），也不用碰 DNS：
+```powershell
+git -c http.curloptResolve=github.com:443:140.82.112.3 push origin main
+git -c http.curloptResolve=github.com:443:140.82.112.3 push origin v1.0.0
+```
+实测一次成功（`dbf8761..8185fc2 main -> main`、`[new tag] v1.0.0`）。
+`http.curloptResolve` 是 git 暴露出来的 curl `CURLOPT_RESOLVE`，
+**只对这一次命令生效**、不写进任何配置 —— 正好适合「网络偶尔坏一下」这种场景。
+⚠ **只给 `git` 加不够**：`gh` 自己不做解析覆盖，它走 Go 的 `ProxyFromEnvironment`
+（见上面第 3 条）⇒ gh 那边只能靠代理，或者等网络自己好
+（本次就是「第一次 `gh release create` 报 `error connecting to api.github.com`，
+过一会儿原样重试就成了」）。
 
 ### ⚠ 提交前确认 target 没被加进来
 
