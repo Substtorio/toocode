@@ -1,6 +1,6 @@
 [package]
 name = "toocode"
-version = "0.2.0"
+version = "1.0.0"
 description = "Toocode —— 一个仿 VS Code 的桌面代码编辑器"
 authors = ["Substtorio"]
 # 和仓库根目录那份 LICENSE 保持一致。
