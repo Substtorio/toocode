@@ -1,5 +1,7 @@
 # Toocode
 
+[![CI](https://github.com/Substtorio/toocode/actions/workflows/ci.yml/badge.svg)](https://github.com/Substtorio/toocode/actions/workflows/ci.yml)
+
 一个用 **Tauri 2 + Vue 3 + TypeScript + Monaco** 写的桌面代码编辑器。
 
 它既是练手项目，也是一次「把 VS Code 的那些机制拆开看看到底怎么实现」的实验 ——

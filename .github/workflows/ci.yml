@@ -22,9 +22,9 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -47,5 +47,9 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - run: cargo test
+      # ★ 带 `-- --nocapture`：有几条用例需要本机装了 VS Code / node，
+      #   条件不具备时它们会**打印一行跳过原因**然后返回。
+      #   默认 libtest 会把通过用例的输出吞掉 —— 那样「绿」就没有信息量了，
+      #   看一眼日志应该能分清「真的跑了」和「跳过了一部分」
+      - run: cargo test -- --nocapture
         working-directory: src-tauri

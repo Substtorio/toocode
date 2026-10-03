@@ -1670,9 +1670,13 @@ mod tests {
     #[test]
     fn talks_to_the_real_json_language_server() {
         let Some(script) = find_bundled_server("json-language-features", "json") else {
+            println!("[跳过] 这台机器上没找到 VS Code 自带的 JSON 语言服务器");
             return;
         };
-        let Some(node) = which("node") else { return };
+        let Some(node) = which("node") else {
+            println!("[跳过] PATH 里没有 node");
+            return;
+        };
 
         let mut child = Command::new(node)
             .arg(&script)
@@ -1753,6 +1757,7 @@ mod tests {
     fn finds_the_bundled_language_servers() {
         // 条件不具备时跳过（见上一个测试的说明）
         if which("node").is_none() {
+            println!("[跳过] PATH 里没有 node");
             return;
         }
         let servers = find_lsp_servers();
@@ -1762,6 +1767,8 @@ mod tests {
             assert!(json.is_some(), "没认出 JSON 语言服务器");
             // ★ 语言 id 必须和语法扫描给出的对得上，否则永远匹配不上
             assert!(json.unwrap().languages.contains(&"json".to_string()));
+        } else {
+            println!("[跳过] 这台机器上没找到 VS Code 自带的语言服务器，只验证了能扫出服务器列表");
         }
     }
 
