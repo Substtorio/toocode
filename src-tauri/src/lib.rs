@@ -2528,6 +2528,69 @@ fn clear_secret(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 问接口要它支持的模型列表（OpenAI 兼容的 `GET {base}/models`）。
+///
+/// ★★ 为什么要有这个：官网的**模型字段**（真正发给接口的那串 id）是会变的 ——
+///   内置一张写死的表，等它变了只能改代码重新发版。
+///   而 `/models` 是 OpenAI 兼容接口的**标准端点**，问一次拿到的就是**当前**答案，
+///   对 Ollama / LM Studio / 通义这些第三方接口一样管用。
+///
+/// ⚠ 密钥由 Rust 自己读，前端拿不到 —— 和 `chat_stream` 同一套规矩
+#[tauri::command]
+async fn list_models(app: tauri::AppHandle, base_url: String) -> Result<Vec<String>, String> {
+    let key = {
+        let path = secret_file(&app)?;
+        read_secret(&path)?.trim().to_string()
+    };
+    if key.is_empty() {
+        return Err("还没配置 API 密钥".into());
+    }
+
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let response = http_client()
+        .get(&url)
+        .bearer_auth(&key)
+        .send()
+        .await
+        .map_err(|error| describe_http_error(&format!("请求 {url} 失败"), &error))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .map_err(|error| format!("读响应失败：{error}"))?;
+
+    if !status.is_success() {
+        // 只截一小段 —— 有些网关会把整个 HTML 错误页吐回来
+        let brief: String = text.chars().take(200).collect();
+        return Err(format!("接口返回 {status}：{brief}"));
+    }
+
+    // 标准形状是 `{ "data": [ { "id": "…" }, … ] }`。
+    // ⚠ 解析失败要**说清楚**，不要静默返回空列表 ——
+    //   那种情况下界面会显示「接口报了 0 个模型」，看着像接口真的没有模型
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("响应不是合法的 JSON：{error}"))?;
+
+    let ids: Vec<String> = value
+        .get("data")
+        .and_then(|data| data.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if ids.is_empty() {
+        return Err("接口没返回任何模型（响应里没有 data[].id）".into());
+    }
+
+    Ok(ids)
+}
+
 /// 复用同一个 HTTP 客户端。
 /// ★ 每次新建 Client 会连连接池一起丢掉，逐轮对话时开销很明显
 static HTTP_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -3302,6 +3365,7 @@ pub fn run() {
             save_secret,
             has_secret,
             clear_secret,
+            list_models,
             chat_stream,
             load_chats,
             save_chats,

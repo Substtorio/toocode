@@ -72,20 +72,28 @@ function loadConfig(): StoredConfig {
 const config = ref<StoredConfig>(loadConfig());
 
 /**
- * 已知模型：**调用名 → 版本名**的对照表。
+ * 已知模型：**模型字段（发给接口的 id）→ 人看的版本名**的对照表。
  *
- * ★★ 为什么要这张表：`deepseek-chat` 这种是**给接口看的 slug** ——
+ * ★★ 两者的区别一定要分清：`deepseek-flash` 这种是**给接口看的 slug** ——
  *   它既不说明是哪个版本、也不说明有多大。而配置界面那一栏是给**人**看的，
  *   人想知道的是「我在跟哪个模型说话」。
- *   所以界面显示**版本名**，请求里照旧发**调用名**（少了任何一个都不行）
+ *   所以界面显示**版本名**，请求里照旧发**模型字段**（少了任何一个都不行）
  *
- * ★ 表里没有的调用名照旧原样显示：兼容接口太多
- *   （通义 / Ollama / LM Studio 的模型名五花八门），
- *   硬要穷举只会得到一个永远不全的列表 —— 想加一个模型就往这里追一行
+ * ★ 这张表**只影响显示**，不再是“唯一的候选来源” ——
+ *   真正发给接口的值由下面那一行「模型字段」决定，
+ *   候选项则由 `GET /models` 现问现拿（见 fetchModels）。
+ *   官网改了模型字段，不用改代码就能跟上
+ *
+ * ★ 表里没有的照旧原样显示：兼容接口太多
+ *   （通义 / Ollama / LM Studio 的模型名五花八门）
  */
 const MODEL_PRESETS: ReadonlyArray<{ id: string; label: string }> = [
-  { id: "deepseek-chat", label: "DeepSeek V4.1 Flash" },
-  { id: "deepseek-reasoner", label: "DeepSeek V4.1 Thinking" },
+  { id: "deepseek-flash", label: "DeepSeek V4.1 Flash" },
+  { id: "deepseek-v4-pro", label: "DeepSeek V4 Pro" },
+  // 下面两个是 DeepSeek 长期存在的稳定别名，现在仍然能用。
+  // ★ 留着它们是为了**不打翻已经配好的用户** —— 他们存的 `config.model` 就是这个
+  { id: "deepseek-chat", label: "DeepSeek Chat（旧别名）" },
+  { id: "deepseek-reasoner", label: "DeepSeek Reasoner（旧别名）" },
 ];
 
 /** 下拉里那个「自定义…」的哨兵值。用一个真实 id 不可能是的字符串 */
@@ -108,31 +116,66 @@ function modelDisplayName(id: string): string {
 }
 
 /**
- * 现在是不是「自己填调用名」的状态。
+ * 从接口拉回来的模型字段（`GET {baseUrl}/models`）。
  *
- * ⚠ 它**不是** `config.model` 的第二份拷贝 —— `config.model` 依旧是唯一的真相，
- *   这里记的是「模型那一栏现在用哪种方式编辑」。
- *   之所以要单独一个开关（而不是普通的「查不到版本名 = 自定义」那种反推）：
- *   切到「自定义」时我们**要保留原来的调用名当草稿**，
- *   否则用户想把 `deepseek-chat` 改成 `deepseek-chat-v2` 就得整个重打一遍；
- *   而只要保留着取值，「是不是已知模型」这个反推判据就失效了
+ * ★★ 为什么要有这个：官网的模型字段是会变的 ——
+ *   内置一张写死的表，等它变了只能改代码重新发版。
+ *   而 `/models` 是 OpenAI 兼容接口的**标准端点**，问一次拿到的就是**当前**答案，
+ *   对 Ollama / LM Studio / 通义这些第三方接口一样管用
+ *
+ * ⚠ 只在**这次会话**里缓存，**不**写 localStorage：
+ *   它是「接口现在有什么」，不是用户的配置 —— 存下来只会变成一个过期的东西
  */
-const customModel = ref(modelLabel(config.value.model) === null);
+const remoteModels = ref<string[]>([]);
+const fetchState = ref<"idle" | "loading" | "ok" | "error">("idle");
+const fetchError = ref("");
+
+/** 下拉 / datalist 的候选：内置预设（有版本名）+ 接口报上来的（显示 id 本身） */
+const modelOptions = computed(() => {
+  const known = new Set(MODEL_PRESETS.map((preset) => preset.id));
+  const extra = remoteModels.value
+    .filter((id) => !known.has(id))
+    .map((id) => ({ id, label: id }));
+  return [...MODEL_PRESETS, ...extra];
+});
 
 /**
- * 下拉框绑的值。
+ * 上面那个下拉框绑的值。
  *
- * ★ 用**计算属性 + setter**，不给模板里挂一串 `@change` 处理器 ——
- *   「选了什么」和「存了什么」的对应关系只写在这一处
+ * ★★ 完全**派生**，没有独立的开关状态：取值在候选里就显示它自己，
+ *   不在就显示「自定义…」。
+ *   （以前有一个 `customModel` ref，那是为了「切到自定义时保留草稿」—— 
+ *     现在模型字段那一行**始终**可编辑，草稿天然就在 `config.model` 里，那个开关就多余了）
  */
 const modelChoice = computed({
-  get: () => (customModel.value ? CUSTOM_MODEL : config.value.model),
+  get: () =>
+    modelOptions.value.some((option) => option.id === config.value.model)
+      ? config.value.model
+      : CUSTOM_MODEL,
   set: (value: string) => {
-    customModel.value = value === CUSTOM_MODEL;
-    // 选「自定义」时**不**动 config.model（那是留给用户改的草稿）
+    // 选「自定义」时**不**动 config.model —— 真正改值的地方是下面那一行输入框
     if (value !== CUSTOM_MODEL) config.value.model = value;
   },
 });
+
+/**
+ * 问接口要一次模型列表。
+ *
+ * ⚠ 拉取失败**不是**「不能用了」—— 手填照旧。
+ *   所以失败只把原因显示出来，不改 `config.model`、也不拦着保存
+ */
+async function fetchModels() {
+  if (fetchState.value === "loading") return;
+  fetchState.value = "loading";
+  fetchError.value = "";
+  try {
+    remoteModels.value = await invoke<string[]>("list_models", { baseUrl: config.value.baseUrl });
+    fetchState.value = "ok";
+  } catch (error) {
+    fetchState.value = "error";
+    fetchError.value = error instanceof Error ? error.message : String(error);
+  }
+}
 
 /** 密钥配了没有。null = 还没问过 */
 const hasKey = ref<boolean | null>(null);
@@ -151,6 +194,18 @@ const editingConfig = ref(false);
 
 /** 什么时候显示配置界面：没配过（强制）、或者用户主动打开了 */
 const showSetup = computed(() => hasKey.value !== true || editingConfig.value);
+
+// 打开配置界面时**自动拉一次**模型列表 —— 这就是「跟着官网更新」的落点：
+// 用户不需要知道该按哪个按钮，打开就能看到接口当前认哪些模型字段。
+// ⚠ 三个前提缺一不可：有密钥（没密钥问了也是 401）、界面真的开着、这次会话还没拉过
+//   （`idle` 就是那个「还没拉过」的状态）
+watch(
+  [showSetup, hasKey],
+  ([open, key]) => {
+    if (open && key === true && fetchState.value === "idle") void fetchModels();
+  },
+  { immediate: true },
+);
 
 /** 没配过密钥时才必须填；已有密钥时留空表示「只改地址 / 模型，不动密钥」 */
 const canSaveConfig = computed(() => {
@@ -847,36 +902,55 @@ function onChatLogClick(event: MouseEvent) {
         <input v-model="config.baseUrl" type="text" spellcheck="false" />
       </label>
 
-      <!-- 模型：**显示版本名、存调用名**，两者的区别见上面 MODEL_PRESETS 的说明。
-           ★ 用下拉框而不是文本框：常用模型就那么几个，手填 slug 纯属浪费
-           ★ 但保留了「自定义」—— 兼容接口太多，穷举不完 -->
+      <!-- 模型：下拉只是**快捷选择**，真正决定发给接口什么的是下面那行「模型字段」。
+           ★ 选项来自「内置预设（有版本名）+ 接口报上来的」（见 modelOptions） -->
       <label class="chat-field">
         <span>模型</span>
         <select v-model="modelChoice">
-          <option v-for="preset in MODEL_PRESETS" :key="preset.id" :value="preset.id">
-            {{ preset.label }}
+          <option v-for="option in modelOptions" :key="option.id" :value="option.id">
+            {{ option.label }}
           </option>
           <option :value="CUSTOM_MODEL">自定义…</option>
         </select>
       </label>
 
-      <!-- 自定义时才出来填调用名的地方。
-           默认值就是原来的调用名，改一个字符就行，不用重打 -->
-      <label v-if="customModel" class="chat-field">
-        <span>模型调用名</span>
+      <!-- 模型字段：**真正发给接口的那串 id**。
+           ★ 始终可编辑（不再藏在「自定义…」后面）—— 值一旦不在上面的候选里，
+             上面会显示「自定义…」，而改值就在这一行
+           ★ 带 datalist：既能从候选里挑，也能手打任意 id（第三方接口就靠这个） -->
+      <label class="chat-field">
+        <span>模型字段（发给接口）</span>
         <input
           v-model="config.model"
           type="text"
           spellcheck="false"
-          placeholder="接口那边认的模型 id，如 deepseek-chat"
+          list="topilot-model-ids"
+          placeholder="接口那边认的模型 id，如 deepseek-flash"
         />
       </label>
 
-      <!-- ★ 调用名**始终**露一行：真发出去的就是它，
-           排错（比如 404）看的就是它。把它藏起来 = 出问题时无从下手 -->
+      <!-- 拉取状态 + 手动刷新。★ 拉取失败**不拦着保存** —— 手填照旧可用 -->
       <p class="chat-model-note">
-        接口收到的模型名：<code>{{ config.model || "（还没填）" }}</code>
+        <button
+          type="button"
+          class="chat-mini-button"
+          :disabled="fetchState === 'loading'"
+          @click="fetchModels"
+        >
+          {{ fetchState === "loading" ? "获取中…" : "从接口获取列表" }}
+        </button>
+        <span v-if="fetchState === 'ok'">接口报了 {{ remoteModels.length }} 个模型，可从上面的候选里挑</span>
+        <span v-else-if="fetchState === 'error'">拉取失败（手填照旧可用）：{{ fetchError }}</span>
+        <span v-else-if="fetchState === 'loading'">正在问接口要模型列表…</span>
+        <span v-else>填写后打开这一页会自动问一次接口，拿到的是官网当前的模型字段</span>
       </p>
+
+      <!-- 候选数据源。放哪儿都行，它自己不渲染 -->
+      <datalist id="topilot-model-ids">
+        <option v-for="option in modelOptions" :key="option.id" :value="option.id">
+          {{ option.label }}
+        </option>
+      </datalist>
 
       <label class="chat-field">
         <span>API 密钥</span>
@@ -1315,18 +1389,40 @@ function onChatLogClick(event: MouseEvent) {
   border-color: var(--color-link);
 }
 
-/* 「接口收到的模型名」那一行 ——
-   它是**说明**不是输入，所以压暗、用等宽字体把那个 id 凸出来 */
+/* 「从接口获取列表」那一行 —— 小一号的**次要**按钮 + 状态说明。
+   ★ 刻意不给它主色：这是辅助动作，主操作始终是下面那个「保存」 */
 .chat-model-note {
   margin: -2px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
   color: var(--color-text-dim);
   font-size: 11px;
   line-height: 1.5;
 }
 
-.chat-model-note code {
-  font-family: Consolas, "Courier New", monospace;
+.chat-mini-button {
+  flex: 0 0 auto;
+  height: 22px;
+  box-sizing: border-box;
+  padding: 0 8px;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 3px;
+  background: var(--color-hover);
   color: var(--color-text);
+  font-family: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.chat-mini-button:hover:not(:disabled) {
+  border-color: var(--color-link);
+  color: var(--color-text-emphasis);
+}
+
+.chat-mini-button:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .chat-setup-actions {
