@@ -31,10 +31,11 @@ import {
 // 会话（一段可以独立存、独立切回来的对话）。存储细节全在那边，见文件头
 import {
   loadSessions,
-  MAX_SESSIONS,
   newSession,
   saveSessions,
   titleFrom,
+  trimSessions,
+  workspaceKeyOf,
   type ChatSession,
   type ChatSessionMessage,
 } from "../chatSessions";
@@ -213,9 +214,37 @@ const canSaveConfig = computed(() => {
  *   不报错、只答非所问的怪事
  */
 const sessions = ref<ChatSession[]>([]);
+/** 会话文件读回来没有 —— 用它而不是 `sessions.length === 0` 猜状态（见面板那个 watch） */
+const sessionsLoaded = ref(false);
 const activeSessionId = ref("");
 const sessionsOpen = ref(false);
 const sessionWrapEl = ref<HTMLElement | null>(null);
+
+/**
+ * 当前文件夹的「身份」（`null` = 没打开文件夹）。
+ *
+ * ★ 不能直接拿 `props.workspaceRoot` 去比：那是原样的路径，盘符大小写和
+ *   分隔符都可能不一样，而会话里存的是归一化过的。不统一过一遍的话，
+ *   同一个文件夹会因为「这次写成 `D:\foo`、上次是 `d:/foo/`」
+ *   而被当成两个工作区 —— 症状是「切回来对话不见了」
+ */
+const workspaceKey = computed(() => workspaceKeyOf(props.workspaceRoot));
+
+/**
+ * 只属于**当前文件夹**的会话。
+ *
+ * ★★ 为什么 `sessions` 存**全集**（所有文件夹的）、这里才过滤，
+ *   而不是让 `sessions` 里只放当前项目的：
+ *   `persist()` 是**整份重写**文件的。`sessions` 里只有当前项目的话，
+ *   每存一次就会把别的项目的对话**全部删掉** —— 而且不报错
+ *   （下一次启动才发现，那时已经晚了）
+ */
+const visibleSessions = computed(() =>
+  sessions.value.filter((session) => session.workspace === workspaceKey.value),
+);
+
+/** 不属于当前文件夹的那些。只在列表末尾提一句，不列出来（理由见模板里那段注释） */
+const hiddenSessionCount = computed(() => sessions.value.length - visibleSessions.value.length);
 
 const activeSession = computed(
   () => sessions.value.find((session) => session.id === activeSessionId.value) ?? null,
@@ -241,8 +270,10 @@ const history = computed<ChatMessage[]>({
   },
 });
 
-/** 列表里按最后更新排（新建的永远在最上面） */
-const sortedSessions = computed(() => [...sessions.value].sort((a, b) => b.updatedAt - a.updatedAt));
+/** 列表里按最后更新排（新建的永远在最上面）。★ 只排**当前文件夹**的 */
+const sortedSessions = computed(() =>
+  [...visibleSessions.value].sort((a, b) => b.updatedAt - a.updatedAt),
+);
 
 const input = ref("");
 
@@ -401,10 +432,30 @@ watch(
   (visible) => {
     if (!visible) return;
     if (hasKey.value === null) void refreshKeyState();
-    if (sessions.value.length === 0) void initSessions();
+    if (!sessionsLoaded.value) void initSessions();
   },
   { immediate: true },
 );
+
+/**
+ * 换文件夹（或关掉文件夹）时，把面板切到**这个文件夹自己的**对话。
+ *
+ * ★★ 不做这一步，过滤只会让列表变短，而 `activeSession` 还指着上一个项目的
+ *   会话 —— 更糟的是那个组合：「面板里显示着旧项目的对话，但下一条消息
+ *   带的是新项目的上下文」，模型只会答得莫名其妙，两边都不报错
+ * ★ 监听的必须是 `workspaceKey`（归一化过的）而不是 `props.workspaceRoot` 本身：
+ *   否则同一个路径换个写法也会触发一次「换文件夹」
+ * ⚠ 会话还没读回来时直接返回 —— 那是「面板从没打开过」。
+ *   等它第一次显示时 `initSessions` 会拿**当时**的文件夹来选，正合适
+ * ⚠ 流式进行中不切：那时 `reply` 指着旧会话里的一条消息，切走它还在往一个
+ *   看不见的地方写。（和 `newChat` / `openSession` 同一个取舍）
+ *   已知局限：这一下会「漏切」，要等下一次切文件夹才补上
+ */
+watch(workspaceKey, () => {
+  if (busy.value) return;
+  if (!sessionsLoaded.value) return;
+  ensureActiveSession();
+});
 
 /**
  * 系统提示词。告诉模型「你在哪、能干什么、别干什么」。
@@ -674,8 +725,42 @@ function stop() {
 
 // ---------- 会话的增 / 删 / 切 ----------
 
-/** 当前「在聊哪个」。只存一个 id，很小，放 localStorage 不会和 hot exit 抢配额 */
+/**
+ * 「每个文件夹上次在聊哪一段」。
+ *
+ * ★ 存成一个**映射**（文件夹 key ➝ 会话 id），而不是一个裸 id：
+ *   裸 id 的话，从 A 切到 B 再切回来，记的是 B 的 id ⇒ **每次都只能回退到
+ *   本文件夹的第一段**，用户会以为「聊到一半的记录没了」
+ * ★ 只存 id，很小，放 localStorage 不会和 hot exit 抢配额
+ * ⚠ 旧版本存的就是一个裸 id（不带引号的字符串）⇒ `JSON.parse` 会抛，
+ *   这里当成「没记过」。不值得为它写迁移：代价只是「回到第一段」
+ */
 const ACTIVE_CHAT_KEY = "toocode:activeChat";
+
+/** 读那个映射。读不出来一律当空 —— 它丢了只是「回到第一段」，不影响对话本身 */
+function readActiveMap(): Record<string, string> {
+  try {
+    const raw = window.localStorage.getItem(ACTIVE_CHAT_KEY);
+    if (raw === null) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+    return parsed as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+/** 本文件夹上次在聊哪一段（没记过就 null） */
+function rememberedSessionId(): string | null {
+  return readActiveMap()[workspaceKey.value ?? ""] ?? null;
+}
+
+/** 记下「这个文件夹现在在聊哪一段」 */
+function rememberActiveSession(id: string) {
+  const map = readActiveMap();
+  map[workspaceKey.value ?? ""] = id;
+  window.localStorage.setItem(ACTIVE_CHAT_KEY, JSON.stringify(map));
+}
 
 /** 落盘。★ 不 await —— 调用它的地方都是「顺手存一下」，不该把对话拖慢 */
 function persist() {
@@ -700,7 +785,7 @@ function activateSession(id: string) {
 
   activeSessionId.value = session.id;
   renderMessages(session);
-  window.localStorage.setItem(ACTIVE_CHAT_KEY, session.id);
+  rememberActiveSession(session.id);
 
   // 上一个会话的报错 / 停止原因不该带到这一个里
   errorText.value = null;
@@ -709,23 +794,61 @@ function activateSession(id: string) {
   void scrollToBottom();
 }
 
-/** 面板第一次显示时才去读聊天记录 */
+/**
+ * 面板第一次显示时才去读聊天记录。
+ * ★ 它只负责「读进来」，至于该切到哪一段交给 `ensureActiveSession` ——
+ *   那一段逻辑换文件夹时还要再用一次（见那个 watch）
+ */
 async function initSessions() {
-  const loaded = await loadSessions();
-  sessions.value = loaded.length > 0 ? loaded : [newSession()];
+  sessions.value = await loadSessions();
 
-  // ★ 消息 id 要接在历史里最大的那个后面 —— 不然新消息会和旧消息撞 id，
-  //   而 id 是列表的 key（撞了 Vue 会复用错节点，症状是「内容串了」）
+  // ★ 消息 id 要接在**全部**历史里最大的那个后面 —— 不然新消息会和旧消息撞 id，
+  //   而 id 是列表的 key（撞了 Vue 会复用错节点，症状是「内容串了」）。
+  //   这里按全集算：跨文件夹也不应该撞
   uiSeq = sessions.value.reduce(
     (max, session) =>
       session.messages.reduce((inner, message) => Math.max(inner, message.id), max),
     0,
   );
 
-  const last = window.localStorage.getItem(ACTIVE_CHAT_KEY);
-  const target = sessions.value.find((session) => session.id === last) ?? sessions.value[0];
-  activeSessionId.value = target.id;
-  renderMessages(target);
+  sessionsLoaded.value = true;
+  ensureActiveSession();
+}
+
+/** 真的建一段（不看 busy）—— `ensureActiveSession` 和 `newChat` 共用 */
+function createSession(): ChatSession {
+  const session = newSession(workspaceKey.value);
+  sessions.value.unshift(session);
+  // ★ 上限交给 trimSessions 那**唯一**一个入口。
+  //   它按文件夹分别封顶，所以不会碰到别的项目的记录
+  sessions.value = trimSessions(sessions.value);
+  activateSession(session.id);
+  persist();
+  return session;
+}
+
+/**
+ * 保证「当前文件夹」有一段可聊的会话，并把它设为当前。
+ *
+ * ★ 加载完 / 换文件夹之后都要走一遍，所以单独抽出来
+ * ★ 优先级：**本文件夹上次在聊的那段** ➝ 本文件夹最近更新的一段 ➝ 新建一段。
+ *   中间那一步不能省：上次那段可能已经被删了，也可能根本就是老数据（未归属）
+ */
+function ensureActiveSession() {
+  const visible = visibleSessions.value;
+  const remembered = rememberedSessionId();
+
+  const target =
+    visible.find((session) => session.id === remembered) ??
+    [...visible].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+
+  if (target === undefined) {
+    // 这个文件夹还一段都没有 ⇒ 开一段新的
+    createSession();
+    return;
+  }
+
+  activateSession(target.id);
 }
 
 /** 新建一段对话。
@@ -739,17 +862,7 @@ async function initSessions() {
  */
 function newChat() {
   if (busy.value) return;
-
-  const session = newSession();
-  sessions.value.unshift(session);
-  // ★ 别让列表无限长，而且**从列表里就丢掉** ——
-  //   只在存盘时截断的话，界面上有、文件里没有，两边就对不上了
-  if (sessions.value.length > MAX_SESSIONS) {
-    sessions.value = sessions.value.slice(0, MAX_SESSIONS);
-  }
-
-  activateSession(session.id);
-  persist();
+  createSession();
 }
 
 function openSession(id: string) {
@@ -767,15 +880,23 @@ function deleteChat(id: string) {
   const target = sessions.value[index];
   if (!window.confirm(`确定要删除「${target.title}」这段对话吗？删除后无法恢复。`)) return;
 
+  // ★ 「删完之后该切到哪」必须在删**之前**算：
+  //   `visibleSessions` 是过滤出来的子集，删完它的下标就和全集对不上了
+  const position = visibleSessions.value.findIndex((session) => session.id === id);
+  const remaining = visibleSessions.value.filter((session) => session.id !== id);
+  const wasActive = id === activeSessionId.value;
+
   sessions.value.splice(index, 1);
 
-  // 删的正好是当前这段 ⇒ 挪到相邻一段去；一段都不剩就开个新的
-  if (id === activeSessionId.value) {
-    if (sessions.value.length === 0) {
-      newChat();
-      return; // newChat 自己会落盘
+  // 删的正好是当前这段 ⇒ 退到同一位置上的那一段（没了就往前面退）；
+  // 这个文件夹一段都不剩了就开个新的
+  if (wasActive) {
+    if (remaining.length === 0) {
+      createSession();
+      return; // createSession 自己会落盘
     }
-    activateSession(sessions.value[Math.min(index, sessions.value.length - 1)].id);
+    const next = remaining[Math.min(Math.max(position, 0), remaining.length - 1)];
+    activateSession(next.id);
   }
   persist();
 }
@@ -1031,7 +1152,7 @@ function onChatLogClick(event: MouseEvent) {
           <button
             class="chat-icon-button"
             type="button"
-            :title="`聊天记录（${sessions.length}）`"
+            :title="`聊天记录（${visibleSessions.length}）`"
             :disabled="busy"
             :class="{ active: sessionsOpen }"
             @click="sessionsOpen = !sessionsOpen"
@@ -1054,6 +1175,11 @@ function onChatLogClick(event: MouseEvent) {
 
           <div v-if="sessionsOpen" class="chat-sessions">
             <div class="chat-sessions-head">聊天记录</div>
+            <!-- 这个文件夹还没有对话。★ 说一句比留一片空白好 ——
+                 空白会让人以为「记录没了」 -->
+            <p v-if="sortedSessions.length === 0" class="chat-sessions-empty">
+              这个文件夹还没有对话
+            </p>
             <button
               v-for="session in sortedSessions"
               :key="session.id"
@@ -1074,6 +1200,15 @@ function onChatLogClick(event: MouseEvent) {
                 ×
               </span>
             </button>
+            <!-- ★ 必须说这一句：按文件夹过滤之后，别的文件夹的对话**不在列表里**了。
+                 不解释的话用户会以为记录丢了（尤其刚换过文件夹那一下）——
+                 而「东西不见了但没报错」最容易让人怀疑是自己记错了
+                 ⚠ 文案说「不属于当前文件夹」而不是「属于其它文件夹」：
+                   加这个字段**之前**存的那些会归到「未归属」那一档，
+                   它们不属于任何文件夹，说成「其它文件夹」是错的 -->
+            <p v-if="hiddenSessionCount > 0" class="chat-sessions-note">
+              另外还有 {{ hiddenSessionCount }} 段对话不属于当前文件夹
+            </p>
           </div>
         </div>
       </div>
@@ -1924,6 +2059,25 @@ function onChatLogClick(event: MouseEvent) {
   padding: 2px 6px 4px;
   color: var(--color-text-dim);
   font-size: 11px;
+}
+
+/* 这个文件夹一段对话都没有时的一句说明 */
+.chat-sessions-empty {
+  margin: 0;
+  padding: 4px 6px 6px;
+  color: var(--color-text-dim);
+  font-size: 11px;
+}
+
+/* 「另外还有 n 段属于其它文件夹」。
+   ★ 用一条分隔线把它和列表分开 —— 它不是一段对话，不该看着像一段 */
+.chat-sessions-note {
+  margin: 4px 0 0;
+  padding: 5px 6px 2px;
+  border-top: 1px solid var(--color-menu-border);
+  color: var(--color-text-dim);
+  font-size: 10px;
+  line-height: 1.4;
 }
 
 /* 一行 = 一段对话 */
