@@ -1,4 +1,4 @@
-  import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import * as monaco from "monaco-editor";
 
