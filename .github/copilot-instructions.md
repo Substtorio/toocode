@@ -2179,6 +2179,28 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
   ⚠ 夹取那两个 `Math.max` **不能合** —— 窗口比提示条还窄时
     `innerWidth - width - MARGIN` 是个负数，直接用会把框推到视口外面
 
+  ★★ **补出来的 `aria-label` 会固化在第一次的值上（隔了一轮才发现）**：
+    tooltip 接管 `title` 时会给「光秃秃」的按钮补一个 `aria-label`
+    （title 是它唯一的名称来源）—— 但那个值补进去就不动了。
+    实测：面板打开时补成「聊天记录（0）」，之后 `data-tooltip` 跟着会话数
+    变成「（1）」「（2）」，而 `aria-label` **一直停在（0）**。
+    ⇒ 界面上完全看不出来，只有用读屏的人会发现名字和实际不符
+    ★ 修法：补的时候顺手打个 `data-a11y-from-title` 标记（值 = 上次补的文本），
+      title 变了就跟着更新
+      ⚠ 只在「`aria-label` 还等于那个标记值」时才接管 ——
+        作者若自己改过就该让位，不能被我们覆盖回去
+    ★ 顺带修了同一类过期：**`title` 变成空串 / 被移除时，
+      `data-tooltip` 留着上一次那句**。`title=""` 的语义是「这里不要提示」，
+      留着过期的信息比没有更糟
+      ⚠ 不会因此无限循环：观察者那句 `getAttribute("title") !== null`
+        挡住了「我们自己 remove 掉 title」那一轮
+    ✅ 实测：「聊天记录（1）」→ 新建一段 → tip 和 label 都变「（2）」；
+      「显示 Topilot」→「隐藏 Topilot」也跟着走；18 个补过的元素
+      tip 与 label 全部一致；提示条本身照常
+    ⚠ 验证时踩到：前面的 `locator.hover()` 超时（元素不存在）会让鼠标停在
+      一个奇怪的状态，紧接着那次 hover 就不出提示条了 —— 别把它当成「坏了」。
+      改用 `page.mouse.move` 或页内合成 `mouseover` 都正常
+
 - [x] **Topilot 多会话（新建聊天 + 选择聊天）**：
   起因是用户说「加一个功能让他分不同的 Session，支持新建聊天和选择聊天」。
   ★★ **存哪儿：`appDataDir/toocode.chats.json`，不是 localStorage** ——
@@ -2211,10 +2233,12 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     这种崩法只在「用了很久之后」才出现。原则是「读不出来的当它不存在」
     ⚠ 解析失败**不要**顺手把文件清掉 —— 万一只是我们理解错了，
       用户的记录还在原地，下次改对了还能读出来
-  ★ **上限 20 段**（`MAX_SESSIONS`），而且**从列表里就丢掉**多出来的：
-    只在存盘时截断的话，界面上有、文件里没有，两边就对不上了
-  ★ **「上次在聊哪个」存 localStorage**：那只是一个 id，很小，
-    不会和 hot exit 抢配额（实测重载后正确恢复）
+  ★ **上限 20 段**（`MAX_SESSIONS`）。⚠ 这条**后来改了**：现在收成一个
+    `trimSessions()` 入口，而且是「每个文件夹各自 20 段 + 整个文件 60 段」，
+    界面上也不再自己 slice —— 见下面「会话按打开的文件夹分开」那条
+  ★ **「上次在聊哪个」存 localStorage**（`toocode:activeChat`）：它只是一个 id，
+    很小，不会和 hot exit 抢配额。（实测重载后正确恢复）
+    ⚠ 后来从「一个 id」改成了「文件夹 ➝ id 的映射」，见下面那条
 
   ★★ **把「清空对话」换成了「新建聊天」**：有了会话之后它就没必要了 ——
     新建**不会**毁掉旧的，所以也不用确认框；而「清空」和「新建」给用户的结果
@@ -2247,6 +2271,73 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       上一个脚本一断开，它注册的桩就没了。换一个脚本再 `Page.reload`
       出来的新文档**没有桩**，症状是「面板停在配置界面」。
       ⇒ 每个脚本要自己注册一遍
+
+- [x] **会话按打开的文件夹分开（切项目不再串台）**：
+  起因是用户问「我打开了一个不同的项目，右侧的 Topilot 还是上一个项目的，
+  VS Code 的 Copilot 是新开一个窗口，是怎么实现的？是把上下文存在项目里了吗」。
+  ★★ **先纠正一个前提：哪儿都没存进项目**。会话一直存在**一个全局文件**
+    （`%APPDATA%\com.toocode.app\toocode.chats.json`），项目目录里一个字节都没写
+  ★★ **VS Code 也不是「存进项目」** —— 扒了它的库：
+    `%APPDATA%\Code\User\globalStorage\github.copilot-chat\session-store.db`
+    是个**全局 SQLite**，但 `sessions` 表里有 `cwd` / `repository` / `branch`
+    三列，还有 `CREATE INDEX idx_sessions_repo ON sessions(repository)`
+    ⇒ 它是「一个全局库 + 每段打上工作区标记，UI 按标记过滤」。
+      ★ 这个区别很关键：**隔离是数据上打标记，不是挪存放位置** ——
+        存进项目目录反而更糟（每个仓库多一个聊天记录文件，还会被 git 看见）
+    ⚠ 扒它的时候踩到：`session-store.db` 被 VS Code 占着，
+      `[IO.File]::ReadAllBytes` 直接 IOException。要用
+      `[IO.File]::Open($db, Open, Read, ReadWrite)` 共享读 —— 建表语句是
+      明文存在文件里的，抠出来就能看到表结构
+  ★★ **本轮最该记的一件事：「sessions 里存全集，只在显示上过滤」**
+    落盘是**整份重写**文件的（`saveSessions(sessions.value)`）。如果为了「隔离」
+    把 `sessions` 改成只装当前文件夹的会话，那么**第一次落盘就会把别的项目的
+    对话全部删掉** —— 而且不报错，用户下次启动才发现
+    ⇒ 所以 `sessions` 永远是全集，`visibleSessions` 才做过滤
+    ⇒ 连带 `persist()` 存的也是全集
+  ★★ **上限也必须跟着改**：原来是两处全局 `slice(0, 20)`
+    （`newChat` 里一处、`saveSessions` 里一处）—— 多开几个项目之后，
+    旧项目的对话会被**静默挤掉**。收成一个 `trimSessions()`：
+    「每个文件夹各自 `MAX_SESSIONS`(20) 段 + 整个文件 `MAX_SESSIONS_TOTAL`(60) 段」
+    ★ 为什么还要总上限：20 × N 个项目，文件会一直长
+    ★ 顺带消掉一个隐患：界面上也不再自己 slice 了，所以
+      「界面上有、文件里没有」从根上没了
+  ★ **归属是个字段，不是文件名**：`ChatSession.workspace`（归一化路径，
+    `null` = 建的时候没打开文件夹）。为此在 `chatSessions.ts` 里加了
+    `workspaceKeyOf()` —— 复用 `pathUtils` 的 `normalizePath`，不自己再写一遍
+    ⇒ 写 `D:\foo` 和 `d:/foo/` 是同一个工作区
+  ⚠ **老数据没有这个字段** ⇒ `normalizeSession` 归成 `null`（未归属）。
+    这是**故意的**：猜「它属于哪个项目」比承认不知道更糟。
+    代价是「打开文件夹之后看不到它们」（关掉文件夹才看得到）——
+    所以列表末尾加了一句提示，不然用户会以为**记录丢了**
+    ⚠ 文案是「不属于当前文件夹」而不是「属于其它文件夹」——
+      前者对「未归属」那一档也成立
+  ★★ **「上次在聊哪一段」从 id 改成映射**（`toocode:activeChat`
+    = `{ "d:/proj-a": "chat-xxx" }`）：裸 id 的话，从 A 切到 B 再切回来，
+    记的是 B 的 id ⇒ **每次都只能退回本文件夹的第一段**，
+    用户会以为「聊到一半的记录没了」
+    ⚠ 老格式是裸 id（不带引号）⇒ `JSON.parse` 抛，当成「没记过」。
+      不值得写迁移：代价只是「回到第一段」
+  ★ **切文件夹时自动重选**：`watch(workspaceKey)` → `ensureActiveSession()`
+    （优先级：本文件夹上次那段 ➝ 本文件夹最近更新的一段 ➝ 新建一段）
+    ★ 必须 `watch(workspaceKey)` 而不是 `props.workspaceRoot`：
+      监听原始字符串的话，同一个路径换个写法也会触发一次「换文件夹」
+    ⚠ 流式进行中不切（和 `newChat` / `openSession` 同一个取舍）——
+      已知局限：这一下会「漏切」，要等下一次切文件夹才补上
+  ✅ 实测（浏览器 + 桩，**关键是抓 `save_chats` 的 payload**）：
+    · 造 5 段跨 3 档（proj-a ×2 / proj-b ×1 / 未归属 ×2，其中一段**真的
+      没有 workspace 字段**模拟老数据）
+    · 打开 A：列表只有 A 的两段、tip「聊天记录（2）」、
+      note「另外还有 3 段对话不属于当前文件夹」✅
+    · 在 A 里切到第二段 → 去 B（列表换成 B 那段）→ **回 A 恢复的是第二段**，
+      `activeChat` = `{"d:/proj-a":"chat-a2","d:/proj-b":"chat-b1"}` ✅
+    · **落盘 payload = 5 段原始会话一段没少** + 新建那段 ✅（本次改动
+      最大的风险点）
+    · 关掉文件夹 → 列表变成「未归属」那两段（老数据归到这一档）✅
+    · **面板开着**时点「打开文件夹」→ 列表当场跟着换 ✅（验的是
+      `watch(workspaceKey)` 那条路，不是 reload）
+  ★ 用的技巧：**用 `localStorage` 的 `lastFolder` + `reload` 模拟「换文件夹」**，
+    比驱动文件对话框省事得多。而「面板开着时切」那一条只能靠
+    `plugin:dialog|open` 桩（把 `window.__TAURI_INTERNALS__.invoke` 包一层）
 
 - [x] **修一个「发布前才发现」的大 bug：Topilot 请求必然失败（系统代理）**：
   ★ 现象：第一次拿**真接口**跑（之前一次都没跑过），报
