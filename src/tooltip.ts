@@ -77,28 +77,68 @@ let hiddenAt = 0;
 const disposers: Array<() => void> = [];
 
 /**
+ * 标记：这个元素的 `aria-label` 是**我们补的**，值 = 上一次补进去的文本。
+ *
+ * ★ 为什么要把「上次补的那个值」存下来：靠它区分「这标记是我们写的、作者
+ *   没动过」和「作者后来自己改了 aria-label」（那就该让位，不再接管）
+ */
+const A11Y_FROM_TITLE = "data-a11y-from-title";
+
+/**
  * 把元素上的 `title` 搬成 `data-tooltip`。
  *
  * ★ 必须**删掉** `title`：留着的话原生那个提示还会自己弹出来，
  *   于是光标停一会儿会看到两个框叠在一起
+ *
+ * ★★ 这个函数会被**反复调用**（MutationObserver 盯着 title 的变化），
+ *   所以每种情况都要能重复走：`title` 变了就重新搬一遍
  */
 function capture(element: Element): void {
   const text = element.getAttribute("title");
-  if (text === null) return;
-  if (text.trim() !== "") {
-    element.setAttribute("data-tooltip", text);
 
-    // ⚠ `title` 在无障碍里是**最后兜底的名称来源**：一个只有图标的按钮
-    //   （窗口那三个按钮、活动栏图标）靠的就是它。搬走之后要把这份信息补回去 ——
-    //   但只补**真正光秃秃**的那种（没有 aria-label、也没有可见文字）：
-    //   `aria-label` 的优先级比可见文字高，随便加会**把名称改得更糟**
-    if (
-      element.getAttribute("aria-label") === null &&
-      (element.textContent ?? "").trim() === ""
-    ) {
-      element.setAttribute("aria-label", text);
+  // ★ `title` 没了 / 变成空串 = 「这里不要提示了」——必须把 data-tooltip 一起去掉。
+  //   留着的话会显示**上一次**那句（过期的信息比没有信息更糟）。
+  //   Vue 把 `:title="cond ? 'a' : ''"` 改成空串、或者直接不要了，都会走到这
+  // ⚠ 不会因此无限循环：观察者那句 `getAttribute("title") !== null` 挡住了
+  //   「我们自己 remove 掉 title」那一轮
+  if (text === null || text.trim() === "") {
+    element.removeAttribute("data-tooltip");
+    const own = element.getAttribute(A11Y_FROM_TITLE);
+    if (own !== null && element.getAttribute("aria-label") === own) {
+      element.removeAttribute("aria-label");
+      element.removeAttribute(A11Y_FROM_TITLE);
     }
+    element.removeAttribute("title");
+    return;
   }
+
+  element.setAttribute("data-tooltip", text);
+
+  // ⚠ `title` 在无障碍里是**最后兜底的名称来源**：一个只有图标的按钮
+  //   （窗口那三个按钮、活动栏图标）靠的就是它。搬走之后要把这份信息补回去 ——
+  //   但只补**真正光秃秃**的那种（没有 aria-label、也没有可见文字）：
+  //   `aria-label` 的优先级比可见文字高，随便加会**把名称改得更糟**
+  const patched = element.getAttribute(A11Y_FROM_TITLE);
+
+  if (patched !== null) {
+    // ★★ 我们补过 ⇒ **跟着 title 一起更新**。
+    //   漏了这一步的后果很隐蔽：动态 title（「聊天记录（2）」这种）改了之后，
+    //   屏幕阅读器会一直读到**第一次补进去的那个数字** ——
+    //   界面上看不出任何不对，只有用读屏的人会发现名字和实际不符
+    // ⚠ 但只在「还是我们上次写的那个值」时才接管：作者若自己改过
+    //   aria-label，就不该被我们覆盖回去
+    if (element.getAttribute("aria-label") === patched) {
+      element.setAttribute("aria-label", text);
+      element.setAttribute(A11Y_FROM_TITLE, text);
+    }
+  } else if (
+    element.getAttribute("aria-label") === null &&
+    (element.textContent ?? "").trim() === ""
+  ) {
+    element.setAttribute("aria-label", text);
+    element.setAttribute(A11Y_FROM_TITLE, text);
+  }
+
   element.removeAttribute("title");
 }
 
