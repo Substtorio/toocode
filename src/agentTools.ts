@@ -87,6 +87,36 @@ export const AGENT_TOOLS: ToolSpec[] = [
       },
     },
   },
+
+  // ⚠⚠ 唯一的写工具，而且**必须**列在这个数组里。
+  //
+  //   它曾经漏在数组外面（只有 runAgentTool 里那个 case 在）——
+  //   后果是：执行的代码完好、diff 审阅那一整套也都在，
+  //   但模型**永远收不到这个工具**，于是「Topilot 能改文件」一直是句空话。
+  //
+  //   ★ 这类漏声明的失效方式极其隐蔽：不报错、不缺代码、
+  //     连日志都一切正常，只是「模型从来不用它」。
+  //     ⇒ 改工具相关的代码时，**执行分支和声明必须成对出现**
+  {
+    type: "function",
+    function: {
+      name: "write_file",
+      description:
+        "把一个文本文件的内容改成给定的内容。⚠ 这是**整份替换**，不是打补丁 —— 所以要先 read_file 看全，" +
+        "再把你想要的**完整**内容写进来。改完不会立刻生效：会先让用户看一眼 diff，确认了才真的写盘。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "文件的绝对路径" },
+          content: {
+            type: "string",
+            description: "改完之后文件的完整内容（不是差异片段，也不是补丁）",
+          },
+        },
+        required: ["path", "content"],
+      },
+    },
+  },
 ];
 
 /**

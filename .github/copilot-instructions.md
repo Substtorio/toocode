@@ -2068,6 +2068,40 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
   ⚠ 验证时自己踩的坑：**第一次点箭头变成了「关」** —— 因为上一轮失败时浮层还开着，
     于是整条测试序列错位一格。测「开关」这类有状态的控件，**开头必须先归零**
 
+- [x] **修一个「功能一直是假的」的 bug：`write_file` 从来没声明给模型 —— 2026-10-08**：
+  起因是用户问「Topilot 修改代码的功能是怎么实现的」，翻代码时发现的。
+  ★★★ **症状**：`agentTools.ts` 里 `runAgentTool` 的 `case "write_file"` 完好无损、
+    `agentChanges.ts` 一整层、diff 浮层、ChatPanel 的「N 处改动待确认」全都在 ——
+    但 **`AGENT_TOOLS` 数组里只有三个读工具**，而 `agentLoop.ts` 发给接口的就是它。
+    ⇒ 模型**永远收不到** `write_file`，于是「Topilot 能改文件」一直是句空话。
+  ★★ `git log -S 'name: "write_file"' -- src/agentTools.ts` **返回空** ⇒
+    不是回归，是**从来没接上过**（声明和执行分两次写的，漏了声明）。
+  ★ 教训：**一个功能的「实现」和「接线」是两件事** ——
+    执行分支写完、UI 画完、桩测通过，**都不代表模型能用它**。
+    ⇒ 改工具相关的代码时，**声明数组和执行分支必须成对出现**；
+      最好的回归测试是「断言请求里带的 tools 列表」（见下）。
+  ★ README 里那两句「能调工具：…改文件」「改文件必须过 diff 审阅」当时都不成立，
+    现在用真模型跑通了、成立了
+
+  ✅ 验证（**两层，刻意分开**）：
+    ① **真接口探针**（`node` 脚本直接问一次 DeepSeek，不写任何文件）：
+       · 工具声明 = `read_file, list_directory, search_in_folder, write_file`
+       · 它**先调 `read_file`** —— description 里那句「先看全再改」生效了
+       · 第二轮调 `write_file`：`path` 正确、`content` 是**整份 7 行**（不是补丁）
+       ⚠ 探针里的工具声明是**从 `src/agentTools.ts` 里抠出来的**
+         （`new Function` 求值那段数组字面量），保证和 App 发出去的完全一致 ——
+         手抄一份就等于在测自己的转写
+    ② **App 全链路**（浏览器 + 桩）：断言 `chat_stream.args.request.tools` 里
+       **有 `write_file`**（这一条就是那个 bug 的回归测试）
+       → 桩按 SSE 吐一个**分段拼装**的 `write_file` tool_call →
+       「1 处改动待确认」出现、**此时 `write_file` 调用数 = 0**（安全门生效）
+       → 点开 diff（左 `Hello,` / 右 `Hi from Topilot`）→ 点「保留」
+       → `write_file` 被调用一次、参数正确、列表清空、浮层收起
+    ⏳ **没做的**：真模型 + 真 App 的端到端（要重启 dev 应用带 CDP 端口才能自动驱动）
+    ⚠ 验证时踩的坑：`locator(...).filter({ hasText: /^保留$/ })` **匹配不上** ——
+      按钮的 textContent 里带着模板的换行和缩进。改用
+      `getByRole("button", { name: "保留", exact: true })`（走无障碍名，会被规整）
+
 - [x] **悬停提示（tooltip）换成 VS Code 的样式**：
   起因是用户说「鼠标悬停显示的 Title 的样式也学一下 vscode 的样式」。
   ★★ **根因：原生 `title` 提示的样式没有任何办法改** ——
@@ -2361,8 +2395,13 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
   · 符号没有嵌套层级（`container` 没存）⇒ 列表里显示不出「`类 › 方法`」
   · 打开过的文件还没用 LSP 的 `documentSymbol` 覆盖那些启发式结果
   · html / css 服务器没声明 `completionProvider`，`triggerCharacters` 拿不到（LSP 遗留）
-  · `%LOCALAPPDATA%\\com.toocode.app\\index\\<哈希>.db` 是**派生数据**，
+  · `%APPDATA%\\com.toocode.app\\index\\<哈希>.db` 是**派生数据**，
     随时可以删（删了会重建），也可以在工作区面板里点「重建」
+    ⚠ ★ **是 `%APPDATA%`（Roaming）不是 `%LOCALAPPDATA%`** —— 这里原来记错了。
+      WebView2 的配置目录才是 `%LOCALAPPDATA%\com.toocode.app`，两个别混
+    ⚠ 顺带一个观察：`.db-wal` 也不小（实测某个库 `.db` 9.1 MB、`.db-wal` 5.7 MB，
+      而它索引的源码才 1.9 MB）—— 连接一直开着，WAL 没被 checkpoint。
+      想省磁盘的话，可以在关闭工作区时手动 checkpoint 一次
 
 - [x] **发布 1.0 前的准备（LICENSE / README / CI / 依赖许可扫描）**：
   起因是「感觉已经能作为 1.0 发布了」。功能上确实够了，
@@ -2420,6 +2459,20 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     ⇒ **空结果的断言不能靠计数**
 
 ### 待办（按优先级）
+
+> **⏳ 方案 B：把「语法 / 主题 / 片段的来源」做成三级兜底（2026-10-08 记下的待办）**
+> 起因：「重要功能以装了 VS Code 为前提」这个质疑。现在**只有中间一级**
+> （本机 VS Code 扩展），所以没装 VS Code 的人拿不到完整的语法 / 主题 / 片段。
+> **目标形状**：`项目内置（兜底）→ 本机 VS Code（增强）→ 用户自己的扩展（覆盖）`
+> **主要成本不在代码，在许可** —— 别直接拄 VS Code 里的语法文件：那些来自 TextMate
+> 社区，许可不统一（有些 MIT，有些压根没写）。干净的来源是 **Shiki**（MIT 项目，
+> 它打包分发的就是 TextMate 语法和主题，格式和我们用的**完全一样**）。
+> **动手前先做**：把要内置的那几个语法 / 主题的许可一个一个查清楚，
+> 和 README 里那份依赖许可扫描一起过一遍。
+> **可选的第三步**：首次启动按需下载 —— ⚠ 和「离线可用」直接冲突，倾向不做。
+> 优先级：**不高**。现在的定位是作品集（README 里已写明），
+> 这一步是「发布给陌生人用」才必须的。
+> 已做的前置：README 新增「一个前提」一节；扩展名映射改成问 Monaco 注册表。
 
 > **✅ 1.0.0 发布了（2026-10-03）** —— 作者的判断是「功能上已经够了」，
 > 缺的不是功能，而是**对外承诺那几样**，所以这一版补的是 LICENSE / README 重写 / CI。
