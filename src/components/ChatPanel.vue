@@ -54,7 +54,10 @@ interface StoredConfig {
 }
 
 function loadConfig(): StoredConfig {
-  const fallback: StoredConfig = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-chat" };
+  // ★ 默认值跟**官网当前给的模型字段**走（写成 `deepseek-flash`）。
+  //   旧别名（`deepseek-chat` / `deepseek-reasoner`）仍然能用，所以
+  //   **不**去改用户已经存好的值 —— 那是「静默换掉他实际发出去的东西」，不该做
+  const fallback: StoredConfig = { baseUrl: "https://api.deepseek.com/v1", model: "deepseek-flash" };
   const raw = window.localStorage.getItem(CONFIG_KEY);
   if (raw === null) return fallback;
 
@@ -942,7 +945,7 @@ function onChatLogClick(event: MouseEvent) {
         <span v-if="fetchState === 'ok'">接口报了 {{ remoteModels.length }} 个模型，可从上面的候选里挑</span>
         <span v-else-if="fetchState === 'error'">拉取失败（手填照旧可用）：{{ fetchError }}</span>
         <span v-else-if="fetchState === 'loading'">正在问接口要模型列表…</span>
-        <span v-else>填写后打开这一页会自动问一次接口，拿到的是官网当前的模型字段</span>
+        <span v-else>配上密钥后，打开这一页会自动问一次接口，拿到的是官网当前的模型字段</span>
       </p>
 
       <!-- 候选数据源。放哪儿都行，它自己不渲染 -->

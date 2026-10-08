@@ -1958,7 +1958,10 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     ⚠ `describe_http_error` 在这里同样用上：`reqwest::Error` 的 Display 指不到原因
   ★ **预设表更新成官网当前的字段名**：`deepseek-flash`（DeepSeek V4.1 Flash）、
     `deepseek-v4-pro`（DeepSeek V4 Pro）；`deepseek-chat` / `deepseek-reasoner`
-    保留并标「旧别名」—— 它们仍然能用，而**留着是为了不打翻已经配好的用户**
+    保留并标「旧别名」—— 它们仍然能用，而**留着是为了不打翻已经配好的用户**。
+    ★ 「新装时的**默认值**」也跟着改成了 `deepseek-flash`（`loadConfig()` 的 fallback），
+      但**只动默认值**、不碰用户已经存好的那个 —— 静默换掉他实际发出去的东西是不该做的。
+      实测（清掉 localStorage 后开一个干净页面）：下拉和模型字段都是 `deepseek-flash`
   ★ 顺带把「接口收到的模型名」那行只读说明**删了**：模型字段那一行就是它，
     两份显示同一个值迟早会不一致
   ✗ 没验到的：**「拉取失败」那条分支**（`v-else-if="fetchState === 'error'"`）。
