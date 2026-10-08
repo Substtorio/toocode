@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, inject } from "vue";
+import { CHEVRON_DOWN } from "../icons";
 import type { FileNode } from "../types";
 import { fileTreeExpansionKey, fileTreeSelectionKey } from "../injectionKeys";
 
@@ -38,9 +39,9 @@ const canExpand = computed(() => isFolder.value && children.value.length > 0);
  *   两张图各写一份的话，迟早会有一次只改了其中一个
  * ⚠ codicon 是**填充**图形（图上只有 `fill="currentColor"`，没有 stroke），
  *   所以这里也不给 stroke —— 按描边画会得到「粗轮廓图」，和原生不是一个东西
+ * ★ 路径本体在 `../icons.ts` —— 配置界面那个下拉箭头用的是同一份，
+ *   免得两条一模一样的长字符串各写一份、以后只改了其中一处
  */
-const CHEVRON_DOWN =
-  "M3.14598 5.85423L7.64598 10.3542C7.84098 10.5492 8.15798 10.5492 8.35298 10.3542L12.853 5.85423C13.048 5.65923 13.048 5.34223 12.853 5.14723C12.658 4.95223 12.341 4.95223 12.146 5.14723L7.99998 9.29323L3.85398 5.14723C3.65898 4.95223 3.34198 4.95223 3.14698 5.14723C2.95198 5.34223 2.95098 5.65923 3.14598 5.85423Z";
 
 // 高亮跟随「当前激活的文件」—— 注意点标签栏上的标签也会让这里跟着变，
 // 因为大家读的是同一个状态

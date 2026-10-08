@@ -18,6 +18,8 @@ import { runAgent, type AgentConfig, type ChatMessage } from "../agentLoop";
 // 编辑器状态桥：让 Topilot 知道用户正在看哪个文件、光标在哪、选了什么
 import { getEditorContext } from "../editorBridge";
 import { renderMarkdown } from "../markdown";
+// 自绘的下拉框 —— 原生 <select> / datalist 的箭头长得不一样，而且后者只能展开
+import ChatCombo from "./ChatCombo.vue";
 import {
   acceptAll,
   acceptChange,
@@ -99,15 +101,14 @@ const MODEL_PRESETS: ReadonlyArray<{ id: string; label: string }> = [
   { id: "deepseek-reasoner", label: "DeepSeek Reasoner（旧别名）" },
 ];
 
-/** 下拉里那个「自定义…」的哨兵值。用一个真实 id 不可能是的字符串 */
-const CUSTOM_MODEL = "\u0000custom";
-
 /**
- * 调用名 → 版本名；表里没有就返回 null。
+ * 模型字段 → 版本名；表里没有就返回 null。
  *
- * ⚠ 刻意**不**在查不到时返回调用名 ——「这是个已知模型的版本名」和
- *   「这是个我们不认识的 id」是两件事，混在一起就没法判断
- *   「该不该显示自定义输入框」了
+ * ⚠ 刻意**不**在查不到时返回字段名本身 ——「这是个已知模型的版本名」和
+ *   「这是个我们不认识的 id」是两件事，混在一起就分不清了。
+ *   （当初它是给「该不该显示自定义输入框」判断用的；现在两行都直接绑
+ *     `config.model`，不需要那个判断了，但**语义区分**本身仍然有用：
+ *     顶栏那张标签就靠它）
  */
 function modelLabel(id: string): string | null {
   return MODEL_PRESETS.find((preset) => preset.id === id)?.label ?? null;
@@ -133,32 +134,13 @@ const remoteModels = ref<string[]>([]);
 const fetchState = ref<"idle" | "loading" | "ok" | "error">("idle");
 const fetchError = ref("");
 
-/** 下拉 / datalist 的候选：内置预设（有版本名）+ 接口报上来的（显示 id 本身） */
+/** 两行的候选：内置预设（有版本名）+ 接口报上来的（显示 id 本身） */
 const modelOptions = computed(() => {
   const known = new Set(MODEL_PRESETS.map((preset) => preset.id));
   const extra = remoteModels.value
     .filter((id) => !known.has(id))
     .map((id) => ({ id, label: id }));
   return [...MODEL_PRESETS, ...extra];
-});
-
-/**
- * 上面那个下拉框绑的值。
- *
- * ★★ 完全**派生**，没有独立的开关状态：取值在候选里就显示它自己，
- *   不在就显示「自定义…」。
- *   （以前有一个 `customModel` ref，那是为了「切到自定义时保留草稿」—— 
- *     现在模型字段那一行**始终**可编辑，草稿天然就在 `config.model` 里，那个开关就多余了）
- */
-const modelChoice = computed({
-  get: () =>
-    modelOptions.value.some((option) => option.id === config.value.model)
-      ? config.value.model
-      : CUSTOM_MODEL,
-  set: (value: string) => {
-    // 选「自定义」时**不**动 config.model —— 真正改值的地方是下面那一行输入框
-    if (value !== CUSTOM_MODEL) config.value.model = value;
-  },
 });
 
 /**
@@ -906,31 +888,29 @@ function onChatLogClick(event: MouseEvent) {
       </label>
 
       <!-- 模型：下拉只是**快捷选择**，真正决定发给接口什么的是下面那行「模型字段」。
-           ★ 选项来自「内置预设（有版本名）+ 接口报上来的」（见 modelOptions） -->
-      <label class="chat-field">
+           ★ 选项来自「内置预设（有版本名）+ 接口报上来的」（见 modelOptions）
+           ★ 两行都用自绘的 ChatCombo：原生 <select> 的箭头**是系统画的**，
+             而 datalist 那个又是 Chromium 另画的一套 —— 两个并排放着就不是一个样子，
+             而且后者**只能展开、点第二次收不起来** -->
+      <div class="chat-field">
         <span>模型</span>
-        <select v-model="modelChoice">
-          <option v-for="option in modelOptions" :key="option.id" :value="option.id">
-            {{ option.label }}
-          </option>
-          <option :value="CUSTOM_MODEL">自定义…</option>
-        </select>
-      </label>
+        <ChatCombo v-model="config.model" :options="modelOptions" label="模型" />
+      </div>
 
       <!-- 模型字段：**真正发给接口的那串 id**。
-           ★ 始终可编辑（不再藏在「自定义…」后面）—— 值一旦不在上面的候选里，
-             上面会显示「自定义…」，而改值就在这一行
-           ★ 带 datalist：既能从候选里挑，也能手打任意 id（第三方接口就靠这个） -->
-      <label class="chat-field">
+           ★ 始终可编辑（不再藏在「自定义…」后面）—— 两行是同一个值，
+             上面那个只是个带箭头的快捷选择，这里才是能随便打的地方
+           ★ 带候选浮层：可以从里面的列表挑，也可以手打任意 id（第三方接口就靠这个） -->
+      <div class="chat-field">
         <span>模型字段（发给接口）</span>
-        <input
+        <ChatCombo
           v-model="config.model"
-          type="text"
-          spellcheck="false"
-          list="topilot-model-ids"
+          :options="modelOptions"
+          editable
+          label="模型字段（发给接口）"
           placeholder="接口那边认的模型 id，如 deepseek-flash"
         />
-      </label>
+      </div>
 
       <!-- 拉取状态 + 手动刷新。★ 拉取失败**不拦着保存** —— 手填照旧可用 -->
       <p class="chat-model-note">
@@ -947,13 +927,6 @@ function onChatLogClick(event: MouseEvent) {
         <span v-else-if="fetchState === 'loading'">正在问接口要模型列表…</span>
         <span v-else>配上密钥后，打开这一页会自动问一次接口，拿到的是官网当前的模型字段</span>
       </p>
-
-      <!-- 候选数据源。放哪儿都行，它自己不渲染 -->
-      <datalist id="topilot-model-ids">
-        <option v-for="option in modelOptions" :key="option.id" :value="option.id">
-          {{ option.label }}
-        </option>
-      </datalist>
 
       <label class="chat-field">
         <span>API 密钥</span>
@@ -1367,13 +1340,12 @@ function onChatLogClick(event: MouseEvent) {
   color: var(--color-text-dim);
 }
 
-.chat-field input,
-.chat-field select {
+.chat-field input {
   height: 26px;
   /* ⚠ `box-sizing` 必须显式写。Chrome 的 UA 样式给 `<select>` 设了
      `box-sizing: border-box`，而 `<input>` 是默认的 content-box ——
-     于是同样写 `height: 26px`，输入框量出来是 **28px**（26 + 上下两条边框）、
-     下拉框是 26px，并排放着差 2px。实测量出来才发现的 */
+     于是同样写 `height: 26px`，输入框量出来是 **28px**（26 + 上下两条边框）。
+     下拉框那边（ChatCombo.vue）也写了同一行，两边才是同一个高度 */
   box-sizing: border-box;
   padding: 0 8px;
   border: 1px solid var(--color-menu-border);
@@ -1385,10 +1357,7 @@ function onChatLogClick(event: MouseEvent) {
   border-radius: 3px;
 }
 
-/* ⚠ input 和 select 用**同一条规则**：它俩是同一栏里的控件，
-   分开写两份迟早会不一致 —— 而那种不一致只是「看着有点怪」，不报错 */
-.chat-field input:focus,
-.chat-field select:focus {
+.chat-field input:focus {
   border-color: var(--color-link);
 }
 
