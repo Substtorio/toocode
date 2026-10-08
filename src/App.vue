@@ -2002,8 +2002,75 @@ function extOf(path: string): string {
   return dot === -1 ? "" : fileName.slice(dot + 1).toLowerCase();
 }
 
+/**
+ * 只认**自己的**键。
+ *
+ * ⚠ 不能直接写 `map[key] ?? fallback` —— 普通对象字面量继承自 `Object.prototype`，
+ *   而扩展名全是小写，一个叫 `weird.constructor` 的文件正好能命中
+ *   `Object.prototype.constructor`，于是查出来的值变成一个**函数**。
+ *   它不报错，只会静默跑偏：
+ *   · 语言那边，`{{ currentLanguage }}` 会直接渲染出函数源码
+ *   · 图片那边更明显 —— `isImagePath()` 返回 true，**一个文本文件被当成图片预览打开**
+ *     （实测踩到：`weird.constructor` 的语言栏显示「图片」）
+ */
+function ownLookup(map: Record<string, string>, key: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
+}
+
+/**
+ * Monaco **自己**的「文件名 / 扩展名 → 语言 id」注册表。
+ *
+ * ★★ 为什么要问它，而不是继续手写：Monaco 内置 **81** 种语言，每一种在注册时都
+ *   声明了自己管哪些扩展名（`.kt`、`.dart`、`.graphql`…）。而上面那张手写表只有
+ *   二十多条 —— 剩下五十多种语言**明明有分词器**，却因为「没告诉 Monaco 该用谁」
+ *   而显示成纯文本。
+ *   ⇒ 手写表继续管它自己那部分（尤其是有意的别名：toml→ini、svg→xml、vue→html），
+ *     其余交给 Monaco 自己的注册表兜底。
+ *
+ * ⚠★ 必须**懒加载 + 只建一次**：`getLanguages()` 要有内容，得等 basic-languages
+ *   那个 contribution 模块跑完。在模块顶层建的话可能建出一张**空表** ——
+ *   而且不会报错，症状是「所有语言都变回 plaintext」
+ * ⚠ 同一个扩展名被多种语言声明时**先到先得**（按 Monaco 的注册顺序），只求确定性
+ */
+let monacoLanguages: {
+  extensions: Record<string, string>;
+  filenames: Record<string, string>;
+} | null = null;
+
+function monacoLanguageMaps() {
+  if (monacoLanguages === null) {
+    const extensions: Record<string, string> = {};
+    const filenames: Record<string, string> = {};
+    for (const language of monaco.languages.getLanguages()) {
+      for (const ext of language.extensions ?? []) {
+        const key = ext.replace(/^\./, "").toLowerCase();
+        if (ownLookup(extensions, key) === undefined) extensions[key] = language.id;
+      }
+      // 有些语言是靠**文件名**认的，压根没有扩展名（Dockerfile / Makefile / CMakeLists.txt）
+      for (const name of language.filenames ?? []) {
+        const key = name.toLowerCase();
+        if (ownLookup(filenames, key) === undefined) filenames[key] = language.id;
+      }
+    }
+    monacoLanguages = { extensions, filenames };
+  }
+  return monacoLanguages;
+}
+
+/**
+ * 按路径猜语言。
+ *
+ * ★ 顺序有讲究：**手写表（含插件写进去的）优先**，Monaco 的注册表只兜底 ——
+ *   这样插件语法接管过的扩展名不会被 Monaco 抢回去
+ * ★ 文件名比扩展名更具体，所以先看它（`Dockerfile` 压根没有扩展名）
+ */
 function languageFromPath(path: string): string {
-  return LANGUAGE_BY_EXT[extOf(path)] ?? "plaintext";
+  const mine = ownLookup(LANGUAGE_BY_EXT, extOf(path));
+  if (mine !== undefined) return mine;
+
+  const maps = monacoLanguageMaps();
+  const fileName = (path.split("/").pop() ?? "").toLowerCase();
+  return ownLookup(maps.filenames, fileName) ?? ownLookup(maps.extensions, extOf(path)) ?? "plaintext";
 }
 
 /**
@@ -2029,9 +2096,9 @@ const IMAGE_MIME_BY_EXT: Record<string, string> = {
   icns: "image/png", // 见上面的说明：Rust 会把内嵌 PNG 抠出来
 };
 
-/** 是图片就返回它的 MIME，不是就返回 null */
+/** 是图片就返回它的 MIME，不是就返回 null。★ 用 ownLookup，见上面的说明 */
 function imageMimeOf(path: string): string | null {
-  return IMAGE_MIME_BY_EXT[extOf(path)] ?? null;
+  return ownLookup(IMAGE_MIME_BY_EXT, extOf(path)) ?? null;
 }
 
 function isImagePath(path: string): boolean {
@@ -2237,7 +2304,7 @@ async function loadSyntaxExtensions() {
       //   手写表里**没有**的扩展名照常接管：反正原本就是纯文本，接管了只会更好
       if (
         !hasCoreGrammars &&
-        entry.extensions.some((ext) => LANGUAGE_BY_EXT[ext.replace(/^\./, "").toLowerCase()])
+        entry.extensions.some((ext) => ownLookup(LANGUAGE_BY_EXT, ext.replace(/^\./, "").toLowerCase()) !== undefined)
       ) {
         continue;
       }

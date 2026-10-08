@@ -248,6 +248,54 @@
   ★ 核心教训：**坏得不一样比完全坏掉更难发现** ——
     残缺的语法依然能编译、能分词，只是默默少一大堆 token；
     这种「不是报错，而是变差」的失效模式，必须主动判断，不能指望它自己报错
+- [x] **把「扩展名 → 语言」交给 Monaco 自己的注册表（顺带抓到一个原型链污染的 bug）—— 2026-10-08**：
+  起因是用户问「这个编辑器重要功能必须以『下载了 VS Code』为前提，那它不就是鸡肋吗」，
+  顺着这条线去盘「没有 VS Code 时到底还剩多少」，结果发现**和 VS Code 无关的一处浪费**。
+  ★★ **数字**：Monaco 内置 **81** 种语言，每一种注册时都声明了自己管哪些扩展名
+    （`esm/vs/languages/definitions/<语言>/`）。而我们手写的 `LANGUAGE_BY_EXT` 只有
+    二十多条 —— 剩下五十多种语言**明明有分词器**，却因为「没告诉 Monaco 该用谁」
+    而显示成纯文本（`dockerfile` / `kotlin` / `dart` / `graphql` / `bat` / `clojure` …）
+  ★ **修法**：手写表继续管它自己那部分（尤其是有意的别名：`toml→ini`、`svg→xml`、
+    `vue→html`），其余**问 Monaco**：遍历 `monaco.languages.getLanguages()`，
+    把每个语言的 `extensions` / `filenames` 收成两张表当兜底。
+    ★ 顺手把 `filenames` 也收了 —— `Dockerfile` / `Makefile` / `CMakeLists.txt`
+      这类**压根没有扩展名**，只靠 `extensions` 永远认不出来
+  ★★ **顺序有讲究**：`手写表（含插件写进去的）→ Monaco 的文件名 → Monaco 的扩展名`。
+    手写表必须优先，否则**插件语法接管过的扩展名会被 Monaco 抢回去**
+  ⚠★ **必须懒加载 + 只建一次**：`getLanguages()` 要有内容，得等 basic-languages 那个
+    contribution 模块跑完。在模块顶层建会建出一张**空表** —— 而它不会报错，
+    症状是「**所有**语言都变回 plaintext」，比不修还糟
+  ⚠ 同一个扩展名被多种语言声明时**先到先得**（按注册顺序），只求确定性
+
+  ★★★ **顺带抓到一个真 bug：原型链污染**（写测试用例时撞出来的）。
+    `LANGUAGE_BY_EXT[extOf(path)] ?? "plaintext"` 这种写法有个洞：
+    对象字面量继承自 `Object.prototype`，而扩展名全是小写 ——
+    一个叫 **`weird.constructor`** 的文件正好命中 `Object.prototype.constructor`，
+    于是「语言 id」变成了一个**函数**（`{{ currentLanguage }}` 会把函数源码渲染出来）。
+    · 语言那边只是难看；**图片那边更严重**：`IMAGE_MIME_BY_EXT[…] ?? null` 同样命中，
+      `isImagePath()` 返回 true ⇒ **一个文本文件被当成图片预览打开**
+      （实测：`weird.constructor` 的状态栏语言显示「图片」，编辑区盖上了图片预览层）
+    · 修法：加一个 `ownLookup(map, key)`（`Object.prototype.hasOwnProperty.call`）
+      统一替掉那几处 `map[key] ?? …`，连插件那条「有没有退路」的判断一起改掉
+    ★ 教训：**「用字面量当查表」+「键来自外部输入」= 一定要过 `hasOwnProperty`**。
+      它的失效方式是「查出来一个不相干的东西」，既不报错、也很难联想到原型链
+
+  ★ 顺带把「**它需要本机装 VS Code**」这个隐含前提写进了 README（新增「一个前提」一节 +
+    「已知的局限」第一条）。起因是用户那句很关键的质疑：「重要功能必须以装了 VS Code
+    为前提，用户为什么不用 VS Code？」—— 结论是：
+    · 作为**产品**，这个批评成立，而且不止这一条（没扩展市场 / 永远打不过 VS Code）；
+    · 作为**作品集**，它是对的取舍 —— 两周做出 LSP+DAP+插件机制，靠的就是不重复实现语言；
+    · 真正该改的不是「借了 VS Code」，而是**借成了硬依赖**：应该把「资源来源」做成
+      三级兜底（内置 → VS Code → 用户扩展），现在只有中间一级。
+    已写进 README —— **主动说出来比被问出来强**
+
+  ✅ 验证（浏览器 + 桩假工作区，`::1:1420`）：
+    造了一棵含各种扩展名的假文件树，逐个点开读状态栏语言：
+    · `main.kt` → **kotlin**、`Dockerfile` → **dockerfile**（靠 filenames）、
+      `schema.graphql` → **graphql**、`app.dart` → **dart**（这四条原来都是 plaintext）
+    · `index.ts` → typescript（没被改变）、`notes.txt` → plaintext（对照组）
+    · `weird.constructor` → **plaintext**（修之前是「图片」），且图片预览层数量 = 0
+
 - [x] **「VS Code 在哪」不能只靠 PATH**：内置扩展藏在安装目录里，而 PATH 里的线索
   只在「从 VS Code 自己的终端启动应用」时才会在 —— 换个终端启动，线索就没了，
   于是内置扩展找不到、Vue 这类语法整批降级（症状：状态栏语言从 `vue` 变成 `html`）。
