@@ -12,7 +12,15 @@ name: CI
 on:
   push:
     branches: [main]
+    # 纯文档改动不必跑这 2~3 分钟的构建 + 测试。
+    # ★ 这份开发笔记（`.github/copilot-instructions.md`）也是 .md，一并被覆盖
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
   pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
   workflow_dispatch:
 
 jobs:
