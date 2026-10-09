@@ -1295,6 +1295,14 @@ mod tests {
             "checkpoint 之后 WAL 应该变小：{before} -> {after}"
         );
 
+        // ★ 还要确认那些内容**写回主库了**，不是被丢掉 ——
+        //   「WAL 变小了但内容也没了」比「没省下磁盘」糟糕得多
+        let rows: i64 = index
+            .conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 5000, "checkpoint 不该丢数据");
+
         drop(index);
         let _ = std::fs::remove_dir_all(&dir);
     }
