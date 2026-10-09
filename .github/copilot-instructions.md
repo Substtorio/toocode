@@ -2401,6 +2401,91 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     ⚠ 以后若给仓库设「必须通过状态检查才能合并」，docs-only 的 PR 会因为
       **根本没有 check 跑**而被卡住 —— 那时要重新考虑这条
 
+- [x] **插件机制的第五块：`contributes.languages` → 语言配置**：
+  ★ 这一块管的和另外几块**不是一回事**：那些决定「代码长什么样」，
+    这一块决定「**打字时会发生什么**」—— Ctrl+/ 插什么注释符、
+    敲 `{` 会不会自动补 `}`、回车缩进几格、双击选中的「一个词」到哪为止。
+    数据全在扩展的 `language-configuration.json` 里，Monaco 有现成 API。
+    实测本机扫到 **77 份**
+  ★ 复用 `for_each_manifest()` + 「先确认文件存在再占位」那套
+  ⚠ 顺手给 `LanguageContribution.id` 补了 `#[serde(default)]`：serde 是
+    **全有或全无**的 —— 一条**缺 id** 的语言声明会让整个 manifest 被跳过，
+    那个扩展的语法 / 主题 / 片段也跟着一起没（同一个坑踩过一次了）
+  ★ **只给 Monaco 已经认识的语言设置**：`setLanguageConfiguration` 对没注册过的
+    id 会顺手把它**注册**进去 ⇒ `getLanguages()` 多出一批没有分词器的语言，
+    而那张表还被「扩展名 → 语言」用着（见 App.vue 的 `monacoLanguageMaps`）
+  ⚠ 所以还有一个 `waitForLanguageIds()` 的守卫：**等语言表非空再往下走**。
+    空表的后果不是报错，是**所有配置都被跳过**（和 `monacoLanguageMaps`
+    必须懒加载是同一个坑）
+
+  ★★★ **本轮最值钱的一条：这个功能的时机，而且它只以「不生效」的方式失败**
+    现象：日志说「备好 N 份」、`setLanguageConfiguration` 也没抛异常，
+    但 Ctrl+/ 出来的还是 Monaco 内置的 `//`。
+    ★ 根因（**读 Monaco 源码读出来的，不是猜的**）——
+      `esm/vs/languages/definitions/_.contribution.js`：
+      ```js
+      languages.onLanguageEncountered(languageId, async () => {
+          const mod = await lazyLanguageLoader.load();      // ← 一次动态 import
+          languages.setLanguageConfiguration(languageId, mod.conf);
+      });
+      ```
+      **内置那份配置藏在一次动态 import 后面**：
+      · 在 `onMounted` 里直接设 ⇒ 用户第一次打开 .js 时被它覆盖掉
+      · 挂到 `onLanguage` 上再 `setTimeout(0)` ⇒ import 要几十毫秒，追不上
+      · ✅ 正确信号是「**这个 model 真的被分词过一次**」⇒ 用
+        `model.onDidChangeTokens`（⚠ 它不在 `ITextModel` 的公开类型里，运行时却有
+        —— 用 `@ts-expect-error` 标着），再延一个宏任务
+      ★ 我一开始是按 `onLanguage` **猜**的（还写了段挺自信的注释），
+        实测两次都不对，最后 fetch 源码才看清 —— **推理不如读源码**
+    ⚠ `@ts-expect-error` 比 `as any` 好：它在「错误消失」时会报「未使用」，
+      正好是升级 Monaco 时的提醒。碰 Monaco 内部的另一处是
+      `lspFeatures.ts` 拿 `ICodeEditorService`
+
+  ⚠ ★★ **验证这块时踩的坑：不在前台的页面里，Monaco 的 DOM 不更新**
+    我读 `.view-line` 拿到的还是旧内容 ⇒ 连着两次误判成「没生效」
+    （差点把对的代码改坏）。**要看事实就读 `model.getValue()`** ——
+    那是数据层，不受 rAF 节流影响
+    ★ 顺带一个「验证方法本身不够强」的例子：第一次我用 `//` 验，
+      其实**证明不了任何事** —— Monaco 内置的 javascript 配置本来就有 `//`。
+      换成 `;;;` 这种**非默认值**才是决定性证据
+    ★ 还有一个更省事的取数办法：从 `performance.getEntriesByType("resource")`
+      里找 `.vite/deps/monaco-editor.js` 再 `import()` —— 直接就能
+      `editor.getAction("editor.action.commentLine").run()`，
+      **不依赖键盘事件送达**（比合成 keydown 可靠得多）
+
+- [x] **插件机制的第六块：用户自己的代码片段**（`%APPDATA%\Code\User\snippets`）：
+  ★ 这是**独立于扩展**的一处来源：VS Code 的「用户片段」界面按语言存成
+    `<语言>.json`（**文件名就是语言 id**），不在任何扩展目录里 ⇒
+    `contributes.snippets` 那条路扫不到它们
+  ★ `user_snippet_dirs()` 做成参数，理由和 `scan_snippets_in(roots)` 一样：
+    真机上那个目录**可能压根不存在**（本机就没有），只有测试造得出来
+    （新增用例 `picks_up_user_snippets`，顺带钉住「`.code-snippets` 要跳过」）
+  ⚠ **只认 `.json`**：`*.code-snippets`（全局片段文件）里**每条自带 scope**，
+    一个文件能同时服务好几种语言 —— 那是另一套形状，暂时不支持
+  ★ `source` 的值抽成了常量 `USER_SNIPPET_SOURCE`（判重和统计都靠它，
+    各处手写字符串迟早会写错一个字符）
+  实测日志：`[代码片段] 得到 17 个片段文件，覆盖 17 个语言（其中用户片段 0 个）`
+  ✓ 和「用户片段目录不存在」对得上
+
+  ⭐ **顺带修了一处真脆弱点**：`dap.availableAdapters()` 原来直接信任
+  `invoke("dap_adapters")` 的返回值 ⇒ 桩里让它返回 null 时，`adapterFor`
+  对着 null 调 `.find`，崩在一个 computed 里
+  （`Unhandled error during execution of component update`），
+  **整个组件更新中断**，而报错栈指不到原因。加了
+  `Array.isArray(loaded) ? loaded : []`
+  ★ 通用点：`invoke` 返回值的形状**不由我们保证**，用之前该过一遍
+
+  ⏭ **明确不做**的两件（写清理由，免得下次又惦记）：
+  · `contributes.commands`（扩展命令进命令面板）—— **列出来点了没用**。
+    command 必须由扩展代码 `registerCommand` 注册，而 `contributes.commands`
+    只是元数据（title / category / icon）。我们没有 JS 扩展宿主 ⇒
+    做出来就是一批点不动的假菜单项，和「只列真实生效的」那条原则直接冲突
+  · `contributes.semanticTokenScopes` —— **没有前置**。它把 LSP 的**语义 token**
+    映射到 TextMate scope 供主题上色，而我们**没接语义高亮**（只接了 TextMate
+    语法）。要做就得先接 `textDocument/semanticTokens`（含 delta 编码 +
+    token 类型图例），而本机 json / html / css 三个服务器基本不产生语义 token
+    ⇒ 验都没法验
+
 - [x] **修一个「发布前才发现」的大 bug：Topilot 请求必然失败（系统代理）**：
   ★ 现象：第一次拿**真接口**跑（之前一次都没跑过），报
     `请求失败：error sending request for url (…)`

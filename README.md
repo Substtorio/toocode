@@ -53,6 +53,15 @@
 | `contributes.themes` | 把 VS Code 主题翻译成 Monaco 主题 + 一整套 CSS 变量 |
 | `contributes.grammars[].injectTo` | 注入语法（`v-if`、`@click`、`:class` 这些） |
 | `contributes.snippets` | 代码片段补全 |
+| `contributes.languages[].configuration` | 语言配置：`Ctrl+/` 插什么注释符、敲 `{` 会不会自动补 `}`、回车缩进几格 |
+
+另外还读**用户自己写的代码片段**（`%APPDATA%\Code\User\snippets\*.json`）——
+那个不在任何扩展里，但走的是同一条链路。
+
+**不做的两个**：`contributes.commands`（扩展注册的命令）和 `semanticTokenScopes`。
+前者要跑扩展代码（我们没有 JS 扩展宿主，列出来点了没用），后者要先把 LSP 的
+**语义 token** 接上（现在只有 TextMate 语法高亮）—— 都是「有前置条件」的，
+不是漏了。
 
 **Topilot —— 内置 AI 助手**（`Ctrl+Alt+I`）
 
