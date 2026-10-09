@@ -2339,6 +2339,45 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     比驱动文件对话框省事得多。而「面板开着时切」那一条只能靠
     `plugin:dialog|open` 桩（把 `window.__TAURI_INTERNALS__.invoke` 包一层）
 
+- [x] **索引的收尾：退出时把 WAL 收回来**（顺带两件小技术债）：
+  ★ 现象：`.db` 9.1 MB + `.db-wal` 5.7 MB，而它索引的源码才 1.9 MB ——
+    **WAL 比它索引的东西还大**
+  ★ 根因：连接是**长期开着**的（放在 `IndexStore` 的 `HashMap` 里），
+    所以 WAL 不会被回收。而 `wal_autocheckpoint`（默认 1000 页）那个机制
+    在主库上有搜索的读事务时只能做一部分（PASSIVE 语义）⇒ WAL 一直涨
+  ★★ **两次收尾，而「退出」那条才是主路径**：
+    · `index_close` 命令：前端「关闭文件夹」时调。从 map 里移除 ⇒
+      `Connection` 被 drop ⇒ 关库时自己 checkpoint；顺带把整张索引从内存里放掉
+      ⚠ 后台补齐线程可能正拿着那个 Index：`map.remove` 会**等锁**，
+        线程拿到锁后再一看 key 没了就自己退出（`warm()` 里那条 `None => break`
+        早就为这个场景留好了）
+    · `RunEvent::Exit` 里把所有还开着的索引都 checkpoint 一次
+      ★ 没有这一步的话，**关文件夹那条路大多数时候根本走不到** ——
+        用户是直接关窗口的。而「写了但走不到」比不写更糟：它会让人以为已经做了
+      ⚠ 用 `Exit` 而不是 `ExitRequested`：后者会被「未保存确认」取消，
+        那时用户还没走，不该做收尾
+  ★ **改 `.run()` 为 `.build()?...run(|app, event| ...)`**：
+    官方那种 `.run(generate_context!())` 拿不到事件回调。
+    ⚠ `.run()` 的闭包里第一句得是 `use tauri::Manager;` ——
+      `try_state` 来自那个 trait，而命令那边是**参数注入**、用不到它，
+      所以文件头根本没引过它（实测就是这个报错：`no method named try_state`）
+  ★★ **新增用例 `checkpoint_truncates_wal`**：拿真实**文件**库验
+    「写入 → WAL 非空 → checkpoint → WAL 变小」。为什么值得单独写一条：
+    **这个改动的唯一目的是省磁盘，而它的失效方式是「不报错、也没省下来」**
+    —— 正是这个项目最怕的一类。只看代码里那句 PRAGMA 拼得对不对是验不出来的
+    ⚠ 写它时踩到：Rust 的 `\` 续行会把换行和前导空白一起吃掉，
+      几条 SQL 粘成 `...n < 5000)INSERT INTO ...` 就是语法错误。要用 `concat!`
+    实测：**44 个测试全过**（43 → 44）
+
+  ⭐ **另外两件小技术债一起清了**：
+  · `tauri.conf.json` 补 `"publisher": "Toocode"` —— 不写它 Tauri 会回落到
+    小写的标识符，「应用和功能」里那一列显示成 `toocode`（1.0.0 实测如此）。
+    纯观感，**下次打包生效**（所以 1.0.0 那个 Release 不会变）
+  · CI 加 `paths-ignore: ["**.md", "LICENSE"]` —— 改个 README 不必等
+    2~3 分钟的构建 + 测试。（这份开发笔记也是 `.md`，一并被覆盖）
+    ⚠ 以后若给仓库设「必须通过状态检查才能合并」，docs-only 的 PR 会因为
+      **根本没有 check 跑**而被卡住 —— 那时要重新考虑这条
+
 - [x] **修一个「发布前才发现」的大 bug：Topilot 请求必然失败（系统代理）**：
   ★ 现象：第一次拿**真接口**跑（之前一次都没跑过），报
     `请求失败：error sending request for url (…)`
@@ -2492,7 +2531,9 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       WebView2 的配置目录才是 `%LOCALAPPDATA%\com.toocode.app`，两个别混
     ⚠ 顺带一个观察：`.db-wal` 也不小（实测某个库 `.db` 9.1 MB、`.db-wal` 5.7 MB，
       而它索引的源码才 1.9 MB）—— 连接一直开着，WAL 没被 checkpoint。
-      想省磁盘的话，可以在关闭工作区时手动 checkpoint 一次
+      ✅ **已处理**，见下面「索引的收尾」那条。
+      ⚠ 关键是**退出那条才是主路径** —— 用户大多数时候直接关窗口，
+        不会先去菜单里「关闭文件夹」
 
 - [x] **发布 1.0 前的准备（LICENSE / README / CI / 依赖许可扫描）**：
   起因是「感觉已经能作为 1.0 发布了」。功能上确实够了，
@@ -2528,6 +2569,9 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     那是刻意设计，不是漏测 —— 但**要写清楚**，否则下次看到「跳过了」会以为是坏的
   · 本地只预演了两步：`npm run build` 过；YAML 用 `npx --yes js-yaml` 解过
     （用 npx 跑，不把解析器装进项目）
+  · ⚠ **后来加了 `paths-ignore: ["**.md", "LICENSE"]`** —— 改个 README
+    不该等 2~3 分钟。但要小心：**docs-only 的 PR 不会产生任何 check run**，
+    如果以后给仓库设「必须通过状态检查才能合并」，那种 PR 会被卡住
 
   ★★ **依赖许可扫描顺手挖出一个真东西**：本来只想确认没有 GPL，
   结果 `cargo metadata` **卡住不动**；加 `--offline` 才看到真原因：
@@ -3293,7 +3337,9 @@ foreach ($t in @("Cache","Code Cache","GPUCache","DawnGraphiteCache","DawnWebGPU
 
 ⚠ **`Publisher` 登记成 `toocode`（小写）而不是 `Toocode`** —— 「应用和功能」
 里那一列会显示小写。根因：`tauri.conf.json` 的 `bundle` 段里**没写 `publisher`**
-（现在只有 `icons`），Tauri 就回落到小写的形式。纯观感问题，不影响功能。
+（当时只有 `icons`），Tauri 就回落到小写的形式。纯观感问题，不影响功能。
+✅ **已修**（补了 `"publisher": "Toocode"`）—— 但**下次打包**才生效，
+1.0.0 那个 Release 里还是小写
 
 ⚠ ★ **「比对 Local Storage 字节数」这个办法只在不启动应用时才有意义** ——
 本次比基线大了 346 字节（22,226 → 22,572），因为**装了之后真起了一次应用**，
