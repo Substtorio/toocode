@@ -2730,6 +2730,12 @@ async function openRecentFolder(path: string) {
 async function closeFolder() {
   if ((await askAboutUnsaved("关闭工作区")) === "cancel") return;
 
+  // 顺手把这个工作区的索引库关掉（见 Rust 侧 index_close 的说明）：
+  // 连接一直开着的话 WAL 不会被回收 —— 实测有个库 .db-wal 比它索引的源码还大。
+  // ⚠ 不 await、失败也不管：关文件夹本身不该被它拖慢或搞失败
+  const closing = workspaceRoot.value;
+  if (closing !== null) void invoke("index_close", { root: closing }).catch(() => {});
+
   resetWorkspace();
   workspaceRoot.value = null;
   fileTree.value = [];

@@ -3358,6 +3358,7 @@ pub fn run() {
             searchdb::index_warm,
             searchdb::index_rebuild,
             searchdb::index_invalidate,
+            searchdb::index_close,
             pty_spawn,
             pty_write,
             pty_resize,
@@ -3390,6 +3391,21 @@ pub fn run() {
         .manage(DapState::default())
         // 搜索索引（每个工作区一个 SQLite 库）
         .manage(searchdb::IndexStore::default())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // ★ 退出时把每个还开着的索引库都 checkpoint 一次。
+            //   为什么退出这条才是主路径：用户大多数时候是**直接关窗口**，
+            //   不会先去菜单里「关闭文件夹」—— 只在 index_close 里做是不够的
+            // ⚠ 用 `Exit` 而不是 `ExitRequested`：后者会被「未保存确认」取消掉，
+            //   那时用户还没走，不该做收尾
+            if matches!(event, tauri::RunEvent::Exit) {
+                // `try_state` 来自 `Manager` trait —— 命令那边是参数注入，用不到它，
+                // 所以这个 trait 只有退出回调这里需要引进来
+                use tauri::Manager;
+                if let Some(store) = app.try_state::<searchdb::IndexStore>() {
+                    searchdb::checkpoint_all(&store);
+                }
+            }
+        });
 }

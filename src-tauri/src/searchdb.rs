@@ -289,6 +289,23 @@ impl Index {
         self.dirty = true;
     }
 
+    /// 把 WAL 里的内容写回主库，并把 WAL 截断。
+    ///
+    /// ★ 为什么需要它：连接是**长期开着**的（放在 `IndexStore` 的 HashMap 里），
+    ///   于是 WAL 文件不会被回收 —— 实测某个库 `.db` 9.1 MB、`.db-wal` 5.7 MB，
+    ///   而它索引的源码才 1.9 MB。**WAL 比它索引的东西还大**
+    /// ★ 那 `wal_autocheckpoint` 呢：它确实有（默认 1000 页），
+    ///   但主库上有搜索的读事务时 checkpoint 只能做一部分（PASSIVE 语义），
+    ///   所以 WAL 会一直涨。而关掉工作区 / 应用退出的那一刻没有别的事务，
+    ///   正好做一次 TRUNCATE
+    /// ⚠ `execute_batch` 而不是 `query_row`：`wal_checkpoint` 会返回一行结果，
+    ///   用批量执行的话结果直接被忽略，不用去接那三列
+    pub fn checkpoint(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|err| format!("checkpoint 失败：{err}"))
+    }
+
     /// 只读状态，不碰磁盘
     pub fn info(&self) -> IndexInfo {
         let count = |sql: &str| -> i64 {
@@ -1205,9 +1222,82 @@ pub fn index_invalidate(
     })
 }
 
+/// 关掉某个工作区的索引库（前端在「关闭文件夹」时调）。
+///
+/// ★ 为什么要关：`IndexStore` 里那个连接是**一直开着**的 —— 于是关掉工作区之后
+///   WAL 文件继续占着磁盘、整张索引也继续占着内存。
+///   从 map 里移除会让 `Connection` 被 drop，SQLite 关库时自己也会 checkpoint
+/// ⚠ 这里显式再 checkpoint 一次：不指望「关库时顺手做了」—— 意图写在代码里
+/// ⚠ 后台补齐线程可能正拿着这个 Index：`map.remove` 会**等锁**，
+///   线程拿到锁之后一看 key 没了就自己退出（`warm()` 里那条 `None => break`）
+#[tauri::command]
+pub fn index_close(store: tauri::State<'_, IndexStore>, root: String) -> Result<(), String> {
+    let key = root_key(&root);
+    let mut map = store.0.lock().map_err(|err| err.to_string())?;
+    if let Some(index) = map.remove(&key) {
+        // ★ 失败不算错：这个命令的目的是「省磁盘 / 省内存」，
+        //   关不掉工作区才是真问题 —— 不该因为 checkpoint 没做成而报错
+        if let Err(err) = index.checkpoint() {
+            println!("[搜索索引] 关闭时 checkpoint 失败（无害）：{err}");
+        }
+    }
+    Ok(())
+}
+
+/// 把所有还开着的索引库都 checkpoint 一次 —— 应用退出前调。
+///
+/// ★ 退出这条才是主路径：用户大多数时候是**直接关窗口**，
+///   不会先去菜单里「关闭文件夹」⇒ 只在 `index_close` 里做是不够的
+/// ⚠ 全程忽略失败：这是退出路径，绝不能因为「省磁盘没省成」而出问题
+pub fn checkpoint_all(store: &IndexStore) {
+    let Ok(map) = store.0.lock() else { return };
+    for index in map.values() {
+        let _ = index.checkpoint();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 这次改动唯一的目的是「省磁盘」，而它的失效方式恰好是
+    /// **不报错、但也没省下来** —— 正是这个项目最怕的一类。
+    /// 所以拿真实的**文件**库验一遍「WAL 确实变小了」，
+    /// 而不是只看代码里那句 PRAGMA 拼得对不对
+    #[test]
+    fn checkpoint_truncates_wal() {
+        let dir = std::env::temp_dir().join(format!("toocode-wal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("t.db");
+
+        let index = Index::open(&db).unwrap();
+        // 建一张自己的表往 WAL 里写（不碰 files 表，免得依赖它的列）
+        // ⚠ 用 concat! 拼：Rust 的 `\` 续行会把换行和前导空白一起吃掉，
+        //   粘成 `...n < 5000)INSERT INTO ...` 就成了语法错误
+        index
+            .conn
+            .execute_batch(&concat!(
+                "CREATE TABLE t(x);",
+                " WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5000)",
+                " INSERT INTO t SELECT n FROM seq;",
+            ))
+            .unwrap();
+
+        let wal = dir.join("t.db-wal");
+        let before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(before > 0, "写入之后 WAL 应该非空，实测 {before} 字节");
+
+        index.checkpoint().unwrap();
+        let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            after < before,
+            "checkpoint 之后 WAL 应该变小：{before} -> {after}"
+        );
+
+        drop(index);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn hit(conn: &Connection, pattern: &str) -> Vec<i64> {
         let mut stmt = conn
