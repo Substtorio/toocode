@@ -14,6 +14,9 @@ import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
 // 把 TextMate 语法接成 Monaco 分词器的地方（插件机制的执行层）
 import { registerInjections, registerTextMateLanguage } from "./textmate";
 import { registerSnippetCompletions } from "./snippets";
+// 语言配置（contributes.languages[].configuration）—— 注释符 / 自动闭合括号 /
+// 自动缩进这些「打字时的行为」，和上面几块一样是从 VS Code 扩展里读的
+import { loadLanguageConfigurations } from "./languageConfigs";
 import { parseSnippetFile, type ParsedSnippet } from "./snippetParser";
 import {
   acceptChange,
@@ -5221,6 +5224,12 @@ onMounted(async () => {
   // ★ 放在语言注册**之后**：片段是挂在语言 id 上的，
   //   语言得先存在，注册上去的补全才有地方生效
   await loadSnippets();
+
+  // 再接语言配置（contributes.languages[].configuration）——
+  // Ctrl+/ 插什么注释符、敲 `{` 会不会自动补 `}`、回车缩进几格。
+  // ★ 同样要在语言注册之后：它只给 Monaco **已经认识**的语言设置
+  //   （理由见 languageConfigs.ts 里那段说明）
+  await loadLanguageConfigurations();
 
   // 把编辑器状态桥接给 Agent（Topilot 靠它知道用户在编辑什么）。
   // ★ 这里只是**登记函数**，不是把此刻的状态快照出去 ——

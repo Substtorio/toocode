@@ -309,10 +309,23 @@ struct ThemeContribution {
 
 #[derive(Deserialize)]
 struct LanguageContribution {
+    // ⚠ 这里也要 `default`：serde 是**全有或全无**的 —— 一条**缺 id 的**语言声明
+    //   会让整个 `Contributes` 反序列化失败，那个扩展的语法 / 主题 / 片段
+    //   就全没了。症状是「某个扩展怎么完全没反应」，而且不报错
+    #[serde(default)]
     id: String,
     /// 形如 [".vue"]，带点
     #[serde(default)]
     extensions: Vec<String>,
+    /// 这个语言的**语言配置文件**在哪（`contributes.languages[].configuration`）。
+    ///
+    /// ★ 这是插件机制里最容易被忽略、但收益最直接的一块：文件里写着
+    ///   注释符号、自动闭合的括号对、自动缩进的正则 —— 也就是
+    ///   **Ctrl+/ 注释**、**敲 `{` 自动补 `}`**、「输入 `/**` 自动补 `*/`」
+    ///   背后的东西。Monaco 有现成的 API（`setLanguageConfiguration`），
+    ///   而 VS Code 的扩展本来就得声明它 —— 我们只是把这份数据拿来用
+    #[serde(default)]
+    configuration: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -592,6 +605,67 @@ fn scan_grammar_extensions() -> Result<Vec<GrammarEntry>, String> {
         entries.iter().filter(|entry| !entry.inject_to.is_empty()).count()
     );
 
+    Ok(entries)
+}
+
+/// 一份可用的语言配置
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LanguageConfigEntry {
+    /// Monaco 的语言 id（就是扩展声明的那个）
+    id: String,
+    /// `language-configuration.json` 的绝对路径（前端再自己去读）
+    path: String,
+}
+
+/// 扫一遍所有扩展，把它们给每种语言配的「语言配置」列出来。
+///
+/// ★ 和另外几块的区别：管的是**打字时的行为**，不是上色。
+///   `comments.lineComment` 决定 Ctrl+/ 插什么，
+///   `autoClosingPairs` 决定敲 `{` 会不会自动补 `}`，
+///   `indentationRules` 决定回车时缩进几格
+#[tauri::command]
+fn scan_language_configurations() -> Result<Vec<LanguageConfigEntry>, String> {
+    let roots = extension_roots();
+    let mut entries: Vec<LanguageConfigEntry> = Vec::new();
+
+    // 一个语言只认第一份（先到先得，和语法 / 主题一致）：
+    // 扫描顺序 = 目录优先级（用户扩展 > 内置）
+    let mut seen = HashSet::new();
+
+    for_each_manifest(&roots, |dir, manifest| {
+        let Some(contributes) = manifest.contributes else {
+            return;
+        };
+
+        for language in contributes.languages {
+            // 没声明配置文件的跳过（大多数扩展都声明了，但不是全部）
+            let Some(relative) = language.configuration else {
+                continue;
+            };
+            if language.id.is_empty() {
+                continue;
+            }
+
+            // 老规矩：**先确认文件真的存在，再占位** ——
+            // 反过来会让一条「声明了路径但文件不在」的配置把那个语言白吃掉
+            let path = dir.join(&relative);
+            if !path.is_file() {
+                continue;
+            }
+
+            if !seen.insert(language.id.clone()) {
+                continue;
+            }
+
+            entries.push(LanguageConfigEntry {
+                id: language.id,
+                path: path.to_string_lossy().replace('\\', "/"),
+            });
+        }
+    });
+
+    println!("[语言配置] 得到 {} 份语言配置", entries.len());
     Ok(entries)
 }
 
@@ -2121,7 +2195,7 @@ mod tests {
             roots.push(root);
         }
 
-        let entries = scan_snippets_in(&roots);
+        let entries = scan_snippets_in(&roots, &[]);
         println!("\n扫到 {} 条片段：", entries.len());
         for entry in &entries {
             println!("  {} -> {:?}", entry.source, entry.languages);
@@ -2144,6 +2218,46 @@ mod tests {
                 .count(),
             1
         );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// 用户**自己写的**片段（`%APPDATA%\Code\User\snippets\*.json`）也要被扫到。
+    ///
+    /// ★ 为什么值得测：这条规则的失效方式是**静默的** ——
+    ///   目录不存在、文件名不是语言名、被 `.code-snippets` 搅乱，
+    ///   表现出来都只是「用户的片段没出现」，而用户多半会以为
+    ///   「这个编辑器不支持用户片段」，不会想到是扫描的问题
+    /// ⚠ `user_dirs` 做成参数正是为了这个：真机上那个目录**可能压根不存在**
+    ///   （本机就没有），只有测试造得出来
+    #[test]
+    fn picks_up_user_snippets() {
+        let base = std::env::temp_dir().join("toocode-user-snippets");
+        std::fs::remove_dir_all(&base).ok();
+        std::fs::create_dir_all(&base).unwrap();
+
+        // 按语言命名的两个文件 —— VS Code 的「用户片段」就是这种形状，文件名即语言 id
+        std::fs::write(base.join("typescript.json"), "{}").unwrap();
+        std::fs::write(base.join("markdown.json"), "{}").unwrap();
+        // ⚠ 这个要跳过：`.code-snippets` 里**每条自带 scope**，一个文件能服务
+        //   好几种语言 —— 是另一套形状，暂时不支持
+        std::fs::write(base.join("global.code-snippets"), "{}").unwrap();
+
+        let entries = scan_snippets_in(&[], &[base.clone()]);
+        println!("\n用户片段扫到 {} 条：", entries.len());
+        for entry in &entries {
+            println!("  {} -> {:?}", entry.source, entry.languages);
+        }
+
+        assert_eq!(
+            entries.len(),
+            2,
+            "应该只认那两个 .json，`.code-snippets` 要跳过"
+        );
+        assert!(entries.iter().all(|entry| entry.source == USER_SNIPPET_SOURCE));
+        let languages: Vec<&String> = entries.iter().flat_map(|entry| &entry.languages).collect();
+        assert!(languages.iter().any(|id| *id == "typescript"));
+        assert!(languages.iter().any(|id| *id == "markdown"));
 
         std::fs::remove_dir_all(&base).ok();
     }
@@ -2192,8 +2306,13 @@ struct SnippetEntry {
     path: String,
     /// 这份片段来自哪个扩展。
     /// ★ 不是装饰：片段重名时用户会问「这条是哪来的」，而且排查也只靠它
+    /// ⚠ 用户自己写的那些不是任何扩展贡献的，`source` 就是下面这个常量
     source: String,
 }
+
+/// 用户片段在 `source` 里的取值。定义成常量而不是各处手写字符串 ——
+/// 判重和统计都靠它，写错一个字符就是「用户片段被当成扩展片段算了两遍」
+const USER_SNIPPET_SOURCE: &str = "用户片段";
 
 /// 扫一遍所有扩展，把它们贡献的代码片段（`contributes.snippets`）列出来。
 ///
@@ -2203,7 +2322,25 @@ struct SnippetEntry {
 ///   启动时全读进来解析一遍纯属浪费，用到哪个读哪个
 #[tauri::command]
 fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
-    Ok(scan_snippets_in(&extension_roots()))
+    Ok(scan_snippets_in(&extension_roots(), &user_snippet_dirs()))
+}
+
+/// 用户**自己写的**代码片段放在哪。
+///
+/// ★ 这是独立于扩展的一处来源：VS Code 的「用户片段」界面按语言存成
+///   `<语言>.json`（**文件名就是语言 id**），放在 `%APPDATA%\Code\User\snippets`
+///   —— 不在任何扩展目录里，所以 `contributes.snippets` 那条路扫不到它们
+/// ★ 两个候选：正式版和 Insiders（有些人两个都装）
+/// ⚠ 用环境变量 `APPDATA` 而不是硬拼盘符：Windows 上它可能被重定向
+fn user_snippet_dirs() -> Vec<PathBuf> {
+    let Ok(appdata) = std::env::var("APPDATA") else {
+        return Vec::new();
+    };
+    let appdata = PathBuf::from(appdata);
+    ["Code", "Code - Insiders"]
+        .iter()
+        .map(|name| appdata.join(name).join("User").join("snippets"))
+        .collect()
 }
 
 /// 真正干活的那一层。
@@ -2213,7 +2350,10 @@ fn scan_snippet_extensions() -> Result<Vec<SnippetEntry>, String> {
 ///   它只在「新旧两个版本目录同时存在」时才会起作用，而那种状态
 ///   VS Code 更新完过一阵子就自己没了。参数化之后测试能自己搭两个假安装
 ///   目录把它钉住（见 `dedups_snippets_across_duplicate_install_roots`）
-fn scan_snippets_in(roots: &[PathBuf]) -> Vec<SnippetEntry> {
+///
+/// ★ `user_dirs` 也做成参数，理由和 `roots` 一样：
+///   那几条规则都「没法靠眼睛验」，而测试需要自己搭一个假的片段目录
+fn scan_snippets_in(roots: &[PathBuf], user_dirs: &[PathBuf]) -> Vec<SnippetEntry> {
     let mut entries: Vec<SnippetEntry> = Vec::new();
 
     // ★ 先到先得（和语法那套一致）：扫描顺序 = 目录优先级（用户扩展 > 内置），
@@ -2282,14 +2422,58 @@ fn scan_snippets_in(roots: &[PathBuf]) -> Vec<SnippetEntry> {
         }
     });
 
+    // 用户自己写的片段。★ 单独一处来源、判重规则也不同 ——
+    //   它不属于任何扩展，所以 key 用「『用户片段』+ 文件名」
+    for dir in user_dirs {
+        let Ok(files) = fs::read_dir(dir) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+
+            // ⚠ 只认 `.json`。`*.code-snippets`（全局片段文件）里**每条自带 scope**，
+            //   一个文件能同时服务好几种语言 —— 那是另一套形状，暂时不支持
+            let is_json = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"));
+            if !path.is_file() || !is_json {
+                continue;
+            }
+
+            // 文件名（去掉 .json）就是语言 id
+            let Some(language) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            if !seen.insert((language.to_string(), USER_SNIPPET_SOURCE.to_string(), name)) {
+                continue;
+            }
+
+            entries.push(SnippetEntry {
+                languages: vec![language.to_string()],
+                path: path.to_string_lossy().replace('\\', "/"),
+                source: USER_SNIPPET_SOURCE.to_string(),
+            });
+        }
+    }
+
     println!(
-        "[代码片段] 得到 {} 个片段文件，覆盖 {} 个语言",
+        "[代码片段] 得到 {} 个片段文件，覆盖 {} 个语言（其中用户片段 {} 个）",
         entries.len(),
         entries
             .iter()
             .flat_map(|entry| entry.languages.iter())
             .collect::<HashSet<_>>()
-            .len()
+            .len(),
+        entries
+            .iter()
+            .filter(|entry| entry.source == USER_SNIPPET_SOURCE)
+            .count()
     );
 
     entries
@@ -3351,6 +3535,7 @@ pub fn run() {
             scan_grammar_extensions,
             scan_theme_extensions,
             scan_snippet_extensions,
+            scan_language_configurations,
             search_in_folder,
             searchdb::index_info,
             searchdb::index_files,

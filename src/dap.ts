@@ -594,7 +594,15 @@ export function disposeDap(): void {
 
 /** 本机可用的调试适配器 */
 export async function availableAdapters(): Promise<DapAdapterInfo[]> {
-  adapterCache ??= await invoke<DapAdapterInfo[]>("dap_adapters");
+  if (adapterCache === null) {
+    // ⚠ 外部数据的形状不由我们保证：`invoke` 万一回了 null，
+    //   下游 `adapterFor` 会对着它调 `.find` —— 那会是一句
+    //   「Cannot read properties of null」崩在一个 computed 里，
+    //   症状是**整个组件的更新都中断**，而报错栈指不到真正的原因
+    //   （验证时用桩把 dap_adapters 打成 null 就复现过一次）
+    const loaded = await invoke<DapAdapterInfo[] | null>("dap_adapters");
+    adapterCache = Array.isArray(loaded) ? loaded : [];
+  }
   return adapterCache;
 }
 
