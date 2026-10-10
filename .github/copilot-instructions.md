@@ -2486,6 +2486,60 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     token 类型图例），而本机 json / html / css 三个服务器基本不产生语义 token
     ⇒ 验都没法验
 
+- [x] **hot exit 的备份改用文件（本来在 localStorage）**：
+  ★★ 真正的问题不是「容量不够大」，而是**写失败是静默的** —— 配额一满
+    （QuotaExceededError）就被 catch 掉，用户以为「没保存也没关系」，
+    然后崩溃之后真丢了。丢的是**没保存的代码**，这个项目里最不能出错的一处
+  ★ 实现：`appDataDir/toocode.session.json`，Rust 侧新增 `load_session` /
+    `save_session`。⚠ 顺手把 `read_chats` / `write_chats` 抽成了中性的
+    `read_json_file(path, fallback)` / `write_json_file(path)` —— 两个文件共用
+    同一套「先写临时文件再改名」，不用把那段踩过坑的逻辑再抄一遍
+  ★ 上限跟着放宽：从「总量 50 万字符」到「单文档 200 万 / 总量 800 万」，
+    而且**跳过时 console.warn**（原来静默丢，那正是要修掉的坏毛病）
+  ★ **老数据要接出来**：不然用户一升级，磁盘上还没有文件、localStorage 里
+    那份就成了孤儿。做法是「**文件里没内容时**才看旧 key，接出来立刻删掉
+    并写成文件」
+    ⚠ 「立刻写成文件」这步不能省：只读不写的话，「打开应用、什么都不改、
+      再关掉」之后它又没了（旧 key 已删、文件也没写）
+
+  ★★★ **顺手验掉一个一直没验的关键假设：`beforeunload` 里不等回复的 invoke
+    能不能落地？** 答案是**能** —— Tauri 的 invoke 是「postMessage 发出去、
+    等回复」，**发消息本身是同步的**，所以页面卸载时消息已经在路上了。
+    ★ 判据是决定性的：改内容后**立刻** reload（防抖 600ms 来不及），
+      恢复出来的是**新**内容 ⇒ 那一次确实写成功了。
+      （如果只回退到上一次的备份，就说明没赶上）
+    ⇒ 所以「防抖备份 + beforeunload 补一次」这个结构可以原样保留
+
+- [x] **修一类洞：`invoke` 回 `null` 不会抛，所以 try/catch 接不住**：
+  ★★ 这是本轮最有价值的一条，因为它**断过整个启动流程**。
+    现象：语言配置加载时抛 `entries is not iterable`，而日志里只有
+    `[Vue warn]: Unhandled error during execution of mounted hook` ——
+    **`onMounted` 从那一行被斩断**，后面所有初始化（**包括 hot exit 恢复**）
+    全都没跑。
+    ★ 而这一条是**间接**才看出来的：「读会话备份失败」的警告下面**没有**
+      「接出了旧版…」那条日志 ⇒ 说明 `restoreHotExit` 压根没被执行
+  ★ 根因：
+    ```ts
+    let entries;
+    try { entries = await invoke<Entry[]>("scan_x"); } catch { return; }
+    for (const entry of entries) { ... }   // ← invoke 回 null 时，这儿抛
+    ```
+    `invoke` 回 `null` 是**正常返回**（不是 reject）⇒ catch 接不住 ⇒
+    而 `for...of null` 抛
+  ★ 同一模式一共修了 **4 处**，判断依据是「在不在这条启动链上」：
+    主题 / 代码片段 / 语法 / `lsp_servers`（都在）——
+    不在链上的（`index_*` / `list_models` / `search_in_folder`）崩了只影响
+    那一个功能，先不动
+  ★★ 教训：**「有 try/catch」不等于安全** —— 先确定「失败」是抛出来的
+    还是**返回**的。前者 catch 得住，后者得自己验形状
+    （`dap.availableAdapters` 上踩过一模一样的一次，当时还没意识到是个模式）
+
+  ✅ 验证方式值得记：**桩里把所有 `scan_*` / `lsp_servers` / `dap_adapters`
+    都打成 `null`**，看 `onMounted` 还能不能跑完（判据是「迁移有没有发生」）。
+    加固前会在第一个 await 就断，加固后照样跑完 ✅
+    ★ 这比「逐个函数读一遍看有没有校验」可靠得多 —— 而且它顺带覆盖了
+      以后新加的同类代码
+
 - [x] **修一个「发布前才发现」的大 bug：Topilot 请求必然失败（系统代理）**：
   ★ 现象：第一次拿**真接口**跑（之前一次都没跑过），报
     `请求失败：error sending request for url (…)`
@@ -2801,8 +2855,11 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
    ⚠ 生成 PNG 别走「用浏览器渲染 SVG 再截图」那条路：Playwright 在这个环境里
      截出来的图和实际尺寸对不上（截到的是放大的一角）。
      用 `System.Drawing` 直接画完全可控，也不依赖任何外部工具
-8. **hot exit 备份改用文件**：localStorage 有容量上限且只能存字符串。
-   真需要的话用 Tauri 的 `appDataDir` + 一个 `save_session` / `load_session` 命令
+8. **【已完成】hot exit 备份改用文件** —— 见上面那条。
+   命令名就是当初这里预测的 `load_session` / `save_session`，存到
+   `appDataDir/toocode.session.json`（和聊天记录**分文件**：一个坏了不该牵连另一个）
+   ⏳ 顺带记一笔**这一批没做的**：`index_*` / `list_models` / `search_in_folder`
+   那几处同样缺形状校验，但它们不在启动链上（崩了只影响单个功能），优先级低
 9. **【主体完成】内置 AI 助手 Topilot**（四轮：对话循环 → 工具 → diff 审阅 → 看得见编辑器）。
    ⏳ 还差：接一个真实模型端到端跑一遍（要自备密钥）；代码块的「复制」按钮：
    ★ 命名上分的两层：**Toocode** 是编辑器，**Topilot** 是它内置的 AI 助手
