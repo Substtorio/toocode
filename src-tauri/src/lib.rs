@@ -15,6 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 
 // 搜索索引（SQLite）。单独一个文件 —— 它自己有一整套「建库 / 同步 / 查询」的逻辑，
 // 塞进 lib.rs 只会让这个已经三千多行的文件更难找东西
+mod db;
 mod searchdb;
 
 // ============================ 数据结构 ============================
@@ -3569,6 +3570,12 @@ pub fn run() {
             scan_snippet_extensions,
             scan_language_configurations,
             search_in_folder,
+            db::db_find_files,
+            db::db_index_files,
+            db::db_open,
+            db::db_query,
+            db::db_rows,
+            db::db_schema,
             searchdb::index_info,
             searchdb::index_files,
             searchdb::index_symbols,

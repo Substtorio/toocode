@@ -41,6 +41,9 @@ import FileTreeNode from "./components/FileTreeNode.vue";
 import MenuList from "./components/MenuList.vue";
 import ChatPanel from "./components/ChatPanel.vue";
 import TerminalPanel from "./components/TerminalPanel.vue";
+import DatabasePanel from "./components/DatabasePanel.vue";
+import { CHEVRON_DOWN } from "./icons";
+import { formatBytes } from "./format";
 import { fileTreeExpansionKey, fileTreeSelectionKey } from "./injectionKeys";
 // 语言服务器客户端。★ 它不知道 `models` 表长什么样 —— 以两个函数的
 // 形式把口子开给它（和 editorBridge 一个套路）
@@ -132,7 +135,7 @@ function toggleSidebar() {
  *   有了搜索之后就不等价了 —— 搜索视图开着时，资源管理器那个图标应该是**不亮**的。
  *   用一个布尔去表达两件事，迟早会在加第二个视图时错位
  */
-type ViewId = "explorer" | "search" | "scm" | "debug";
+type ViewId = "explorer" | "search" | "scm" | "debug" | "database";
 const activeView = ref<ViewId>("explorer");
 
 /**
@@ -160,10 +163,14 @@ const activeView = ref<ViewId>("explorer");
  *     按描边去画会得到「粗描边轮廓图」（孔的边被填小、连接线变成粗条），
  *     和原生完全不是一个东西。
  *
- * ⚠ **抄之前先看 svg 上的 `viewBox`，网格尺寸不一样**：
- *   `files` / `search-large` / `source-control` 都是 24×24，
- *   但 `search`（不带 -large）是 **16×16** —— 那个是给菜单 / 按钮用的，
- *   活动栏要的是 `search-large`。
+ * ⚠ ★★ **抄之前先看 svg 上的 `viewBox`，网格尺寸不一样**：
+ *   `files` / `search-large` / `source-control` / `debug-alt` 都是 24×24，
+ *   但 `database` 是 **16×16** —— codicons 里**大多数**图标都是 16×16，
+ *   只有名字带 `-large` 的那几个是 24×24。
+ *   ⇒ 所以 `viewBox` 是**每一项自己的字段**，模板里不再写死。
+ *     两者共用同一个 `width/height="24"`，各自按自己的网格缩放到 24px；
+ *     ⚠ 写死 `viewBox="0 0 24 24"` 的话，16×16 那个路径只占满
+ *       左下角那一块（约六分之四的面积），看起来就是「小了一圈、还偏了」
  *
  * ⚠ ★ **codicon 是「满格」设计**：内容从 x/y 的 0 一路铺到 24。
  *   所以它们比之前手画的那版（16~17 高）**明显大一圈** ——
@@ -176,10 +183,17 @@ const activeView = ref<ViewId>("explorer");
  *   而且活动栏的图标天生是**单选**的（activeView 只能有一个值）——
  *   把它塞进来，就变成「开着 Topilot 就没法同时看资源管理器」
  */
-const ACTIVITY_VIEWS: Array<{ id: ViewId; label: string; icon: string }> = [
+const ACTIVITY_VIEWS: Array<{
+  id: ViewId;
+  label: string;
+  icon: string;
+  /** 这个图标的网格尺寸 —— 见上面那段注释，codicon 有两种 */
+  viewBox: string;
+}> = [
   {
     id: "explorer",
     label: "资源管理器",
+    viewBox: "0 0 24 24",
     // codicon: files —— 两份叠起来的文档（后面那张只露出一角，所以整体略偏左）
     icon:
       "M7.5 22.5H17.595C17.07 23.4 16.11 24 15 24H7.5C4.185 24 1.5 21.315 1.5 18V6C1.5 4.89 2.1 3.93 3 3.405V18C3 20.475 5.025 22.5 7.5 22.5ZM21 8.121V18C21 19.6545 19.6545 21 18 21H7.5C5.8455 21 4.5 19.6545 4.5 18V3C4.5 1.3455 5.8455 0 7.5 0H12.879C13.4715 0 14.0505 0.24 14.4705 0.6585L20.3415 6.5295C20.766 6.954 21 7.5195 21 8.121ZM13.5 6.75C13.5 7.164 13.8375 7.5 14.25 7.5H19.1895L13.5 1.8105V6.75ZM19.5 18V9H14.25C13.0095 9 12 7.9905 12 6.75V1.5H7.5C6.672 1.5 6 2.1735 6 3V18C6 18.8265 6.672 19.5 7.5 19.5H18C18.828 19.5 19.5 18.8265 19.5 18Z",
@@ -187,6 +201,7 @@ const ACTIVITY_VIEWS: Array<{ id: ViewId; label: string; icon: string }> = [
   {
     id: "search",
     label: "搜索",
+    viewBox: "0 0 24 24",
     // codicon: **search-large**（不是 search！那个是 16×16 网格的）
     icon:
       "M22.281 21.219L16.0875 15.0255C17.2815 13.5945 18 11.754 18 9.74854C18 5.19904 14.298 1.49854 9.75 1.49854C5.202 1.49854 1.5 5.20054 1.5 9.75004C1.5 14.2995 5.202 18 9.75 18C11.7555 18 13.5945 17.28 15.027 16.0875L21.2205 22.281C21.3675 22.428 21.5595 22.5 21.7515 22.5C21.9435 22.5 22.1355 22.4265 22.2825 22.281C22.575 21.9885 22.575 21.513 22.2825 21.2205L22.281 21.219ZM9.75 16.5C6.0285 16.5 3 13.4715 3 9.75004C3 6.02853 6.0285 3.00004 9.75 3.00004C13.4715 3.00004 16.5 6.02853 16.5 9.75004C16.5 13.4715 13.4715 16.5 9.75 16.5Z",
@@ -194,6 +209,7 @@ const ACTIVITY_VIEWS: Array<{ id: ViewId; label: string; icon: string }> = [
   {
     id: "scm",
     label: "源代码管理",
+    viewBox: "0 0 24 24",
     // codicon: source-control —— 左边两个节点串成一条线，中间往右上方引出一根旁支
     icon:
       "M21 8.25C21 6.1815 19.3185 4.5 17.25 4.5C15.1815 4.5 13.5 6.1815 13.5 8.25C13.5 10.023 14.739 11.5035 16.395 11.892C16.116 12.819 15.2655 13.5 14.25 13.5H9.75C8.9025 13.5 8.1285 13.7925 7.5 14.268V7.4235C9.21 7.0755 10.5 5.5605 10.5 3.75C10.5 1.6815 8.8185 0 6.75 0C4.6815 0 3 1.6815 3 3.75C3 5.562 4.29 7.0755 6 7.4235V16.575C4.29 16.923 3 18.438 3 20.2485C3 22.317 4.6815 23.9985 6.75 23.9985C8.8185 23.9985 10.5 22.317 10.5 20.2485C10.5 18.4755 9.261 16.995 7.605 16.6065C7.884 15.6795 8.7345 14.9985 9.75 14.9985H14.25C16.0845 14.9985 17.61 13.6725 17.931 11.9295C19.674 11.607 21 10.0845 21 8.25ZM4.5 3.75C4.5 2.5095 5.5095 1.5 6.75 1.5C7.9905 1.5 9 2.5095 9 3.75C9 4.9905 7.9905 6 6.75 6C5.5095 6 4.5 4.9905 4.5 3.75ZM9 20.25C9 21.4905 7.9905 22.5 6.75 22.5C5.5095 22.5 4.5 21.4905 4.5 20.25C4.5 19.0095 5.5095 18 6.75 18C7.9905 18 9 19.0095 9 20.25ZM17.25 10.5C16.0095 10.5 15 9.4905 15 8.25C15 7.0095 16.0095 6 17.25 6C18.4905 6 19.5 7.0095 19.5 8.25C19.5 9.4905 18.4905 10.5 17.25 10.5Z",
@@ -201,9 +217,19 @@ const ACTIVITY_VIEWS: Array<{ id: ViewId; label: string; icon: string }> = [
   {
     id: "debug",
     label: "运行和调试",
+    viewBox: "0 0 24 24",
     // codicon: debug-alt —— 左边一个播放三角，右下角一只小虫（虫子是圆 + 四条腿）
     icon:
       "M19.854 13.9605L13.2105 17.697C12.954 17.22 12.5505 16.8345 12.039 16.641L12.054 16.626L19.1175 12.6525C19.6275 12.366 19.6275 11.6325 19.1175 11.3445L7.11751 4.59599C6.61801 4.31399 6.00001 4.67549 6.00001 5.24999V10.5C5.46901 10.5 4.97401 10.6215 4.50001 10.791V5.24999C4.50001 3.52949 6.35251 2.44499 7.85251 3.28949L19.8525 10.0395C21.381 10.899 21.381 13.101 19.8525 13.962L19.854 13.9605ZM10.5 16.0605V18H11.25C11.664 18 12 18.336 12 18.75C12 19.164 11.664 19.5 11.25 19.5H10.5C10.5 20.076 10.3905 20.625 10.1925 21.132L11.781 22.7205C12.0735 23.013 12.0735 23.4885 11.781 23.781C11.634 23.928 11.442 24 11.25 24C11.058 24 10.866 23.9265 10.719 23.781L9.39151 22.4535C8.56651 23.4 7.35151 24.0015 6.00001 24.0015C4.64851 24.0015 3.43351 23.4015 2.60851 22.4535L1.28101 23.781C1.13401 23.928 0.942009 24 0.750009 24C0.558009 24 0.366009 23.9265 0.219009 23.781C-0.0734912 23.4885 -0.0734912 23.013 0.219009 22.7205L1.80751 21.132C1.60951 20.625 1.50001 20.076 1.50001 19.5H0.750009C0.336009 19.5 8.78423e-06 19.164 8.78423e-06 18.75C8.78423e-06 18.336 0.336009 18 0.750009 18H1.50001V16.0605L0.219009 14.7795C-0.0734912 14.487 -0.0734912 14.0115 0.219009 13.719C0.511509 13.4265 0.987009 13.4265 1.27951 13.719L2.56051 15H3.00001C3.00001 13.3455 4.34551 12 6.00001 12C7.65451 12 9.00001 13.3455 9.00001 15H9.43951L10.7205 13.719C11.013 13.4265 11.4885 13.4265 11.781 13.719C12.0735 14.0115 12.0735 14.487 11.781 14.7795L10.5 16.0605ZM4.50001 15H7.50001C7.50001 14.172 6.82801 13.5 6.00001 13.5C5.17201 13.5 4.50001 14.172 4.50001 15ZM9.00001 16.5H3.00001V19.5C3.00001 21.1545 4.34551 22.5 6.00001 22.5C7.65451 22.5 9.00001 21.1545 9.00001 19.5V16.5Z",
+  },
+  {
+    id: "database",
+    label: "数据库",
+    // codicon: database —— 一只圆柱（三层扁圆叠起来）
+    // ⚠ 它是 **16×16** 网格的，另四个是 24×24 ⇒ 靠 viewBox 各管各的
+    viewBox: "0 0 16 16",
+    icon:
+      "M8 1C5.149 1 3 2.075 3 3.5V12.5C3 13.925 5.149 15 8 15C10.851 15 13 13.925 13 12.5V3.5C13 2.075 10.851 1 8 1ZM8 2C10.441 2 12 2.888 12 3.5C12 4.112 10.441 5 8 5C5.559 5 4 4.112 4 3.5C4 2.888 5.558 2 8 2ZM8 14C5.558 14 4 13.111 4 12.5V5.021C5.21405 5.71872 6.60095 6.05816 8 6C9.39905 6.05816 10.7859 5.71872 12 5.021V12.5C12 13.111 10.441 14 8 14Z",
   },
 ];
 const CHAT_ICON =
@@ -1862,6 +1888,7 @@ const WELCOME_SHORTCUTS: readonly WelcomeShortcut[] = [
 
   // ---- 折叠区：下面这些默认收起 ----
   { keys: ["Ctrl", "Shift", "M"], label: "问题面板" },
+  { keys: ["Ctrl", "Alt", "D"], label: "数据库" },
   // 文件。这几条是全局的 —— 焦点在侧栏或标签栏时也生效
   { keys: ["Ctrl", "N"], label: "新建文件" },
   { keys: ["Ctrl", "Shift", "S"], label: "另存为…" },
@@ -4198,6 +4225,162 @@ function handleChatShortcut(event: KeyboardEvent) {
   toggleChat();
 }
 
+// ---------- 数据库视图 ----------
+//
+// ★ 为什么是「侧栏列表 + 浮层」而不是标签页：
+//   标签页那套结构的底层假设是「一个路径 = 一个文件」—— `openTabs` 是
+//   `string[]`、model 按路径存、脏状态、另存为要搬家…… 而一个「库」不是文件，
+//   一个「表」更不是路径。硬塞进去就得给每一处加特例。
+//   先例：图片预览 / 欢迎页 / diff 审阅全是浮层，`openTabs` 一行都没改过
+
+interface DbTable {
+  name: string;
+  kind: string;
+  sql: string;
+}
+
+interface DbEntry {
+  path: string;
+  name: string;
+  size: number;
+  modifiedMs: number;
+  /** 它属于哪一组（见 DB_GROUPS） */
+  group: "workspace" | "index";
+}
+
+/** 侧栏里的两组。★ 「索引库」那一组不是锦上添花 ——
+ *  实测这个项目的工作区里**一个 .db 都没有**，少了它这个视图就是一片空白 */
+const DB_GROUPS: Array<{ id: DbEntry["group"]; label: string }> = [
+  { id: "workspace", label: "工作区" },
+  { id: "index", label: "搜索索引" },
+];
+
+const dbEntries = ref<DbEntry[]>([]);
+/** 扫过没有。★ 和 `gitChecked` 同一个理由：刚开始也是「没扫过」，
+ *  不加这个状态界面会先闪一句「没有找到数据库文件」 */
+const dbChecked = ref(false);
+const dbError = ref("");
+const dbBusy = ref(false);
+/** 哪些库展开了（按路径记）。★ 和文件树同一个套路：记路径而不是存在节点上，
+ *  重新扫描之后展开状态自然还在，不需要任何额外的「保留逻辑」 */
+const dbExpanded = ref(new Set<string>());
+/** 库路径 → 它的表清单（展开时懒加载） */
+const dbTables = ref<Record<string, DbTable[]>>({});
+/** 打不开的库 → 原因。★ 单个库打不开不该把整个视图变成一条报错 */
+const dbBroken = ref<Record<string, string>>({});
+
+/** 浮层正在看哪个库的哪张表 */
+const dbOpenPath = ref<string | null>(null);
+const dbOpenTable = ref<string | null>(null);
+
+function entriesOf(group: DbEntry["group"]): DbEntry[] {
+  return dbEntries.value.filter((entry) => entry.group === group);
+}
+
+function dbNameOf(path: string): string {
+  return dbEntries.value.find((entry) => entry.path === path)?.name ?? path.split("/").pop() ?? path;
+}
+
+/**
+ * 扫数据库文件。两处来源：工作区里的 `.db`，和我们自己的索引库。
+ */
+async function refreshDatabases(): Promise<void> {
+  dbBusy.value = true;
+  dbError.value = "";
+  try {
+    const [workspace, index] = await Promise.all([
+      workspaceRoot.value
+        ? invoke<DbEntry[]>("db_find_files", { root: workspaceRoot.value })
+        : Promise.resolve([] as DbEntry[]),
+      invoke<DbEntry[]>("db_index_files"),
+    ]);
+
+    // ★ 形状要自己验一遍：`invoke` 回 `null` 是**正常返回**、不是 reject，
+    //   而 `for...of null` 会抛 —— 这个坑一次就把整个 onMounted 后面跳过了。
+    //   这里 `.map` 对 null 一样会抛
+    const toEntries = (list: unknown, group: DbEntry["group"]): DbEntry[] =>
+      Array.isArray(list) ? list.map((item) => ({ ...(item as DbEntry), group })) : [];
+
+    dbEntries.value = [
+      ...toEntries(workspace, "workspace"),
+      ...toEntries(index, "index"),
+    ];
+    // 重新扫过之后，之前记的「打不开」和表清单可能都不成立了
+    dbBroken.value = {};
+    dbTables.value = {};
+  } catch (err) {
+    dbError.value = err instanceof Error ? err.message : String(err);
+    dbEntries.value = [];
+  } finally {
+    dbChecked.value = true;
+    dbBusy.value = false;
+  }
+}
+
+/** 展开 / 收起一个库；展开时才去读它的表清单 */
+async function toggleDbEntry(path: string): Promise<void> {
+  const next = new Set(dbExpanded.value);
+  if (next.has(path)) {
+    next.delete(path);
+    dbExpanded.value = next;
+    return;
+  }
+  next.add(path);
+  dbExpanded.value = next;
+
+  if (dbTables.value[path]) return;
+
+  try {
+    const info = await invoke<{ tables: DbTable[] }>("db_open", { path });
+    dbTables.value = { ...dbTables.value, [path]: info?.tables ?? [] };
+  } catch (err) {
+    // ★ 打不开就在它自己那一行下面说一句（比如「不是 SQLite 数据库」）——
+    //   整个视图报错的话，其它库也看不了了
+    dbTables.value = { ...dbTables.value, [path]: [] };
+    const broken = { ...dbBroken.value };
+    broken[path] = err instanceof Error ? err.message : String(err);
+    dbBroken.value = broken;
+  }
+}
+
+function openDbTable(path: string, table: string): void {
+  dbOpenPath.value = path;
+  dbOpenTable.value = table;
+}
+
+function closeDbPanel(): void {
+  dbOpenPath.value = null;
+  dbOpenTable.value = null;
+}
+
+/**
+ * 数据库视图（`Ctrl+Alt+D`）。
+ *
+ * ★ 和 Topilot 那条（`Ctrl+Alt+I`）同一个家族：`Ctrl+Alt+<字母>` 在有些键盘布局上
+ *   是 AltGr（会把字母变成符号），所以同时认 `event.key` 和 `event.code`
+ */
+function handleDatabaseShortcut(event: KeyboardEvent) {
+  if (!event.ctrlKey || !event.altKey || event.shiftKey) return;
+  if (event.key.toLowerCase() !== "d" && event.code !== "KeyD") return;
+
+  event.preventDefault();
+  toggleView("database");
+}
+
+/** 从菜单进这个视图（＝显示，不是切换）—— 和 showSearchView / showDebugView 一个套路 */
+function showDatabaseView(): void {
+  activeView.value = "database";
+  sidebarVisible.value = true;
+}
+
+// ★ 每次切过来都重新扫。为什么不加一个「刷新」按钮：相比按钮，
+//   「切过来就是新的」没有学习成本 —— 而扫描本身只是递归 readdir，毫秒级。
+//   用 watch 而不是在 toggleView 里加分支：设置 activeView 的地方有好几处，
+//   逐个加必然漏，而漏掉的表现是「列表是空的」
+watch(activeView, (view) => {
+  if (view === "database") void refreshDatabases();
+});
+
 // ---------- 可拖拽的分隔条 ----------
 //
 // VS Code 的布局是「嵌套的框 + 夹在相邻框之间的分隔条」（它把那缝叫 sash）：
@@ -4606,6 +4789,7 @@ const menus = computed<Menu[]>(() => {
       { label: "在文件中查找", shortcut: "Ctrl+Shift+F", run: showSearchView },
       { label: "源代码管理", shortcut: "Ctrl+Shift+G", run: showSourceControlView },
       { label: "运行和调试", shortcut: "Ctrl+Shift+D", run: showDebugView },
+      { label: "数据库", shortcut: "Ctrl+Alt+D", run: showDatabaseView },
       { separator: true },
       {
         label: "后退",
@@ -5342,6 +5526,9 @@ onMounted(async () => {
   // Topilot（Ctrl+Alt+I）。同理
   window.addEventListener("keydown", handleChatShortcut, true);
 
+  // 数据库（Ctrl+Alt+D）。同理
+  window.addEventListener("keydown", handleDatabaseShortcut, true);
+
   // 拦窗口关闭：有未保存的改动就先问一句。
   //
   // ★ 这是官方文档给的范式：**只在需要拦住的时候才 preventDefault**。
@@ -5409,6 +5596,7 @@ onUnmounted(() => {
   window.removeEventListener("keydown", handleSearchShortcut, true);
   window.removeEventListener("keydown", handleSourceControlShortcut, true);
   window.removeEventListener("keydown", handleChatShortcut, true);
+  window.removeEventListener("keydown", handleDatabaseShortcut, true);
   window.removeEventListener("keydown", handleDebugShortcut, true);
   // 拆掉状态桥：它抓着编辑器实例和 model，留着就是泄漏
   provideEditorBridge(null);
@@ -5906,9 +6094,10 @@ watch(activeTabPath, async (path) => {
           :title="view.label"
           @click="toggleView(view.id)"
         >
-          <!-- ★ 不写 fill / stroke：三个都是 codicon，而 codicon 是**填充**图形。
-               统一在 CSS 的 `.activity-item svg` 里给 fill，模板里不重复三遍 -->
-          <svg viewBox="0 0 24 24" width="24" height="24">
+          <!-- ★ 不写 fill / stroke：四个都是 codicon，而 codicon 是**填充**图形。
+               统一在 CSS 的 `.activity-item svg` 里给 fill，模板里不重复四遍 -->
+          <!-- ⚠ viewBox 跟着图标走，不写死 —— codicon 有 16×16 和 24×24 两种网格 -->
+          <svg :viewBox="view.viewBox" width="24" height="24">
             <path :d="view.icon" />
           </svg>
         </button>
@@ -6208,6 +6397,61 @@ watch(activeTabPath, async (path) => {
           </div>
         </div>
 
+        <!-- 数据库视图。
+             ★ 两组：工作区里的 .db 文件 + **我们自己的搜索索引库**。
+               后者不是锦上添花 —— 实测这个项目的工作区里一个 .db 都没有，
+               少了那一组这个视图就是一片空白 -->
+        <div v-else-if="activeView === 'database'" class="sidebar-db">
+          <p v-if="dbBusy && !dbChecked" class="sidebar-empty">正在扫描…</p>
+          <p v-else-if="dbError && dbEntries.length === 0" class="tree-error">{{ dbError }}</p>
+
+          <template v-else-if="dbEntries.length > 0">
+            <template v-for="group in DB_GROUPS" :key="group.id">
+              <p v-if="entriesOf(group.id).length > 0" class="db-group">{{ group.label }}</p>
+
+              <div v-for="entry in entriesOf(group.id)" :key="entry.path" class="db-entry">
+                <button class="db-entry-head" type="button" @click="toggleDbEntry(entry.path)">
+                  <!-- 箭头沿用文件树的 codicon chevron；收起态同样是**同一张图转 -90°** -->
+                  <span class="arrow" :class="{ collapsed: !dbExpanded.has(entry.path) }">
+                    <svg viewBox="0 0 16 16" aria-hidden="true">
+                      <path :d="CHEVRON_DOWN" />
+                    </svg>
+                  </span>
+                  <span class="db-entry-name" :title="entry.path">{{ entry.name }}</span>
+                  <span class="db-entry-size">{{ formatBytes(entry.size) }}</span>
+                </button>
+
+                <div v-show="dbExpanded.has(entry.path)">
+                  <p v-if="dbBroken[entry.path]" class="tree-error">{{ dbBroken[entry.path] }}</p>
+                  <p
+                    v-else-if="(dbTables[entry.path] ?? []).length === 0"
+                    class="sidebar-empty"
+                  >
+                    这个库里没有表
+                  </p>
+                  <button
+                    v-for="table in dbTables[entry.path] ?? []"
+                    :key="table.name"
+                    class="db-table"
+                    type="button"
+                    :title="table.kind"
+                    @click="openDbTable(entry.path, table.name)"
+                  >
+                    <span class="db-table-name">{{ table.name }}</span>
+                    <span v-if="table.kind !== 'table'" class="db-table-kind">{{ table.kind }}</span>
+                  </button>
+                </div>
+              </div>
+            </template>
+          </template>
+
+          <p v-else class="sidebar-empty">没有找到数据库文件</p>
+
+          <p v-if="workspaceRoot && entriesOf('workspace').length === 0" class="sidebar-empty">
+            工作区里没有 .db / .sqlite 文件
+          </p>
+        </div>
+
       </aside>
 
       <!-- 侧栏和编辑区之间的分隔条：拖它改侧栏宽度。
@@ -6272,6 +6516,20 @@ watch(activeTabPath, async (path) => {
           </div>
           <div ref="diffContainer" class="diff-review-body"></div>
         </div>
+
+        <!-- 数据库浮层。
+             ★ 和 .diff-review 同一档（z-index: 2）：它同样**不依赖「有没有打开文件」**，
+               所以必须能盖住欢迎页（三层同档时按 DOM 顺序画，欢迎页在后面就赢了） -->
+        <!-- ⚠ key 用**库路径**：换库要重建（表清单、页码全得重来）；
+             换**表**不重建 —— 那一层由组件内部监听 props.table 处理 -->
+        <DatabasePanel
+          v-if="dbOpenPath"
+          :key="dbOpenPath"
+          :path="dbOpenPath"
+          :name="dbNameOf(dbOpenPath)"
+          :table="dbOpenTable"
+          @close="closeDbPanel"
+        />
 
         <!-- 图片预览层：盖在 Monaco 上面（定位基准是 .editor-area）。
              它不算「另一种标签」—— 标签栏里还是同一个 path，
@@ -7323,6 +7581,128 @@ watch(activeTabPath, async (path) => {
   margin: 12px 16px;
   color: var(--color-text-dim);
   font-size: 12px;
+}
+
+/* ---------- 数据库视图 ---------- */
+
+/* 和 .sidebar-tree / .sidebar-scm 同一套职责：吃掉剩余高度，自己滚 */
+.sidebar-db {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+.db-group {
+  margin: 10px 12px 4px;
+  color: var(--color-text-dim);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+}
+
+/* 一个库那一行：箭头 + 名字 + 大小 */
+.db-entry-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  padding: 2px 8px;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.db-entry-head:hover {
+  background: var(--color-hover);
+}
+
+/* 箭头那一格沿用文件树的做法：固定 12px 宽 + 10px 的图（小了才「细」） */
+.db-entry-head .arrow {
+  flex: 0 0 12px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.db-entry-head .arrow svg {
+  width: 10px;
+  height: 10px;
+  /* codicon 是填充图形，没有 stroke */
+  fill: currentColor;
+  opacity: 0.85;
+}
+
+/* 收起态 = 同一张图转 -90°（和文件树一致） */
+.db-entry-head .arrow.collapsed svg {
+  transform: rotate(-90deg);
+}
+
+.db-entry-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.db-entry-size {
+  flex: 0 0 auto;
+  color: var(--color-text-dim);
+  font-size: 10px;
+  /* 等宽数字：不同库的大小位数不同，等宽才不会左右抖 */
+  font-variant-numeric: tabular-nums;
+}
+
+/* 表：比库名再缩进一级，形成层级 */
+.db-table {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 2px 8px 2px 24px;
+  border: none;
+  background: transparent;
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.db-table:hover {
+  background: var(--color-hover);
+}
+
+.db-table-name {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* 视图 / 虚表跟一个灰色小标签 —— 「表」是默认情况，不用标 */
+.db-table-kind {
+  flex: 0 0 auto;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--color-sash-dot);
+  color: var(--color-text-emphasis);
+  font-size: 10px;
+}
+
+/* 展开区的提示文字缩进到和表名齐平 ——
+   否则一句「这个库里没有表」会顶到最左边，看起来像是库名的一部分 */
+.db-entry .tree-error,
+.db-entry .sidebar-empty {
+  margin: 2px 12px 2px 24px;
+  font-size: 11px;
 }
 
 /* ---------- 源代码管理视图 ---------- */
