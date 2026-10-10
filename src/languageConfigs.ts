@@ -15,6 +15,7 @@
 
 import * as monaco from "monaco-editor";
 import { invoke } from "@tauri-apps/api/core";
+import { parseJsonc } from "./jsonc";
 
 /**
  * JSON 里的正则字段是**字符串**，而 Monaco 要 `RegExp` 对象。
@@ -139,7 +140,9 @@ export async function loadLanguageConfigurations(): Promise<void> {
 
     try {
       const raw = await invoke<string>("read_file", { path: entry.path });
-      configs.set(entry.id, toMonacoConfig(JSON.parse(raw) as Record<string, unknown>));
+      // ★ 用 parseJsonc 而不是 JSON.parse：这些文件**允许写注释**，
+      //   实测本机有 3 份（rnc / vue / markdown）因此整个被跳过
+      configs.set(entry.id, toMonacoConfig(parseJsonc(raw) as Record<string, unknown>));
     } catch (error) {
       // 单份读失败 / 不是合法 JSON 都跳过 —— 一百多份里有一份坏的，
       // 不该让其它语言的打字行为一起没
