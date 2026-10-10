@@ -2755,6 +2755,105 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
     因为 PowerShell 里 `@($null).Count` 等于 **1**。
     ⇒ **空结果的断言不能靠计数**
 
+- [x] **数据库视图（侧栏 + 表数据 / 关系图 / SQL 三个标签）**：
+  数据流：侧栏（库 → 表）→ 点一张表 → 浮层；浮层里三个标签共用「当前库 + 当前表」
+  ★★ **前端做成浮层，不是标签页** —— 标签页那套结构的底层假设是
+    「一个路径 = 一个文件」（`openTabs` 是 `string[]`、model 按路径存、脏状态、
+    另存为要搬家……），而一个「库」不是文件、一个「表」更不是路径，
+    硬塞进去要给每一处加特例。和图片预览 / 欢迎页 / diff 审阅一样走浮层，
+    `openTabs` 一行没改
+  ★ **Rust 侧单开 `src-tauri/src/db.rs`，不和 `searchdb.rs` 混** ——
+    那个管的是「**我们**建的那个索引库」（连接常驻、有增量同步、有字节上限），
+    这个管的是「**用户**想看的任意一个 SQLite 文件」（一次一个连接、用完就放）
+  ★★ **探测「是不是 SQLite」不能用 `SELECT sqlite_version()`**：
+    SQLite 是**惰性打开**的，那个查询不读数据页 ⇒ 对一个纯文本文件**也会成功**
+    （把它当成一个空库）⇒ 用户会看到「0 张表的空库」而以为是坏了。
+    必须去碰一下目录表（`SELECT count(*) FROM sqlite_master`）
+  ★★ **数行数必须带上限**：一张千万行的表会把界面卡死，而我们只需要「大概多少」
+    来算分页。做法是 `SELECT count(*) FROM (SELECT 1 FROM t LIMIT N+1)` ——
+    子查询里的 `LIMIT` 才有用（`count(*)` 只返回一行，外面的 `LIMIT` 是废的），
+    而 `N+1` 是为了分辨「刚好到上限」和「超过上限」。
+    超上限时返回「上限值 + capped 标记」，界面显示成 `100000+`。
+    ⚠ 少了那个标记，分页会算成「一共 100000 行」⇒ **最后几页用户翻不到**，
+      而且不知道为什么
+  ⚠ **表名进不了绑定参数，只能拼进 SQL** ⇒ 一律过 `quote_ident`
+    （双引号转义成两个）。`PRAGMA table_info / index_list / index_info` 同理
+  ★★ **`db_index_files` 这个命令是必须的**：它列我们自己的索引库
+    （`appDataDir/index/*.db`）。实测这个项目的工作区里**一个 `.db` 都没有** ——
+    少了这一组，功能做完了打开也是一片空白
+    · 它顺手把 `x.db-wal` / `x.db-shm` 挡在外面：那两个的 `extension()`
+      是 `db-wal` 而不是 `db` ⇒ `looks_like_db` 天然挡掉。
+      ⚠ 不挡的话侧栏会多出两个看不懂的条目，而 `-wal` 有时候比主库还大
+    · 用「最近修改时间」排序，活动的工作区排最前（文件名是哈希，看不出哪个是当前的）
+  ★ **关系图画的是「结构图」而不是 ER 图**（我们的库里没有外键可画）：
+    主表在左，它的索引和 FTS5 影子表在右，中间连线。
+    SQLite 库里「一个表名背后其实有好几张表」这件事，光看表清单是看不出来的 ——
+    实测索引库的 `fts` 虚表背后有 `fts_data` / `fts_idx` / `fts_docsize` /
+    `fts_config` / `fts_content` 五张影子表
+    ★ 布局自己算（简单的两列网格），不做力导向 —— 那需要的代码比这个视图本身还多
+  ★★ **活动栏图标顺手加了个 `viewBox` 字段**：codicon 有**两种网格** ——
+    `database` 是 **16×16**，而 `files` / `search-large` / `source-control` /
+    `debug-alt` 是 24×24。模板里写死 `viewBox="0 0 24 24"` 的话，
+    16×16 那个路径只会占满**左下角一块**（约六分之四的面积），
+    看起来是「小了一圈、还偏了」
+    ⚠ 抄图标之前先看 svg 上的 `viewBox` —— 这条笔记早就写过，这次又用上了
+  ★ `src/components/DbGrid.vue` 单独一个组件（表数据 / SQL 结果两处都用）：
+    **NULL 和空字符串必须能区分**（SQL 里它们是两回事）—— NULL 写成灰色的斜体 `NULL`，
+    都渲染成空白的话用户会以为数据丢了
+  ★ `src/format.ts` 也是为这个加的（字节数换算两处要用）—— 理由同 pathUtils / fuzzy
+  ★ 快捷键 `Ctrl+Alt+D` + 「查看」菜单一项 + 欢迎页说明（三者一起出生）
+  ★ **每次切到该视图都重扫**（`watch(activeView)`），不加「刷新」按钮：
+    「切过来就是新的」没有学习成本，而扫描只是递归 readdir（毫秒级）。
+    用 watch 而不是在 `toggleView` 里加分支 —— 设置 `activeView` 的地方有好几处
+
+  ✅ 验证（两层）：
+    · **浏览器 + 桩**：侧栏两组、展开懒加载、浮层三个标签、分页的 `offset=100`、
+      关系图节点类型计数、SQL 的读 / 写 / 报错三条路、`Ctrl+Alt+D` 切换 —— 全部通过
+    · **真窗口 + 真索引库**（8.6 MB）：8 张表（含 5 张 FTS5 影子表）、
+      `files` 的真实列 `id/path/mtime/size/indexed` + 115 行真数据、
+      关系图 12 节点 9 连线（含 `sqlite_autoindex_files_1` 这种自动索引）、
+      `SELECT count(*)` = 115、语法错原样显示
+    · 5 个 Rust 测试全过（转义 / wal 排除 / 非 SQLite 拒绝 / 行数上限 / 端到端读写）
+
+  ⚠ ★★ **验证脚本自己踩的三个坑（都表现为「看起来功能坏了」）**：
+    · **`Runtime.evaluate` 的表达式里不能出现反引号** —— 那个表达式整个是包在
+      模板字符串里的，而我在**中文注释**里写了 `` `.db-meta` `` 这种，
+      于是模板字符串提前结束，报出来的是 `SyntaxError: missing )` /
+      `ReferenceError: meta is not defined` 这种**完全指不到原因**的错。
+      ⇒ 表达式里的注释也不要用反引号
+    · **真窗口的页面已经加载完了** ⇒ `Page.addScriptToEvaluateOnNewDocument`
+      对它**无效**（注册了也等于没注册，不报错）。要在当前文档里直接包一次
+    · **断言要边跑边打印**：只在最后统一输出的话，中途一崩就什么都看不到 ——
+      实测因此浪费了一轮（完全不知道前面的侧栏 / 表清单到底过没过）
+    · 顺带：**上一轮跑崩时留下的界面状态会骗人** —— 浮层停在 SQL 标签上，
+      而重开**同一个库**时组件的 `:key` 没变 ⇒ 状态被保留 ⇒
+      这一轮测到的其实是上一轮的残留（表格里显示的是 `sqlite_master` 的查询结果，
+      看起来像「表数据读错了」）⇒ 脚本开头先 `Page.reload`
+
+- [x] **语言配置改用容忍注释的 JSON 解析（JSONC）**：
+  起因是启动日志里那三行 `[语言配置] xxx 加载失败（已跳过）：SyntaxError:
+  Unexpected token '/'`
+  ★★ **VS Code 的 `language-configuration.json` 允许写注释**（按 JSONC 对待），
+    而 `JSON.parse` 会因此把**整份文件**跳过 ⇒ 那几种语言拿不到
+    「注释符 / 括号补全 / 回车缩进」这些配置。
+    而症状只是「Ctrl+/ 出来的是 `//`」，**不报错、不崩**
+  ★ 实测本机 82 份里有 **3 份**：`rnc`（redhat.vscode-xml）、
+    `vue` 和 `markdown`（都在 vue.volar 里）
+  ★★ **不能直接用正则删 `//`**：`"lineComment": "//"` 这种东西在语言配置里
+    **遍地都是**（注释符本身就是 `//`），一删那一行就少个引号、整份文件语法错。
+    必须扫一遍并记住「现在在不在字符串里」（转义符要连后面那个字符一起吞，
+    否则 `\"` 会被当成字符串结束）
+  ★★ 顺带纠正一个想当然：**按固定文件名 `language-configuration.json` 是找不到
+    这些文件的** —— `contributes.languages[].configuration` 写的是**任意路径**。
+    Volar 那两份叫 `vue-language-configuration.json` /
+    `markdown-language-configuration.json`。
+    ⇒ 想找「应用到底会加载哪些」，就得照它自己的逻辑走（读扩展清单的那个字段）。
+      第一版按文件名搜，一份真失败的都没搜到，于是「修复有没有用」那条断言
+      只能空手而归
+  ✅ 验证：10 个构造用例（含**字符串里的 `//`**、URL 里的 `//`、
+    转义的引号、`//` 出现在注释里等关键点）+ 3 份**真实**的失败文件
+    （`JSON.parse` 全失败、`parseJsonc` 全成功）
+
 ### 待办（按优先级）
 
 > **⏳ 方案 B：把「语法 / 主题 / 片段的来源」做成三级兜底（2026-10-08 记下的待办）**
@@ -3583,6 +3682,17 @@ curl.exe -sS -o NUL --noproxy "*" --max-time 12 -w "%{http_code}" `
 git -c http.curloptResolve=github.com:443:140.82.112.3 push origin main
 git -c http.curloptResolve=github.com:443:140.82.112.3 push origin v1.0.0
 ```
+★★ **那个 IP 是会变的，别照着上一次抄** —— 2026-10-08 再推时，
+`20.205.243.166` 变成了「curl 能拿到 200、但 git 死活连不上」，
+而 `140.82.114.3` 一次就通。**每次先测一遍**（上面那三行），
+再把能用的那个填进 `curloptResolve`。
+⚠ ★ 而且「curl 通」**不等于**「git 通」：同一个 IP 上
+`curl --resolve` 返回 200，而 `git -c http.curloptResolve=...` 报
+`Failed to connect ... port 443`。两者走的细节不同，
+所以别拿 curl 的结果当结论 —— 它只能用来**筛掉**明显不通的 IP
+⚠ 顺手记一笔：这台机器上 Clash **关着**的时候
+`-c http.proxy=http://127.0.0.1:7897` 报的是「拒绝连接」（不是超时）——
+那是「代理没在跑」，而不是「代理后面不通」。两者的处理方向正好相反
 实测一次成功（`dbf8761..8185fc2 main -> main`、`[new tag] v1.0.0`）。
 `http.curloptResolve` 是 git 暴露出来的 curl `CURLOPT_RESOLVE`，
 **只对这一次命令生效**、不写进任何配置 —— 正好适合「网络偶尔坏一下」这种场景。
