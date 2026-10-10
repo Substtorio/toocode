@@ -572,7 +572,11 @@ interface ThemeEntry {
  */
 async function loadVscodeThemes() {
   try {
-    const entries = await invoke<ThemeEntry[]>("scan_theme_extensions");
+    const loaded = await invoke<ThemeEntry[] | null>("scan_theme_extensions");
+    // ⚠ **形状要自己验**：`invoke` 回 `null` 不会抛异常，而下面 `.length` / `.find`
+    //   会崩 —— 而这个函数在 `onMounted` 的 await 链上，
+    //   崩了会把后面**所有**初始化（包括 hot exit 恢复）一起带走
+    const entries = Array.isArray(loaded) ? loaded : [];
     // 这条日志放在**前端**而不是 Rust 里：Rust 那边用 println! 只会打到 dev 终端，
     // 前端的「输出」面板收不到 —— 而面板才是用户看日志的地方。
     // （下面 `wanted` 只挑了两个用，所以这里特别说明扫到的总数）
@@ -1611,13 +1615,27 @@ function unwatchDirtyState(path: string) {
 //   退出时写法看似干净，但**活不过崩溃和任务管理器强杀** ——
 //   而那恰恰是最需要它的场景。VS Code 也是这个思路（定期备份到 backups 目录）。
 //
-// ⚠ 局限：localStorage 有容量上限（几 MB）且只能存字符串。
-//   真要更稳得写文件（Tauri 的 appDataDir），那是另一套东西
-const HOT_EXIT_KEY = "new_vscode:hotExit";
+// ★★ 存哪儿：`appDataDir/toocode.session.json`，**不是 localStorage**。
+//   原来放 localStorage，问题是它有容量上限（几 MB）而且**写失败是静默的** ——
+//   配额一满，未保存的内容就再也没被备份上，而用户以为自己被保护着。
+//   丢的是**没保存的代码**，这是整个项目里最不能出错的一处。
+//   （聊天记录当初从 localStorage 搬到文件，也是同一个理由）
+// ★ Rust 只搬原始文本（`load_session` / `save_session`），解析留在这儿 ——
+//   和 chats 同一套分工：形状是前端的事，加字段不用重编 Rust
 
-/** 备份里最多放几个文档、加起来多少字符 —— 不能无限往里塞 */
+/** 老版本的 key。★ 只为了把还在里面的内容接出来，读完就删 */
+const LEGACY_HOT_EXIT_KEY = "new_vscode:hotExit";
+
+/** 备份里最多放几个文档 */
 const HOT_EXIT_MAX_DOCS = 20;
-const HOT_EXIT_MAX_CHARS = 500_000;
+/**
+ * 单个文档的上限。
+ * ★ 改成文件之后可以比 localStorage 时代宽很多
+ *   （那会儿是**总量** 50 万字符，再大就写不进去了）
+ */
+const HOT_EXIT_MAX_DOC_CHARS = 2_000_000;
+/** 加起来的上限 —— 再大就不该指望「重启恢复」了 */
+const HOT_EXIT_MAX_CHARS = 8_000_000;
 
 interface HotExitDoc {
   path: string;
@@ -1630,15 +1648,16 @@ interface HotExitSnapshot {
 }
 
 /**
- * 读备份。**读进来的一律先当它可能是坏的** ——
+ * 把一段原始文本解析成快照。
+ * **读进来的一律先当它可能是坏的** ——
  * 手改过、写到一半断电、被别的版本写过，都可能让它不是我们要的形状
  */
-function readHotExit(): HotExitSnapshot | null {
-  const raw = window.localStorage.getItem(HOT_EXIT_KEY);
-  if (!raw) return null;
+function parseHotExit(raw: string | null): HotExitSnapshot | null {
+  if (raw === null || raw === "") return null;
 
   try {
     const parsed: unknown = JSON.parse(raw);
+    // ⚠ `typeof null === "object"` —— 这两个判断都不能省
     if (typeof parsed !== "object" || parsed === null) return null;
 
     const snapshot = parsed as Partial<HotExitSnapshot>;
@@ -1661,42 +1680,91 @@ function readHotExit(): HotExitSnapshot | null {
   }
 }
 
+/**
+ * 读备份（从文件）。
+ *
+ * ★★ 顺便把**老版本存在 localStorage 里的那份接出来**：不然用户一升级，
+ *   磁盘上还没有这个文件，他上次没保存的内容就没了。
+ *   ⚠ 只在文件里没有内容时才看老 key —— 而且接出来就**立刻删掉并写成文件**，
+ *     否则「打开应用、什么都不改、再关掉」之后它又没了
+ */
+async function readHotExit(): Promise<HotExitSnapshot | null> {
+  let raw: string | null = null;
+  try {
+    raw = await invoke<string>("load_session");
+  } catch (error) {
+    console.warn(`[hot exit] 读会话备份失败（不影响新编辑）：${String(error)}`);
+  }
+
+  const fromFile = parseHotExit(raw);
+  if (fromFile !== null) return fromFile;
+
+  const legacy = window.localStorage.getItem(LEGACY_HOT_EXIT_KEY);
+  if (legacy === null) return null;
+
+  window.localStorage.removeItem(LEGACY_HOT_EXIT_KEY);
+  const migrated = parseHotExit(legacy);
+  if (migrated === null) return null;
+
+  console.log("[hot exit] 接出了旧版存在 localStorage 里的备份，以后改存文件");
+  // ★ 不等它回来：这只是「顺手搬个家」，搬不成下次还会再搬一次
+  void saveHotExit(migrated);
+  return migrated;
+}
+
 /** 把当前所有「脏」文档收集起来 */
 function collectDirtyDocs(): HotExitDoc[] {
   const docs: HotExitDoc[] = [];
   let chars = 0;
+  let skipped = 0;
 
   for (const path of dirtyPaths.value) {
     const model = models.get(path);
     if (!model) continue;
 
     const content = model.getValue();
-    // 太大的不进备份：为了一个超大文件把整个备份写崩（配额报错）不划算
-    if (chars + content.length > HOT_EXIT_MAX_CHARS) continue;
+    if (
+      content.length > HOT_EXIT_MAX_DOC_CHARS ||
+      chars + content.length > HOT_EXIT_MAX_CHARS
+    ) {
+      skipped += 1;
+      continue;
+    }
 
     chars += content.length;
     docs.push({ path, content });
     if (docs.length >= HOT_EXIT_MAX_DOCS) break;
   }
 
+  // ★ 跳过的时候**必须说出来**。上一版是静默丢的 ——
+  //   用户以为「没保存也没关系」，结果崩溃之后那个文件真没了。
+  //   而「东西不见了但没报错」是这个项目里最怕的一类失效
+  if (skipped > 0) {
+    console.warn(`[hot exit] 有 ${skipped} 个文件超过备份上限，没有进备份`);
+  }
+
   return docs;
 }
 
-/** 备份当前所有脏文档。没脏的就直接把备份删掉 */
+/**
+ * 把快照写进文件。
+ * ★ 刻意**不抛异常、也不等它回来**：调用方一个在防抖里、一个在 beforeunload 里，
+ *   都不该被存盘拖住。但失败**要说出来**（上一版是静默 catch 的）
+ */
+function saveHotExit(snapshot: HotExitSnapshot | null): Promise<void> {
+  // 没东西要备份时写一个 `null` —— 读到它和「文件不存在」是一个效果
+  const data = snapshot === null ? "null" : JSON.stringify(snapshot);
+  return invoke<void>("save_session", { data }).catch((error: unknown) => {
+    console.warn(`[hot exit] 备份失败（不影响编辑本身）：${String(error)}`);
+  });
+}
+
+/** 备份当前所有脏文档 */
 function writeHotExit() {
   const docs = collectDirtyDocs();
-
-  try {
-    if (docs.length === 0) {
-      window.localStorage.removeItem(HOT_EXIT_KEY);
-      return;
-    }
-    const snapshot: HotExitSnapshot = { active: activeTabPath.value, docs };
-    window.localStorage.setItem(HOT_EXIT_KEY, JSON.stringify(snapshot));
-  } catch {
-    // 写不进去（配额满了、隐私模式）就算了。
-    // ★ hot exit 是「锦上添花」，绝不能因为它把编辑本身搞崩
-  }
+  const snapshot: HotExitSnapshot | null =
+    docs.length === 0 ? null : { active: activeTabPath.value, docs };
+  void saveHotExit(snapshot);
 }
 
 // 防抖定时器：连续敲键盘时，不要每敲一下就序列化一遍
@@ -1716,8 +1784,8 @@ function scheduleHotExitBackup() {
  * 恢复出来的文档**一律标成脏**：它们的内容还没落盘，
  * 必须让关窗口时的确认框认得它们
  */
-function restoreHotExit() {
-  const snapshot = readHotExit();
+async function restoreHotExit() {
+  const snapshot = await readHotExit();
   if (!snapshot) return;
 
   for (const doc of snapshot.docs) {
@@ -2144,7 +2212,9 @@ interface SnippetEntry {
 
 async function loadSnippets() {
   try {
-    const entries = await invoke<SnippetEntry[]>("scan_snippet_extensions");
+    // ⚠ 同样的形状校验，理由见 `loadVscodeThemes`
+    const loaded = await invoke<SnippetEntry[] | null>("scan_snippet_extensions");
+    const entries = Array.isArray(loaded) ? loaded : [];
     if (entries.length === 0) return;
 
     // ★ 同一份文件可能服务多个语言，所以按**路径**缓存读取结果，
@@ -2219,7 +2289,9 @@ async function loadSnippets() {
 async function loadSyntaxExtensions() {
   try {
     // 只扫元数据：语言 id / scopeName / 文件路径 / 管哪些扩展名
-    const entries = await invoke<GrammarEntry[]>("scan_grammar_extensions");
+    // ⚠ 同样的形状校验，理由见 `loadVscodeThemes`
+    const loaded = await invoke<GrammarEntry[] | null>("scan_grammar_extensions");
+    const entries = Array.isArray(loaded) ? loaded : [];
 
     // scopeName → 语法文件路径。
     // ★ 这一遍**必须包含所有语法**（包括那些没写 language 的「注入语法」），
@@ -5238,7 +5310,10 @@ onMounted(async () => {
 
   // 把上次没保存完的内容接回来。
   // 放在这里（而不是放到最后）是为了：即使下面注册关闭监听失败了，恢复也已经做完
-  restoreHotExit();
+  // ⚠ 现在它是**异步**的（备份在文件里，要过一次 IPC），所以要 await ——
+  //   不等的话后面那段「注册关闭监听」会跑在恢复之前，
+  //   而恢复会新建 model / 标脏，那些都该在监听装好之前完成
+  await restoreHotExit();
 
   // Ctrl+R 刷新 / 关窗前浏览器会派发 beforeunload ——
   // 在这里**同步**补一次备份，免得「刚敲完就刷新」丢掉最后那几百毫秒

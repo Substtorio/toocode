@@ -2085,16 +2085,16 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("toocode.chats.json");
 
-        // ① 文件还不存在 ⇒ 空列表，而不是报错
-        assert_eq!(read_chats(&path).unwrap(), "[]");
+        // ① 文件还不存在 ⇒ 用 fallback，而不是报错
+        assert_eq!(read_json_file(&path, "[]").unwrap(), "[]");
 
         // ② 写一次再读回来
-        write_chats(&path, r#"[{"id":"a"}]"#).unwrap();
-        assert_eq!(read_chats(&path).unwrap(), r#"[{"id":"a"}]"#);
+        write_json_file(&path, r#"[{"id":"a"}]"#).unwrap();
+        assert_eq!(read_json_file(&path, "[]").unwrap(), r#"[{"id":"a"}]"#);
 
         // ③ ★ 连着写第二次（覆盖）
-        write_chats(&path, r#"[{"id":"b"}]"#).unwrap();
-        assert_eq!(read_chats(&path).unwrap(), r#"[{"id":"b"}]"#);
+        write_json_file(&path, r#"[{"id":"b"}]"#).unwrap();
+        assert_eq!(read_json_file(&path, "[]").unwrap(), r#"[{"id":"b"}]"#);
 
         // ④ 临时文件不该留在磁盘上
         assert!(!path.with_extension("json.tmp").exists());
@@ -2997,65 +2997,97 @@ async fn chat_stream(
     Ok(())
 }
 
-// ---------- 聊天记录（Topilot 的「会话」）----------
+// ---------- 聊天记录（Topilot 的「会话」）+ 会话备份（hot exit）----------
+//
+// ★ 两个文件、**同一套读写实现**：它们都是「前端给一段 JSON 文本，Rust 原样存」。
+//   合一个文件不行 —— 一个坏了不该牵连另一个
 
-/// 聊天记录放哪儿：`appDataDir/toocode.chats.json`
-fn chats_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+/// 应用数据目录（不存在就建）。两个文件都要用它，所以抽出来
+fn app_data_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     use tauri::Manager;
     let dir = app
         .path()
         .app_data_dir()
         .map_err(|err| format!("拿不到应用数据目录：{err}"))?;
     std::fs::create_dir_all(&dir).map_err(|err| format!("建目录失败：{err}"))?;
-    Ok(dir.join("toocode.chats.json"))
+    Ok(dir)
 }
 
-/// 读聊天记录。**返回原始 JSON 文本**，解析留给前端。
+/// 聊天记录放哪儿：`appDataDir/toocode.chats.json`
+fn chats_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("toocode.chats.json"))
+}
+
+/// hot exit 的会话备份放哪儿：`appDataDir/toocode.session.json`
+fn session_file(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(app_data_dir(app)?.join("toocode.session.json"))
+}
+
+/// 读一个 JSON 文件。**返回原始文本**，解析留给前端。
 ///
-/// ★★ 为什么不放 localStorage：它有容量上限，而且和 hot exit **共用**同一个配额 ——
-///   聊天记录一多，未保存内容的备份就会**静默**写失败。
-///   丢聊天记录只是烦，丢未保存的代码是真事故
+/// ★★ 为什么不放 localStorage（hot exit 原来就在那里）：它有容量上限，
+///   而且和聊天记录**共用**同一个配额 —— 未保存代码的备份一旦**静默**写失败
+///   （QuotaExceededError 被 catch 掉），用户会以为已经备份了，然后真的丢代码。
+///   写文件没有这个天花板，而且失败能被看见
 ///
-/// ★ 和 `chat_stream` 一样的分工理由：会话的结构是前端的事，
-///   以后加个字段不用重编 Rust（把结构体写在这儿就得跟着改）
-fn read_chats(path: &Path) -> Result<String, String> {
+/// ★ 文件还不存在是**正常**的（第一次用），不是错误 ——
+///   算报错的话调用方还得先判断「是不是第一次」，很啰嗦。
+///   所以缺省时给 `fallback`（聊天记录要 `"[]"`，会话备份要 `"null"`）
+/// ★ 错误信息里带上**路径**：真出问题时（权限 / 磁盘满）
+///   光说「读失败」指不到地方
+fn read_json_file(path: &Path, fallback: &str) -> Result<String, String> {
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(text),
-        // ★ 文件还不存在是**正常**的（第一次用），不是错误 ——
-        //   算报错的话调用方还得先判断「是不是第一次」，很啰嗦
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok("[]".to_string()),
-        Err(error) => Err(format!("读聊天记录失败：{error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(fallback.to_string()),
+        Err(error) => Err(format!("读 {} 失败：{error}", path.display())),
     }
 }
 
-/// 写聊天记录。
+/// 写一个 JSON 文件。
 ///
 /// ★ 先写临时文件再改名，而不是直接覆盖：
 ///   直接覆盖的话，写到一半被打断（崩溃 / 强杀）会留下一个**半截的 JSON**，
 ///   下次启动就整个读不出来了。改名是「要么全有要么全无」的 ——
 ///   最坏情况也只是回到上一个版本
-fn write_chats(path: &Path, data: &str) -> Result<(), String> {
+fn write_json_file(path: &Path, data: &str) -> Result<(), String> {
     let temp = path.with_extension("json.tmp");
-    std::fs::write(&temp, data).map_err(|err| format!("写聊天记录失败：{err}"))?;
+    std::fs::write(&temp, data).map_err(|err| format!("写临时文件失败：{err}"))?;
 
     // ⚠ Windows 上 `rename` **不能覆盖已存在的文件**（会报 AlreadyExists），
     //   所以得先把目标删掉。中间那一瞬间文件是不存在的 —— 可接受：
     //   真在那时崩了，最多丢掉这一次改动，不会留下一个坏文件
     if path.exists() {
-        std::fs::remove_file(path).map_err(|err| format!("替换聊天记录失败：{err}"))?;
+        std::fs::remove_file(path).map_err(|err| format!("替换 {} 失败：{err}", path.display()))?;
     }
-    std::fs::rename(&temp, path).map_err(|err| format!("保存聊天记录失败：{err}"))?;
+    std::fs::rename(&temp, path)
+        .map_err(|err| format!("保存 {} 失败：{err}", path.display()))?;
     Ok(())
 }
 
 #[tauri::command]
 fn load_chats(app: tauri::AppHandle) -> Result<String, String> {
-    read_chats(&chats_file(&app)?)
+    read_json_file(&chats_file(&app)?, "[]")
 }
 
 #[tauri::command]
 fn save_chats(app: tauri::AppHandle, data: String) -> Result<(), String> {
-    write_chats(&chats_file(&app)?, &data)
+    write_json_file(&chats_file(&app)?, &data)
+}
+
+/// 读 hot exit 的会话备份（文件不存在时回 `"null"`）
+#[tauri::command]
+fn load_session(app: tauri::AppHandle) -> Result<String, String> {
+    read_json_file(&session_file(&app)?, "null")
+}
+
+/// 写 hot exit 的会话备份
+///
+/// ⚠ 前端在 `beforeunload` 里**不等回复**就发了 —— 能不能落地取决于
+///   Tauri 的 IPC 在页面卸载时是否已经把消息递出去（实测过：能）。
+///   所以这个命令本身要**尽快返回**，不要在这里做多余的活
+#[tauri::command]
+fn save_session(app: tauri::AppHandle, data: String) -> Result<(), String> {
+    write_json_file(&session_file(&app)?, &data)
 }
 
 // ============================ 全文搜索 ============================
@@ -3555,6 +3587,8 @@ pub fn run() {
             chat_stream,
             load_chats,
             save_chats,
+            load_session,
+            save_session,
             git_status,
             git_show_head,
             lsp_servers,

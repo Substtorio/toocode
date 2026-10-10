@@ -328,10 +328,29 @@ export async function disposeLsp(): Promise<void> {
  *   （VS Code 自带的 json / css / html，PATH 里的 rust-analyzer ……）
  *   是**环境事实**，只有扫描知道
  */
+/**
+ * 拿（必要时读一次）语言服务器清单。
+ *
+ * ⚠ **形状要自己验**：`invoke` 回 `null` 不会抛异常，所以调用方的 try/catch 接不住它 ——
+ *   而下游的 `for...of` / `.find` 会直接崩。两个调用点都在**启动链**上
+ *   （App 打开工作区时就会问），崩了会把 `onMounted` 后面所有初始化一起带走。
+ *   ★ 教训：**有 try/catch 不等于安全** —— 先确定「失败」是抛出来的还是返回的
+ *   （同一个坑在 `dap.availableAdapters` 和 `languageConfigs` 上都踩过）
+ *
+ * ⚠ 这个 helper 是「顺路加进来的」，所以它夹在了**下面那个导出函数**的文档注释
+ *   和函数体之间 —— 上面那一大段讲的是 `availableServerLanguages`，别被顺序骗了
+ */
+async function loadServers(): Promise<LspServerInfo[]> {
+  if (serverCache === null) {
+    const loaded = await invoke<LspServerInfo[] | null>("lsp_servers");
+    serverCache = Array.isArray(loaded) ? loaded : [];
+  }
+  return serverCache;
+}
+
 export async function availableServerLanguages(): Promise<string[]> {
-  serverCache ??= await invoke<LspServerInfo[]>("lsp_servers");
   const all = new Set<string>();
-  for (const server of serverCache) {
+  for (const server of await loadServers()) {
     for (const language of server.languages) all.add(language);
   }
   return [...all];
@@ -346,8 +365,7 @@ export async function availableServerLanguages(): Promise<string[]> {
 export async function openDocument(path: string, languageId: string): Promise<void> {
   if (host === null) return;
 
-  serverCache ??= await invoke<LspServerInfo[]>("lsp_servers");
-  const info = serverCache.find((server) => server.languages.includes(languageId));
+  const info = (await loadServers()).find((server) => server.languages.includes(languageId));
   if (info === undefined) return; // 这个语言没有服务器，正常
 
   let session = sessions.get(info.id);

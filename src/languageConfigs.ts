@@ -112,7 +112,15 @@ async function waitForLanguageIds(): Promise<Set<string>> {
 export async function loadLanguageConfigurations(): Promise<void> {
   let entries: Array<{ id: string; path: string }>;
   try {
-    entries = await invoke<Array<{ id: string; path: string }>>("scan_language_configurations");
+    const loaded = await invoke<Array<{ id: string; path: string }> | null>(
+      "scan_language_configurations",
+    );
+    // ★★ 形状要自己验：`invoke` 回 `null` **不会**抛异常，所以上面的 `catch` 接不住它
+    //   —— 而 `for...of null` 会抛，**直接把 onMounted 从那里斩断**，
+    //   后面那些「锦上添花」的初始化（包括 hot exit 恢复）就全都不跑了。
+    //   ★ 教训：**有 try/catch 不等于安全** —— 先确定「失败」是抛出来的还是返回的。
+    //   （`dap.availableAdapters` 上踩过一模一样的坑）
+    entries = Array.isArray(loaded) ? loaded : [];
   } catch (error) {
     console.warn(`[语言配置] 扫描失败（不影响其它功能）：${String(error)}`);
     return;
