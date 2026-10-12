@@ -467,18 +467,67 @@ pub fn db_schema(path: String, table: String) -> Result<DbSchema, String> {
     })
 }
 
-/// 读一页数据
+/// 拿一张表**真实**的列名。
+///
+/// ★ 它是「排序字段」的白名单：排序的列名最终要拼进 SQL，而那是用户点列头来的
+///   （也就是从我们这儿发的，但链条上任何一环都不该被信任）
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, String> {
+    let mut statement = conn
+        .prepare(&format!("PRAGMA table_info({})", quote_ident(table)))
+        .map_err(|err| err.to_string())?;
+    let names = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|err| err.to_string())?
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(names)
+}
+
+/// 读一页数据，可以按某一列排序。
 ///
 /// ★ 分页靠 `LIMIT / OFFSET` 而不是把整张表读进来 ——
 ///   一张百万行的表读进来会直接把前端撑爆
+///
+/// ★★ 排序的列名**必须先过 `table_columns` 白名单**。
+///   `quote_ident` 的转义其实已经能防注入了（一个带引号的字符串转义之后
+///   整体仍然是一个标识符），但白名单能给出「表里没有列 xxx」这种**说得清**的错，
+///   而不是把 SQLite 那句 `no such column: xxx` 原样丢给用户
 #[tauri::command]
-pub fn db_rows(path: String, table: String, offset: i64, limit: i64) -> Result<DbRows, String> {
+pub fn db_rows(
+    path: String,
+    table: String,
+    offset: i64,
+    limit: i64,
+    order_by: Option<String>,
+    descending: Option<bool>,
+) -> Result<DbRows, String> {
     let conn = open(&path)?;
     let limit = limit.clamp(1, 500);
 
+    let order = match order_by {
+        Some(name) if !name.is_empty() => {
+            if !table_columns(&conn, &table)?.iter().any(|column| column == &name) {
+                return Err(format!("表 {table} 里没有列 {name}"));
+            }
+            // ★ `NULLS LAST` 是**有意**的：SQLite 默认把 NULL 当成最小值，
+            //   升序时一大堆 NULL 会顶在最前面，而看一张表时
+            //   「先看到有值的行」明显更有用
+            //   （`NULLS LAST` 要 SQLite 3.30+，我们用 bunded 的，版本固定）
+            format!(
+                " ORDER BY {} {} NULLS LAST",
+                quote_ident(&name),
+                if descending.unwrap_or(false) { "DESC" } else { "ASC" }
+            )
+        }
+        _ => String::new(),
+    };
+
+    // ⚠ 顺序不能乱：SQL 语法是 `SELECT … FROM … ORDER BY … LIMIT … OFFSET`，
+    //   把 ORDER BY 拼到 LIMIT 后面是语法错
     let sql = format!(
-        "SELECT * FROM {} LIMIT {} OFFSET {}",
+        "SELECT * FROM {}{} LIMIT {} OFFSET {}",
         quote_ident(&table),
+        order,
         limit,
         offset.max(0)
     );
@@ -650,15 +699,15 @@ mod tests {
         assert_eq!(schema.indexes[0].columns, vec!["body"]);
 
         // 分页：limit=2 只要 2 行，但 total 要说全（3 行）
-        let page = db_rows(file.clone(), "notes".to_string(), 0, 2).unwrap();
+        let page = db_rows(file.clone(), "notes".to_string(), 0, 2, None, None).unwrap();
         assert_eq!(page.columns, vec!["id", "body", "extra"]);
         assert_eq!(page.rows.len(), 2);
         assert_eq!(page.total, 3);
         assert!(!page.total_capped);
 
-        // ⚠ 不能断言「第 3 行是哪个」—— 没写 ORDER BY 时 SQLite 给的顺序不定（
-        //   正好是没写 ORDER BY 时该有的行为）。只数 NULL 有几个
-        let all = db_rows(file.clone(), "notes".to_string(), 0, 10).unwrap();
+        // ⚠ 不能断言「第 3 行是哪个」—— 没写 ORDER BY 时 SQLite 给的顺序不定
+        //   （正好是没写 ORDER BY 时该有的行为）。只数 NULL 有几个
+        let all = db_rows(file.clone(), "notes".to_string(), 0, 10, None, None).unwrap();
         assert_eq!(all.rows.len(), 3);
         assert_eq!(all.rows.iter().filter(|row| row[1].is_none()).count(), 1);
 
@@ -675,6 +724,58 @@ mod tests {
 
         // 语法错要让调用方拿到错误（而不是静默返回空结果）
         assert!(db_query(file, "SELECT FROM".to_string(), 10).is_err());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ordering_only_accepts_real_columns() {
+        let path = temp_path("order");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);
+                 INSERT INTO notes(id, body) VALUES (1, 'b'), (2, 'a'), (3, NULL);",
+            )
+            .unwrap();
+        }
+        let file = as_string(&path);
+
+        let asc = db_rows(file.clone(), "notes".to_string(), 0, 10, Some("id".to_string()), Some(false))
+            .unwrap();
+        assert_eq!(asc.rows[0][0], Some("1".to_string()));
+
+        let desc = db_rows(file.clone(), "notes".to_string(), 0, 10, Some("id".to_string()), Some(true))
+            .unwrap();
+        assert_eq!(desc.rows[0][0], Some("3".to_string()));
+
+        // ★ NULL 排最后（升序）—— 看一张表时先看到有值的行更有用。
+        //   没写 NULLS LAST 的话 SQLite 会把 NULL 当成最小值顶在最前面
+        let by_body = db_rows(file.clone(), "notes".to_string(), 0, 10, Some("body".to_string()), Some(false))
+            .unwrap();
+        assert_eq!(by_body.rows.first().unwrap()[1], Some("a".to_string()));
+        assert_eq!(by_body.rows.last().unwrap()[1], None);
+
+        // ★ 白名单：不存在的列要报一句人话，而不是把 SQLite 的
+        //   `no such column` 丢出去，更不能什么都不说就返回没排序的结果
+        let err = match db_rows(file.clone(), "notes".to_string(), 0, 10, Some("nope".to_string()), None) {
+            Ok(_) => panic!("不存在的列应该报错"),
+            Err(err) => err,
+        };
+        assert!(err.contains("没有列"), "错误信息不对：{err}");
+
+        // 注入尝试同样被白名单挡住 —— 而且表必须还在
+        assert!(db_rows(
+            file.clone(),
+            "notes".to_string(),
+            0,
+            10,
+            Some("id); DROP TABLE notes; --".to_string()),
+            None
+        )
+        .is_err());
+        let left = db_query(file, "SELECT count(*) FROM notes".to_string(), 10).unwrap();
+        assert_eq!(left.rows[0][0], Some("3".to_string()), "表被删掉了");
 
         let _ = std::fs::remove_file(&path);
     }

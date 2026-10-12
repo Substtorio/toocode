@@ -96,6 +96,9 @@ const schema = ref<DbSchema | null>(null);
 const page = ref(0);
 const rows = ref<DbRows | null>(null);
 const rowsBusy = ref(false);
+/** 当前按哪一列排（null = 数据库自己的顺序）。列名由后端过白名单再拼进 SQL */
+const orderBy = ref<string | null>(null);
+const descending = ref(false);
 
 const sql = ref("");
 const sqlResult = ref<DbQueryResult | null>(null);
@@ -161,6 +164,10 @@ async function loadInfo(): Promise<void> {
 async function selectTable(name: string): Promise<void> {
   activeTable.value = name;
   page.value = 0;
+  // ★ 排序也要清掉：换一张表之后，原来那一列很可能**不存在**
+  //   （不然后端会报「表里没有列 xxx」，而用户只是点了另一张表）
+  orderBy.value = null;
+  descending.value = false;
   await Promise.all([loadSchema(name), loadRows()]);
 }
 
@@ -185,6 +192,9 @@ async function loadRows(): Promise<void> {
       table: activeTable.value,
       offset: page.value * PAGE_SIZE,
       limit: PAGE_SIZE,
+      // 参数名走 camelCase，Tauri 会自己转成 snake_case（返回值它不管）
+      orderBy: orderBy.value,
+      descending: descending.value,
     });
   } catch (err) {
     error.value = err instanceof Error ? err.message : String(err);
@@ -197,6 +207,19 @@ async function loadRows(): Promise<void> {
 async function goPage(next: number): Promise<void> {
   if (next < 0 || next >= totalPages.value) return;
   page.value = next;
+  await loadRows();
+}
+
+/**
+ * 点了列头。
+ *
+ * ★ 必须**回到第一页**：排序一变，「第 3 页」就是完全另一批数据了 ——
+ *   不重置的话用户会以为「这一页怎么内容全变了」
+ */
+async function onSort(key: string | null, desc: boolean): Promise<void> {
+  orderBy.value = key;
+  descending.value = desc;
+  page.value = 0;
   await loadRows();
 }
 
@@ -476,7 +499,12 @@ onMounted(() => {
           <DbGrid
             :columns="rows?.columns ?? []"
             :rows="rows?.rows ?? []"
+            :offset="rows?.offset ?? 0"
+            sortable
+            :sort-key="orderBy"
+            :sort-descending="descending"
             :empty="rowsBusy ? '正在读取…' : '这张表还没有数据'"
+            @sort="onSort"
           />
         </div>
       </div>
@@ -554,6 +582,8 @@ onMounted(() => {
       </p>
 
       <div class="db-result-host">
+        <!-- ⚠ SQL 结果**不给**排序：那条语句是用户自己写的，要排序就在里面写 ORDER BY。
+             界面再插一手反而和他写的东西对不上 -->
         <DbGrid
           v-if="sqlResult && sqlResult.columns.length"
           :columns="sqlResult.columns"
