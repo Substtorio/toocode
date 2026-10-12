@@ -2830,6 +2830,30 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       这一轮测到的其实是上一轮的残留（表格里显示的是 `sqlite_master` 的查询结果，
       看起来像「表数据读错了」）⇒ 脚本开头先 `Page.reload`
 
+  ⭐ **补丁：点列头排序（三态）** ——
+    升序 → 降序 → **不排**（这一态是必须的：「按数据库自己的顺序看」是个真实需求，
+    尤其是翻了页之后想回到原样）
+    ★★ **排序的列名先过后端白名单**（拿 `PRAGMA table_info` 的真实列名比对）。
+      `quote_ident` 的转义其实已经能防注入了，但白名单能给出「表里没有列 xxx」
+      这种**说得清**的错，而不是把 SQLite 那句 `no such column` 原样丢给用户。
+      测试里专门试了一次注入（`id); DROP TABLE notes; --`）并断言**表还在**
+    ⚠★ **`ORDER BY` 要拼在 `LIMIT` 前面** —— SQL 语法是
+      `SELECT … FROM … ORDER BY … LIMIT … OFFSET`，顺序写反直接是语法错
+    ★ 加了 `NULLS LAST`：SQLite 默认把 NULL 当最小值，升序时一大堆 NULL
+      会顶在最前面，而看一张表时「先看到有值的行」明显更有用
+      （`NULLS LAST` 要 SQLite 3.30+，我们用的是 bundled 的，版本固定）
+    ★★ **排序后必须回到第 1 页** —— 不重置的话「第 3 页」在新顺序下是另一批数据，
+      而用户会以为内容莫名全变了
+    ★ 行号从「页内序号」改成**绝对行号**（`offset + 序号`）：翻到第二页
+      又看到 1、2、3，是看不出这是第 101 行的
+    ★ **SQL 标签的结果不给排序**：那条语句是用户自己写的，要排序就在里面写
+      `ORDER BY`，界面再插一手反而和他写的东西对不上
+    ✅ 实测（真窗口 + 真索引库）：升序 42→196 单调不减、降序 360836→133163
+      单调不增、三态切换、第 2 页行号 101、在第 2 页点排序后回到第 1 页、
+      SQL 结果表头不可排序
+    ⚠ 顺手又被 `vue-tsc` 抓到一个真错：`defineProps` 没赋给变量（`const props = …`），
+      模板里能用但**脚本里取不到 `props`** —— 这类错就该靠类型检查拦
+
 - [x] **语言配置改用容忍注释的 JSON 解析（JSONC）**：
   起因是启动日志里那三行 `[语言配置] xxx 加载失败（已跳过）：SyntaxError:
   Unexpected token '/'`
@@ -3735,6 +3759,16 @@ VS Code 里新开的终端，默认在**工作区根** `d:\code\Java\New_VScode`
 
 **都不是代码问题，是走错目录了。** 两种解法：`cd new_vscode`，
 或者写全路径 `npm run dev --prefix d:\code\Java\New_VScode\new_vscode`。
+
+⚠ ★★ **但 `cd xxx; npm run y` 这种一行写法会被工具「简化」掉**（2026-10-12 实测）：
+它把命令改写成了 `npm run tauri dev`，`cd` 直接没了 ⇒ 跑在工作区根 ⇒
+报的是 `ENOENT ... D:\code\Java\New_VScode\package.json`。
+⇒ 要一次说清目录，就用 `cmd` 自己带：
+```powershell
+cmd /c "cd /d d:\code\Java\New_VScode\new_vscode && npm run tauri dev"
+```
+（顺带：要先设的环境变量也写进那个 `cmd`：`&& set FOO=bar && npm run …` ——
+ 分两次发的话，第二条命令所在的 shell 不一定还是同一个）
 
 ### `Port 1420 is already in use` 不是故障
 
