@@ -125,13 +125,24 @@ const rowsLabel = computed(() => {
   return `第 ${rows.value.offset + (shown ? 1 : 0)}–${rows.value.offset + shown} 行 / 共 ${total} 行`;
 });
 
-/** `CREATE TABLE` 里的第一段注释当提示？不必 —— 摘要给列数和主键就够了 */
-const tableSummary = computed(() => {
-  const current = activeTable.value;
-  const found = info.value?.tables.find((item) => item.name === current);
-  if (!found) return "";
-  const columns = schemas.value[current]?.columns.length ?? 0;
-  return `${found.kind} · ${columns} 列`;
+/**
+ * 列名 → 表头下面那行小字（类型 / PK / NOT NULL / 默认值）。
+ *
+ * ★ 这些信息后端**早就返回了**（`db_schema`），只是之前一直没用 ——
+ *   而「这张表有哪些列、都是什么类型、哪些不能为空」恰恰是看一个库时
+ *   最先要问的事。现在直接摆在表头里，不用悬停
+ */
+const columnNotes = computed(() => {
+  const notes: Record<string, string> = {};
+  for (const column of schema.value?.columns ?? []) {
+    const parts: string[] = [];
+    if (column.type) parts.push(column.type);
+    if (column.primaryKey) parts.push("PK");
+    if (column.notNull) parts.push("NOT NULL");
+    if (column.defaultValue !== null) parts.push(`默认 ${column.defaultValue}`);
+    notes[column.name] = parts.join(" · ");
+  }
+  return notes;
 });
 
 // ---------- 读库 ----------
@@ -208,6 +219,17 @@ async function goPage(next: number): Promise<void> {
   if (next < 0 || next >= totalPages.value) return;
   page.value = next;
   await loadRows();
+}
+
+/** 输入页码回车。输入不合法（空的 / 不是数 / 越界）就夹回去，不报错 */
+function jumpToPage(event: KeyboardEvent): void {
+  const input = event.target as HTMLInputElement;
+  const wanted = Number(input.value.trim());
+  if (!Number.isFinite(wanted) || wanted < 1) {
+    input.value = String(page.value + 1);
+    return;
+  }
+  void goPage(Math.min(Math.round(wanted), totalPages.value) - 1);
 }
 
 /**
@@ -472,29 +494,65 @@ onMounted(() => {
             {{ item.name }}
           </option>
         </select>
-        <span class="db-meta">{{ tableSummary }}</span>
         <span class="db-meta">{{ rowsLabel }}</span>
         <div class="db-spacer"></div>
-        <button class="db-button" type="button" :disabled="page === 0 || rowsBusy" @click="goPage(page - 1)">
-          上一页
+        <button
+          class="db-button db-page"
+          type="button"
+          title="第一页"
+          :disabled="page === 0 || rowsBusy"
+          @click="goPage(0)"
+        >
+          «
         </button>
         <button
-          class="db-button"
+          class="db-button db-page"
           type="button"
+          title="上一页"
+          :disabled="page === 0 || rowsBusy"
+          @click="goPage(page - 1)"
+        >
+          ‹
+        </button>
+        <!-- ★ 带 `:key="page"`：跳转之后页码变了就重建这个框，
+             于是「输入 999 被夹到最后一页」时框里的值也会跟着对上。
+             不用 v-model 是因为那会每敲一个字符就去读一次数据 -->
+        <input
+          :key="page"
+          class="db-page-input"
+          type="text"
+          inputmode="numeric"
+          :value="page + 1"
+          title="跳到第几页，回车确认"
+          @keydown.enter="jumpToPage"
+        />
+        <span class="db-meta">/ {{ totalPages }}</span>
+        <button
+          class="db-button db-page"
+          type="button"
+          title="下一页"
           :disabled="page + 1 >= totalPages || rowsBusy"
           @click="goPage(page + 1)"
         >
-          下一页
+          ›
+        </button>
+        <button
+          class="db-button db-page"
+          type="button"
+          title="最后一页"
+          :disabled="page + 1 >= totalPages || rowsBusy"
+          @click="goPage(totalPages - 1)"
+        >
+          »
+        </button>
+        <button class="db-button" type="button" title="重新读这一页" :disabled="rowsBusy" @click="loadRows">
+          刷新
         </button>
       </div>
 
       <div class="db-body">
-        <!-- 列定义单独摆一条：表格里只有数据，看结构一眼就够 -->
-        <div v-if="schema && schema.columns.length" class="db-columns">
-          <span v-for="column in schema.columns" :key="column.name" class="db-column" :title="column.type">
-            <span v-if="column.primaryKey" class="db-pk">PK</span>{{ column.name }}
-          </span>
-        </div>
+        <!-- 列的类型 / PK / NOT NULL 现在直接排在表头里（见 DbGrid 的 columnNotes）——
+             以前这里单独占一行，而那个位置明显更该给数据 -->
         <div class="db-grid-host">
           <DbGrid
             :columns="rows?.columns ?? []"
@@ -503,6 +561,7 @@ onMounted(() => {
             sortable
             :sort-key="orderBy"
             :sort-descending="descending"
+            :column-notes="columnNotes"
             :empty="rowsBusy ? '正在读取…' : '这张表还没有数据'"
             @sort="onSort"
           />
@@ -729,24 +788,25 @@ onMounted(() => {
   flex-direction: column;
 }
 
-.db-columns {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 5px 8px;
-  border-bottom: 1px solid var(--color-menu-border);
-  background: var(--color-tabbar-bg);
+.db-page {
+  /* 翻页按钮窄一点：它是矢量符号，不需要文字那么宽 */
+  padding: 0 6px;
 }
 
-.db-column {
-  font-size: 11px;
-  color: var(--color-text-dim);
-}
-
-.db-pk {
-  margin-right: 3px;
-  color: var(--color-problem-warning, #cca700);
-  font-weight: 600;
+.db-page-input {
+  width: 46px;
+  height: 22px;
+  padding: 0 4px;
+  /* ★ 原生 input 是 content-box，select 是 border-box ——
+       不显式写的话两者并排会差 2px（踩过一次了） */
+  box-sizing: border-box;
+  border: 1px solid var(--color-menu-border);
+  border-radius: 3px;
+  background: var(--color-menu-bg);
+  color: var(--color-text);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: center;
 }
 
 .db-grid-host,
