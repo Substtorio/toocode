@@ -2510,6 +2510,18 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
       （如果只回退到上一次的备份，就说明没赶上）
     ⇒ 所以「防抖备份 + beforeunload 补一次」这个结构可以原样保留
 
+  ⚠ **关窗口时能看到一条 `IPC custom protocol failed … Failed to fetch`**
+    （从 `saveHotExit` → `writeHotExit` 发出来的）—— 此刻 WebView2 已经开始销毁，
+    IPC 通道断了（Tauri 会回落到 postMessage，但页面也在卸载）。
+    ★ **这条可以不管**，因为三条退路各自都成立：
+      · 有脏文件时关闭**一定**会弹确认框 —— 「全部保存」已存盘、
+        「不保存」是**故意**丢弃（两边都不需要热退出的那一份）
+      · 没脏文件时本来就没东西要备份
+      · 真正的意外（崩溃 / 任务管理器强杀）不触发 `beforeunload`，
+        靠的是**防抖备份**
+      ⇒ 也就是说那一次补写真正覆盖的场景只有「刚敲完就 Ctrl+R」，
+        而那种情况下 IPC 是好的（上面实测过）
+
 - [x] **修一类洞：`invoke` 回 `null` 不会抛，所以 try/catch 接不住**：
   ★★ 这是本轮最有价值的一条，因为它**断过整个启动流程**。
     现象：语言配置加载时抛 `entries is not iterable`，而日志里只有
@@ -2877,6 +2889,8 @@ Node 里 `spawn(process.execPath, [jsonServerMain.js, "--stdio"])` + 自己写�
   ✅ 验证：10 个构造用例（含**字符串里的 `//`**、URL 里的 `//`、
     转义的引号、`//` 出现在注释里等关键点）+ 3 份**真实**的失败文件
     （`JSON.parse` 全失败、`parseJsonc` 全成功）
+  ✅ 修完实测（启动日志）：那三行 `[语言配置] xxx 加载失败（已跳过）` **不再出现** ✓
+    （日志里只剩下 `[语言配置] 得到 77 份语言配置`）
 
 ### 待办（按优先级）
 
