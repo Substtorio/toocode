@@ -43,6 +43,20 @@
 - 调用栈、变量、调试控制台（可以在里面求值）
 - stdio 和 **TCP** 两种适配器都能接（实测 Python / debugpy）
 
+**数据库视图（`Ctrl+Alt+D`）**
+
+- 侧栏列两组：工作区里的 `.db` / `.sqlite` / `.sqlite3` 文件，和**我们自己建的搜索索引库**
+  （后者不是凑数 —— 很多时候手边唯一有真数据的库就是它）
+- 点一张表打开浮层，里面三个标签：
+  - **表数据**：分页浏览（首页 / 跳页 / 末页 / 刷新），点列头三态排序
+    （升序 → 降序 → 不排）；表头直接标出每一列的类型 / `PK` / `NOT NULL` / 默认值；
+    双击单元格复制
+  - **关系图**：主表在左，它的索引和 FTS5 影子表在右。
+    SQLite 库里「一个表名背后其实还有好几张表」这件事，光看表清单是看不出来的
+  - **SQL**：执行任意语句，读和写都行
+- ⚠ **能改数据，包括 DDL** —— 这是有意的（要的就是「能跑任意 SQL」）；
+  在搜索索引库上执行写操作也会真的生效（改坏了可以在搜索视图里重建索引）
+
 **插件机制 —— 直接复用本机已装的 VS Code 扩展**
 
 不是自己写死一套语法，而是去读本机 VS Code 扩展里声明的贡献点：
@@ -80,6 +94,7 @@
 | `Ctrl+Shift+P` / `Ctrl+P` / `Ctrl+T` | 命令面板 / 转到文件 / 转到符号 |
 | `Ctrl+Shift+F` | 在文件夹中搜索 |
 | `Ctrl+Shift+G` / `Ctrl+Shift+D` / `Ctrl+Shift+M` | 源代码管理 / 运行和调试 / 问题 |
+| `Ctrl+Alt+D` | 数据库视图 |
 | `Ctrl+J` 或 `` Ctrl+` `` | 显示 / 隐藏底部面板 |
 | `Ctrl+Alt+I` | 显示 / 隐藏 Topilot |
 | `F5` / `F9` / `F10` / `F11` | 启动调试 / 断点 / 单步跳过 / 单步进入 |
@@ -120,6 +135,7 @@ VS Code 扩展里声明的贡献点；JSON / HTML / CSS 的语言服务器，也
 | 语法高亮 | `vscode-textmate` + `vscode-oniguruma` |
 | 终端 | `xterm.js` + `portable-pty` |
 | 搜索索引 | `rusqlite`（bundled SQLite）+ FTS5 trigram |
+| 数据库视图 | 同一个 `rusqlite`，另外开连接读任意 SQLite 文件 |
 | 后端 | Rust（Tauri command，前端通过 `invoke` 调用） |
 
 ## 跑起来
@@ -135,7 +151,7 @@ npm run tauri dev
 
 ```bash
 npm run build              # 里含 `vue-tsc --noEmit` 类型检查 + 前端构建
-cd src-tauri && cargo test # 43 个用例
+cd src-tauri && cargo test # 51 个用例
 ```
 
 这些用例刻意挑的是**错了不会报错**的地方 —— 它们失败时只会「悄悄变差」：
@@ -146,6 +162,9 @@ cd src-tauri && cargo test # 43 个用例
 - 索引的正确性（`EXPLAIN QUERY PLAN` 断言真的走了 FTS5 索引；建不完时不会漏结果）
 - 符号扫描规则（注释不算声明、markdown 跳过围栏代码块、JSON 靠括号深度判顶层）
 - 片段去重（VS Code 更新后新旧两个版本目录会让同一份片段被扫两遍）
+- 数据库视图的探测（SQLite 是**惰性打开**的，用 `SELECT sqlite_version()` 探不出
+  「这是个纯文本文件」—— 必须去碰目录表）
+- 表数据排序的列名白名单（试一次注入 `id); DROP TABLE notes; --`，并断言**表还在**）
 
 前端的纯逻辑（模糊匹配 / 路径工具 / 片段解析 / SSE 解析）都拆成了零依赖模块，在 Node 里可直接跑用例。
 **组件层没有自动化测试** —— 那部分靠 CDP 直连真窗口验证（做法记在开发笔记里）。
@@ -181,7 +200,8 @@ npm run tauri build
 **不会轻易改的**（改了会伤害已经装了的用户）：
 
 - 用户数据的位置与格式：`%APPDATA%\com.toocode.app\` 下的 `toocode.secret`（DPAPI 加密，
-  兼容早期版本的明文格式）和 `toocode.chats.json`
+  兼容早期版本的明文格式）、`toocode.chats.json`，以及 `toocode.session.json`
+  （未保存内容的热备份 —— 它丢了就是真的丢代码）
 - 那几个 localStorage key（`new_vscode:*`）—— 改名字会让老用户丢掉主题、布局和
   **未保存的内容**（hot exit）
 - 安装包形态：per-user 安装、不写 `Program Files`、卸载**不删**用户数据
@@ -189,7 +209,7 @@ npm run tauri build
 **随时可能变的**（内部实现，别依赖）：
 
 - IPC 命令名与参数形状（只有前端在调）
-- SQLite 索引库：派生数据，删了会重建；表结构不保证跨版本兼容
+- SQLite 索引库（`index\*.db`）：派生数据，删了会重建；表结构不保证跨版本兼容
 - 模块划分、`.github/copilot-instructions.md` 的写法与结构
 
 ## 已知的局限
@@ -202,7 +222,7 @@ npm run tauri build
 - 内容索引有 **128 MB 源码**的上限（trigram 索引体积约为源码的 4 倍），
   超出的文件仍然能搜到，但每次搜索都要现场扫
 - 没有扩展市场：插件机制只读本机已装的 VS Code 扩展
-- 不支持用户自己的代码片段（`%APPDATA%\Code\User\snippets`）
+- 数据库视图的表数据不支持拖动改列宽；关系图不做缩放（表多了会画不下）
 - 单窗口，不支持同时开两个窗口
 - 只在 **Windows** 上验证过。DPAPI 加密是 Windows 专有的，其它平台会退回明文存储
 
