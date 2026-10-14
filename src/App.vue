@@ -4377,8 +4377,18 @@ function showDatabaseView(): void {
 //   「切过来就是新的」没有学习成本 —— 而扫描本身只是递归 readdir，毫秒级。
 //   用 watch 而不是在 toggleView 里加分支：设置 activeView 的地方有好几处，
 //   逐个加必然漏，而漏掉的表现是「列表是空的」
+//
+// ⚠ ★★ 切**走**的时候必须把浮层关掉。它盖的是整个编辑区
+//   （`.db-view` 是 `inset: … 0 0 0` 的浮层，实测占满 editor-area）——
+//   不关的话，侧栏明明已经切到资源管理器了、活动栏高亮也变了，
+//   中间那一大块还停在上次看的那张表上，**看起来就是「点了没反应、切不回去」**
+//   ⇒ 语义上它本来就是「数据库视图的一部分」，离开这个视图就该收起
 watch(activeView, (view) => {
-  if (view === "database") void refreshDatabases();
+  if (view === "database") {
+    void refreshDatabases();
+    return;
+  }
+  if (dbOpenPath.value) closeDbPanel();
 });
 
 // ---------- 可拖拽的分隔条 ----------
